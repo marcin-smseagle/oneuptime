@@ -448,3 +448,39 @@ export const CallDefaultCostInCentsPerMinute: number = process.env[
 
 // Call provider type
 export const CallProvider: string = process.env["CALL_PROVIDER"] || "twilio";
+
+// SMSEagle config
+
+import SMSEagleConfig from "Common/Types/SMSEagle/SMSEagleConfig";
+
+type GetSMSEagleConfigFunction = () => Promise<SMSEagleConfig | null>;
+
+export const getSMSEagleConfig: GetSMSEagleConfigFunction =
+  async (): Promise<SMSEagleConfig | null> => {
+    const globalConfig: GlobalConfig | null =
+      await GlobalConfigService.findOneBy({
+        query: {
+          _id: ObjectID.getZeroObjectID().toString(),
+        },
+        props: {
+          isRoot: true,
+        },
+        select: {
+          smsEagleApiUrl: true,
+          smsEagleAccessToken: true,
+        },
+      });
+
+    if (!globalConfig) {
+      throw new BadDataException("Global Config not found");
+    }
+
+    if (!globalConfig.smsEagleApiUrl || !globalConfig.smsEagleAccessToken) {
+      return null;
+    }
+
+    return {
+      apiUrl: globalConfig.smsEagleApiUrl,
+      accessToken: globalConfig.smsEagleAccessToken,
+    };
+  };

@@ -626,6 +626,45 @@ export default class GlobalConfig extends GlobalConfigModel {
   })
   public telegramWebhookSecretToken?: string = undefined;
 
+  // SMSEagle config.
+
+  @ColumnAccessControl({
+    create: [],
+    read: [],
+    update: [],
+  })
+  @TableColumn({
+    type: TableColumnType.ShortText,
+    title: "SMSEagle API URL",
+    description:
+      "Base URL of your SMSEagle device (e.g. https://192.168.0.100)",
+  })
+  @Column({
+    type: ColumnType.ShortText,
+    length: ColumnLength.ShortText,
+    nullable: true,
+    unique: true,
+  })
+  public smsEagleApiUrl?: string = undefined;
+
+  @ColumnAccessControl({
+    create: [],
+    read: [],
+    update: [],
+  })
+  @TableColumn({
+    type: TableColumnType.ShortText,
+    title: "SMSEagle Access Token",
+    description: "APIv2 access token for your SMSEagle user",
+  })
+  @Column({
+    type: ColumnType.ShortText,
+    length: ColumnLength.ShortText,
+    nullable: true,
+    unique: true,
+  })
+  public smsEagleAccessToken?: string = undefined;
+
   @ColumnAccessControl({
     create: [],
     read: [],
