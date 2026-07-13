@@ -162,7 +162,7 @@ router.post(
 );
 
 router.post(
-  "/send-tts",
+  "/send-tts-advanced",
   ClusterKeyAuthorization.isAuthorizedServiceMiddleware,
   async (req: ExpressRequest, res: ExpressResponse, next: NextFunction) => {
     try {
@@ -295,7 +295,7 @@ router.post(
 );
 
 router.post(
-  "/test-tts",
+  "/test-tts-advanced",
   UserMiddleware.getUserMiddleware,
   UserMiddleware.requireUserAuthentication,
   async (req: ExpressRequest, res: ExpressResponse, next: NextFunction) => {

@@ -134,13 +134,7 @@ export default class SMSEagleService {
         smsLog.userOnCallLogTimelineId = options.userOnCallLogTimelineId;
       }
 
-      const config: SMSEagleConfig | null = await getSMSEagleConfig();
-
-      if (!config) {
-        throw new BadDataException(
-          "SMSEagle is not configured. Please set API URL and access token in the Admin Dashboard.",
-        );
-      }
+      const config: SMSEagleConfig = await getSMSEagleConfig();
 
       if (options.projectId) {
         const project: Project | null = await ProjectService.findOneById({
@@ -324,13 +318,7 @@ export default class SMSEagleService {
         callLog.onCallDutyPolicyScheduleId = options.onCallScheduleId;
       }
 
-      const config: SMSEagleConfig | null = await getSMSEagleConfig();
-
-      if (!config) {
-        throw new BadDataException(
-          "SMSEagle is not configured. Please set API URL and access token in the Admin Dashboard.",
-        );
-      }
+      const config: SMSEagleConfig = await getSMSEagleConfig();
 
       if (options.projectId) {
         const project: Project | null = await ProjectService.findOneById({
@@ -516,13 +504,7 @@ export default class SMSEagleService {
         callLog.onCallDutyPolicyScheduleId = options.onCallScheduleId;
       }
 
-      const config: SMSEagleConfig | null = await getSMSEagleConfig();
-
-      if (!config) {
-        throw new BadDataException(
-          "SMSEagle is not configured. Please set API URL and access token in the Admin Dashboard.",
-        );
-      }
+      const config: SMSEagleConfig = await getSMSEagleConfig();
 
       if (options.projectId) {
         const project: Project | null = await ProjectService.findOneById({

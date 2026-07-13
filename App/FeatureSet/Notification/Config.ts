@@ -453,10 +453,10 @@ export const CallProvider: string = process.env["CALL_PROVIDER"] || "twilio";
 
 import SMSEagleConfig from "Common/Types/SMSEagle/SMSEagleConfig";
 
-type GetSMSEagleConfigFunction = () => Promise<SMSEagleConfig | null>;
+type GetSMSEagleConfigFunction = () => Promise<SMSEagleConfig>;
 
 export const getSMSEagleConfig: GetSMSEagleConfigFunction =
-  async (): Promise<SMSEagleConfig | null> => {
+  async (): Promise<SMSEagleConfig> => {
     const globalConfig: GlobalConfig | null =
       await GlobalConfigService.findOneBy({
         query: {
@@ -475,12 +475,26 @@ export const getSMSEagleConfig: GetSMSEagleConfigFunction =
       throw new BadDataException("Global Config not found");
     }
 
-    if (!globalConfig.smsEagleApiUrl || !globalConfig.smsEagleAccessToken) {
-      return null;
+    const apiUrl: string | undefined = globalConfig.smsEagleApiUrl?.trim();
+    const accessToken: string | undefined =
+      globalConfig.smsEagleAccessToken?.trim();
+
+    if (!apiUrl) {
+      throw new BadDataException(
+        "SMSEagle API URL not configured. Please set it in the Admin Dashboard: " +
+          AdminDashboardClientURL.toString(),
+      );
+    }
+
+    if (!accessToken) {
+      throw new BadDataException(
+        "SMSEagle access token not configured. Please set it in the Admin Dashboard: " +
+          AdminDashboardClientURL.toString(),
+      );
     }
 
     return {
-      apiUrl: globalConfig.smsEagleApiUrl,
-      accessToken: globalConfig.smsEagleAccessToken,
+      apiUrl,
+      accessToken,
     };
   };

@@ -19,6 +19,7 @@ import HTTPResponse from "Common/Types/API/HTTPResponse";
 import URL from "Common/Types/API/URL";
 import API from "Common/UI/Utils/API/API";
 import { APP_API_URL } from "Common/UI/Config";
+import { useTranslation } from "react-i18next";
 
 const smsEagleSetupMarkdown: string = [
   "### What you'll need",
@@ -41,6 +42,7 @@ const smsEagleSetupMarkdown: string = [
 ].join("\n");
 
 const SettingsSMSEagle: FunctionComponent = (): ReactElement => {
+  const { t } = useTranslation();
   const [isSendingTestSms, setIsSendingTestSms] = useState<boolean>(false);
   const [testSmsError, setTestSmsError] = useState<string>("");
   const [testSmsSuccess, setTestSmsSuccess] = useState<string>("");
@@ -55,20 +57,20 @@ const SettingsSMSEagle: FunctionComponent = (): ReactElement => {
 
   return (
     <Page
-      title="Admin Settings"
+      title={t("pages.settings.title")}
       breadcrumbLinks={[
         {
-          title: "Admin Dashboard",
+          title: t("breadcrumbs.adminDashboard"),
           to: RouteUtil.populateRouteParams(RouteMap[PageMap.HOME] as Route),
         },
         {
-          title: "Settings",
+          title: t("breadcrumbs.settings"),
           to: RouteUtil.populateRouteParams(
             RouteMap[PageMap.SETTINGS] as Route,
           ),
         },
         {
-          title: "SMSEagle",
+          title: t("breadcrumbs.smseagle"),
           to: RouteUtil.populateRouteParams(
             RouteMap[PageMap.SETTINGS_SMSEAGLE] as Route,
           ),
@@ -77,8 +79,8 @@ const SettingsSMSEagle: FunctionComponent = (): ReactElement => {
       sideMenu={<DashboardSideMenu />}
     >
       <Card
-        title="SMSEagle Setup"
-        description="Configure your SMSEagle hardware gateway for SMS and call notifications."
+        title={t("pages.settings.smseagle.setupCardTitle")}
+        description={t("pages.settings.smseagle.setupCardDescription")}
       >
         <MarkdownViewer text={smsEagleSetupMarkdown} />
       </Card>
@@ -86,12 +88,11 @@ const SettingsSMSEagle: FunctionComponent = (): ReactElement => {
       <CardModelDetail
         name="SMSEagle Settings"
         cardProps={{
-          title: "SMSEagle Configuration",
-          description:
-            "Configure the connection to your SMSEagle device.",
+          title: t("pages.settings.smseagle.configCardTitle"),
+          description: t("pages.settings.smseagle.configCardDescription"),
         }}
         isEditable={true}
-        editButtonText="Edit SMSEagle Settings"
+        editButtonText={t("pages.settings.smseagle.configEditButton")}
         formFields={[
           {
             field: {
@@ -134,7 +135,7 @@ const SettingsSMSEagle: FunctionComponent = (): ReactElement => {
               },
               title: "API URL",
               fieldType: FieldType.Text,
-              placeholder: "Not configured",
+              placeholder: t("common.notConfigured"),
             },
             {
               field: {
@@ -142,7 +143,7 @@ const SettingsSMSEagle: FunctionComponent = (): ReactElement => {
               },
               title: "Access Token",
               fieldType: FieldType.HiddenText,
-              placeholder: "Not configured",
+              placeholder: t("common.notConfigured"),
             },
           ],
           modelId: ObjectID.getZeroObjectID(),
@@ -151,8 +152,8 @@ const SettingsSMSEagle: FunctionComponent = (): ReactElement => {
 
       {/* Test SMS */}
       <Card
-        title="Send test SMS"
-        description="Send a test SMS message through your SMSEagle device to verify the configuration."
+        title={t("pages.settings.smseagle.testSmsCardTitle")}
+        description={t("pages.settings.smseagle.testSmsCardDescription")}
       >
         {testSmsSuccess ? (
           <Alert
@@ -169,7 +170,7 @@ const SettingsSMSEagle: FunctionComponent = (): ReactElement => {
           name="Send test SMS"
           isLoading={isSendingTestSms}
           error={testSmsError || ""}
-          submitButtonText="Send Test SMS"
+          submitButtonText={t("pages.settings.smseagle.testSmsSubmitButton")}
           maxPrimaryButtonWidth={true}
           initialValues={{
             toPhone: "",
@@ -195,7 +196,9 @@ const SettingsSMSEagle: FunctionComponent = (): ReactElement => {
 
             if (!toPhone) {
               setTestSmsSuccess("");
-              setTestSmsError("Please enter a phone number.");
+              setTestSmsError(
+                t("pages.settings.smseagle.testMissingPhone"),
+              );
               return;
             }
 
@@ -219,11 +222,13 @@ const SettingsSMSEagle: FunctionComponent = (): ReactElement => {
               }
 
               if (response.isFailure()) {
-                throw new Error("Failed to send test SMS.");
+                throw new Error(
+                  t("pages.settings.smseagle.testSmsFailure"),
+                );
               }
 
               setTestSmsSuccess(
-                "Test SMS sent successfully!",
+                t("pages.settings.smseagle.testSmsSuccess"),
               );
 
               if (onSubmitSuccessful) {
@@ -240,8 +245,8 @@ const SettingsSMSEagle: FunctionComponent = (): ReactElement => {
 
       {/* Test RING */}
       <Card
-        title="Send test ring call"
-        description="Make a test ring call through your SMSEagle device."
+        title={t("pages.settings.smseagle.testRingCardTitle")}
+        description={t("pages.settings.smseagle.testRingCardDescription")}
       >
         {testRingSuccess ? (
           <Alert
@@ -258,7 +263,7 @@ const SettingsSMSEagle: FunctionComponent = (): ReactElement => {
           name="Send Test RING Call"
           isLoading={isSendingTestRing}
           error={testRingError || ""}
-          submitButtonText="Send test ring call"
+          submitButtonText={t("pages.settings.smseagle.testRingSubmitButton")}
           maxPrimaryButtonWidth={true}
           initialValues={{
             toPhone: "",
@@ -284,7 +289,9 @@ const SettingsSMSEagle: FunctionComponent = (): ReactElement => {
 
             if (!toPhone) {
               setTestRingSuccess("");
-              setTestRingError("Please enter a phone number.");
+              setTestRingError(
+                t("pages.settings.smseagle.testMissingPhone"),
+              );
               return;
             }
 
@@ -308,11 +315,13 @@ const SettingsSMSEagle: FunctionComponent = (): ReactElement => {
               }
 
               if (response.isFailure()) {
-                throw new Error("Failed to send test ring call.");
+                throw new Error(
+                  t("pages.settings.smseagle.testRingFailure"),
+                );
               }
 
               setTestRingSuccess(
-                "Test ring call sent successfully!",
+                t("pages.settings.smseagle.testRingSuccess"),
               );
 
               if (onSubmitSuccessful) {
@@ -329,8 +338,8 @@ const SettingsSMSEagle: FunctionComponent = (): ReactElement => {
 
       {/* Test TTS */}
       <Card
-        title="Send test TTS Advanced Call"
-        description="Make a test TTS Advanced call through your SMSEagle device."
+        title={t("pages.settings.smseagle.testTtsCardTitle")}
+        description={t("pages.settings.smseagle.testTtsCardDescription")}
       >
         {testTtsSuccess ? (
           <Alert
@@ -347,7 +356,7 @@ const SettingsSMSEagle: FunctionComponent = (): ReactElement => {
           name="Send test TTS Advanced call"
           isLoading={isSendingTestTts}
           error={testTtsError || ""}
-          submitButtonText="Send test TTS Advanced call"
+          submitButtonText={t("pages.settings.smseagle.testTtsSubmitButton")}
           maxPrimaryButtonWidth={true}
           initialValues={{
             toPhone: "",
@@ -373,7 +382,9 @@ const SettingsSMSEagle: FunctionComponent = (): ReactElement => {
 
             if (!toPhone) {
               setTestTtsSuccess("");
-              setTestTtsError("Please enter a phone number.");
+              setTestTtsError(
+                t("pages.settings.smseagle.testMissingPhone"),
+              );
               return;
             }
 
@@ -385,7 +396,7 @@ const SettingsSMSEagle: FunctionComponent = (): ReactElement => {
               const response: HTTPResponse<JSONObject> | HTTPErrorResponse =
                 await API.post({
                   url: URL.fromString(APP_API_URL.toString()).addRoute(
-                    "/notification/smseagle/test-tts",
+                    "/notification/smseagle/test-tts-advanced",
                   ),
                   data: {
                     toPhone,
@@ -397,11 +408,13 @@ const SettingsSMSEagle: FunctionComponent = (): ReactElement => {
               }
 
               if (response.isFailure()) {
-                throw new Error("Failed to send test TTS Advanced call.");
+                throw new Error(
+                  t("pages.settings.smseagle.testTtsFailure"),
+                );
               }
 
               setTestTtsSuccess(
-                "Test TTS Advanced call sent successfully!",
+                t("pages.settings.smseagle.testTtsSuccess"),
               );
 
               if (onSubmitSuccessful) {
