@@ -448,3 +448,53 @@ export const CallDefaultCostInCentsPerMinute: number = process.env[
 
 // Call provider type
 export const CallProvider: string = process.env["CALL_PROVIDER"] || "twilio";
+
+// SMSEagle config
+
+import SMSEagleConfig from "Common/Types/SMSEagle/SMSEagleConfig";
+
+type GetSMSEagleConfigFunction = () => Promise<SMSEagleConfig>;
+
+export const getSMSEagleConfig: GetSMSEagleConfigFunction =
+  async (): Promise<SMSEagleConfig> => {
+    const globalConfig: GlobalConfig | null =
+      await GlobalConfigService.findOneBy({
+        query: {
+          _id: ObjectID.getZeroObjectID().toString(),
+        },
+        props: {
+          isRoot: true,
+        },
+        select: {
+          smsEagleApiUrl: true,
+          smsEagleAccessToken: true,
+        },
+      });
+
+    if (!globalConfig) {
+      throw new BadDataException("Global Config not found");
+    }
+
+    const apiUrl: string | undefined = globalConfig.smsEagleApiUrl?.trim();
+    const accessToken: string | undefined =
+      globalConfig.smsEagleAccessToken?.trim();
+
+    if (!apiUrl) {
+      throw new BadDataException(
+        "SMSEagle API URL not configured. Please set it in the Admin Dashboard: " +
+          AdminDashboardClientURL.toString(),
+      );
+    }
+
+    if (!accessToken) {
+      throw new BadDataException(
+        "SMSEagle access token not configured. Please set it in the Admin Dashboard: " +
+          AdminDashboardClientURL.toString(),
+      );
+    }
+
+    return {
+      apiUrl,
+      accessToken,
+    };
+  };

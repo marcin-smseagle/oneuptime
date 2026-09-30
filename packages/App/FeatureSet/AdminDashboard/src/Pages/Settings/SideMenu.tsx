@@ -82,6 +82,15 @@ const DashboardSideMenu: () => JSX.Element = (): ReactElement => {
           }}
           icon={IconProp.Telegram}
         />
+        <SideMenuItem
+          link={{
+            title: t("sideMenu.settingsSMSEagle"),
+            to: RouteUtil.populateRouteParams(
+              RouteMap[PageMap.SETTINGS_SMSEAGLE] as Route,
+            ),
+          }}
+          icon={IconProp.SMS}
+        />
       </SideMenuSection>
 
       <SideMenuSection title={t("sideMenu.settingsMonitoring")}>

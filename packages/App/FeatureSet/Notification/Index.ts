@@ -5,6 +5,7 @@ import MailAPI from "./API/Mail";
 import SmsAPI from "./API/SMS";
 import WhatsAppAPI from "./API/WhatsApp";
 import TelegramAPI from "./API/Telegram";
+import SMSEagleAPI from "./API/SMSEagle";
 import WebhookAPI from "./API/Webhook";
 import PushNotificationAPI from "./API/PushNotification";
 import PushRelayAPI from "./API/PushRelay";
@@ -27,6 +28,7 @@ const NotificationFeatureSet: FeatureSet = {
     app.use([`/${APP_NAME}/sms`, "/sms"], SmsAPI);
     app.use([`/${APP_NAME}/whatsapp`, "/whatsapp"], WhatsAppAPI);
     app.use([`/${APP_NAME}/telegram`, "/telegram"], TelegramAPI);
+    app.use([`/${APP_NAME}/smseagle`, "/smseagle"], SMSEagleAPI);
     app.use([`/${APP_NAME}/webhook`, "/webhook"], WebhookAPI);
     app.use([`/${APP_NAME}/push`, "/push"], PushNotificationAPI);
     app.use([`/${APP_NAME}/push-relay`, "/push-relay"], PushRelayAPI);
