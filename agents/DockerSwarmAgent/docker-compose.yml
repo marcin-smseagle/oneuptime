@@ -1,0 +1,144 @@
+services:
+  # The collector: docker_stats metrics + container logs + the
+  # filelog/inventory receiver that tails the shared snapshot file.
+  oneuptime-docker-swarm-agent:
+    # Upstream collector, pinned. There is no oneuptime/docker-swarm-agent
+    # image — the agent is entirely defined by the config below, which
+    # install.sh downloads next to this file, so nothing needs baking into a
+    # custom image. Bump this pin and otel-collector-config.yaml together.
+    image: otel/opentelemetry-collector-contrib:0.161.0
+    container_name: oneuptime-docker-swarm-agent
+    user: "0:0"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      # The collector's config. Required — the upstream image ships a
+      # default config that does not talk to OneUptime. install.sh downloads
+      # this file alongside the compose file; it is mounted at the path the
+      # base image's ENTRYPOINT already passes to --config.
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+      # Shared with the inventory sidecar; the collector reads the
+      # snapshot file the sidecar writes here.
+      - swarm-inventory:/var/log
+    environment:
+      - ONEUPTIME_URL=${ONEUPTIME_URL}
+      - ONEUPTIME_SERVICE_TOKEN=${ONEUPTIME_SERVICE_TOKEN}
+      - DOCKER_SWARM_CLUSTER_NAME=${DOCKER_SWARM_CLUSTER_NAME:-docker-swarm}
+      # Lower this if the host's daemon is older: docker version --format '{{ .Server.APIVersion }}'
+      # Keep the default here: the config references the variable and, unlike the
+      # Docker Host agent, there is no image ENV to fall back on when it is unset.
+      # Set it to an empty value to negotiate the version with the daemon instead.
+      # Hence "${VAR-default}" and not "${VAR:-default}": the colon form would
+      # replace an explicitly empty value with the default and swallow that.
+      - DOCKER_API_VERSION=${DOCKER_API_VERSION-1.44}
+      # Required. otel-collector-config.yaml stamps oneuptime.agent.version
+      # from this, and the collector refuses to start pipelines when a
+      # referenced env var is unset — it would crash-loop rather than run
+      # without the attribute. It used to be baked in as ENV APP_VERSION by an
+      # image that was never actually built or published; now that the agent
+      # is the upstream collector plus this config, the image pin is the
+      # version that means something. Keep it in step with `image:` above.
+      - APP_VERSION=${APP_VERSION:-0.161.0}
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Inventory poller — MUST run on a manager node (the /nodes, /services,
+  # /tasks endpoints are manager-only). Stock alpine + curl + jq; writes
+  # the JSON-line snapshot the collector tails on the shared volume.
+  oneuptime-docker-swarm-inventory:
+    image: alpine:3.20
+    container_name: oneuptime-docker-swarm-inventory
+    user: "0:0"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - "apk add --no-cache curl jq >/dev/null 2>&1 && exec /usr/local/bin/inventory-snapshot.sh"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./inventory-snapshot.sh:/usr/local/bin/inventory-snapshot.sh:ro
+      - swarm-inventory:/var/log
+    environment:
+      - DOCKER_INVENTORY_INTERVAL_SECONDS=${DOCKER_INVENTORY_INTERVAL_SECONDS:-300}
+      # Same pin as the collector above; the poller builds its Docker API URL from it.
+      - DOCKER_API_VERSION=${DOCKER_API_VERSION-1.44}
+    # Pin the sidecar to a manager node when deployed as a stack:
+    #   deploy:
+    #     placement:
+    #       constraints: [node.role == manager]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # The OneUptime AI agent for this swarm — MUST run on a manager node, like
+  # the inventory poller (node, service and task commands are manager-only;
+  # on a worker it reports the swarm as unreachable and runs nothing). While
+  # OneUptime AI investigates an incident or alert it runs read-only docker
+  # commands (docker node ls, docker service ps NAME, docker service logs
+  # --tail 200 NAME, ...), and — only when you set
+  # ONEUPTIME_AI_ALLOW_WRITES=true in .env — the fixes you allow (a rolling
+  # restart, a rollback or a scale of a named service; a node drain always
+  # needs a person's approval). It shares this file's .env, so it serves
+  # exactly the cluster the collector reports (DOCKER_SWARM_CLUSTER_NAME).
+  # install.sh --no-ai-agent leaves it out; or remove this service.
+  oneuptime-docker-swarm-ai-agent:
+    image: oneuptime/resource-ai-agent:release
+    container_name: oneuptime-docker-swarm-ai-agent
+    # Root, because the Docker socket is root-owned. Neither the account nor
+    # the socket's :ro mount limits what can be done through the Docker API
+    # (connect() works on a read-only bind mount, and on a manager the socket
+    # is the whole swarm). The agent's command policy is the limit: read-only
+    # commands unless ONEUPTIME_AI_ALLOW_WRITES=true, then only the fixes it
+    # tiers as changes (never service create/rm, stack deploy/rm, secrets,
+    # exec, ...), only on the services and nodes ONEUPTIME_AI_WRITE_TARGETS
+    # allows (all when empty), and never on itself, the collector or
+    # ONEUPTIME_AI_PROTECTED_TARGETS.
+    user: "0:0"
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - ONEUPTIME_URL=${ONEUPTIME_URL}
+      - ONEUPTIME_SERVICE_TOKEN=${ONEUPTIME_SERVICE_TOKEN}
+      - ONEUPTIME_AI_AGENT_RESOURCE_TYPE=docker-swarm
+      - DOCKER_SWARM_CLUSTER_NAME=${DOCKER_SWARM_CLUSTER_NAME:-docker-swarm}
+      # "true" lets OneUptime AI apply fixes; anything else keeps it read-only.
+      - ONEUPTIME_AI_ALLOW_WRITES=${ONEUPTIME_AI_ALLOW_WRITES:-false}
+      # Comma-separated service/node-name globs fixes may touch (e.g. web_*).
+      - ONEUPTIME_AI_WRITE_TARGETS=${ONEUPTIME_AI_WRITE_TARGETS:-}
+      # Comma-separated service/node-name globs OneUptime AI must never change.
+      - ONEUPTIME_AI_PROTECTED_TARGETS=${ONEUPTIME_AI_PROTECTED_TARGETS:-}
+      # Overrides DOCKER_SWARM_CLUSTER_NAME as the name the AI agent registers under.
+      - ONEUPTIME_AI_AGENT_RESOURCE_NAME=${ONEUPTIME_AI_AGENT_RESOURCE_NAME:-}
+      # The AI agent's log level: debug, info, warn or error.
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      # Empty: the docker CLI negotiates the API version with the daemon. Not
+      # APP_VERSION: that one is the collector's; the agent image sets its own.
+      - DOCKER_API_VERSION=${DOCKER_API_VERSION:-}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3877/status/live"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    # When deployed as a stack, pin it to a manager like the poller:
+    #   deploy:
+    #     placement:
+    #       constraints: [node.role == manager]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  swarm-inventory:

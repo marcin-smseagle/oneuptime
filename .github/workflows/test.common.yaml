@@ -1,23 +1,92 @@
 name: Common Test
 
+# Supersede in-flight runs for the same branch/PR: only the newest commit needs CI.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 on:
-  pull_request: 
+  pull_request:
   push:
-    branches-ignore:
-      - 'hotfix-*'   # excludes hotfix branches
-      - 'release'
+    branches:
+      - master
 
 jobs:
+  # Common's `npm run test` used to pass --detectOpenHandles. Jest's scheduler
+  # turns that into an unconditional runInBand -- "detectOpenHandles makes no
+  # sense without runInBand, because it cannot detect leaks in workers", in
+  # @jest/core/build/testSchedulerHelper.js -- so the whole suite ran in one
+  # process, one file at a time. 1645 test files, each dragging Common's import
+  # graph through ts-jest's per-file type check, with nine tenths of the runner
+  # idle. That is what put every shard at 15 minutes and this workflow at ~2
+  # hours of runner time per commit. The suite now runs on Jest's worker pool.
+  #
+  # --forceExit stays, and it is the flag that actually mattered: it is what
+  # stops a leaked handle from hanging the job. --detectOpenHandles only prints
+  # the stack traces that say which handle leaked -- a debugging aid, not a
+  # gate; it never changed a pass into a fail. `npm run debug:test` still has
+  # it for when a leak needs chasing.
+  #
+  # Moving off runInBand is also why the test script now pins --maxWorkers and
+  # a smaller heap. --max-old-space-size is a per-process ceiling, and
+  # jest-worker forwards the parent's execArgv to every worker it forks
+  # (ChildProcessWorker only strips --debug/--inspect), so the old
+  # --max-old-space-size=6144 stopped describing one process and started
+  # describing each of them. On a 4-vCPU runner Jest defaults to three workers,
+  # which is an 18 GB ceiling on a 16 GB box: the workers grew until the VM
+  # itself died, and every shard failed with "the runner has received a
+  # shutdown signal" rather than a test failure. A shard's live set measures
+  # ~2 GB per worker and peaks near 3.5 GB, so 2 workers x 4 GB keeps the hard
+  # ceiling at 8 GB with room to spare for the postgres and valkey containers
+  # test-setup.sh starts alongside.
+  #
+  # The suite runs transpile-only (packages/Common/jest.config.json,
+  # isolatedModules), as App's does. Type checking used to be left on here
+  # because nothing else checked Common's tests, and it had become most of the
+  # job: ts-jest type-checks each worker's import graph on its own, so a suite
+  # whose tests took 0.2s spent six minutes loading, and a file that imports
+  # the services index could take anywhere from two minutes to past a shard's
+  # whole budget depending on what its worker had already compiled. Common's
+  # tests now have their own tsc project (packages/Common/tsconfig.tests.json),
+  # checked once per commit by the compile-common job in the Compile workflow,
+  # so nothing goes unchecked.
   test:
+    name: test (${{ matrix.shard }}/${{ strategy.job-total }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      # One slow or broken shard should not hide the results of the others.
+      fail-fast: false
+      # Eight shards. Type-checking inside jest had grown every shard to 25-29
+      # of its 30 minutes, and the slowest kept crossing the cap; transpiling
+      # only (see above) brought a shard to about two and a half minutes at
+      # sixteen, so eight leaves the 30-minute cap a real tripwire without
+      # asking the runner queue for twice the machines.
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     env:
-      CI_PIPELINE_ID: ${{github.run_number}}
-      BILLING_PRIVATE_KEY: ${{secrets.TEST_BILLING_PRIVATE_KEY}}
+      CI_PIPELINE_ID: ${{ github.run_number }}
+      BILLING_PRIVATE_KEY: ${{ secrets.TEST_BILLING_PRIVATE_KEY }}
+      RUN_POSTGRES_EVENT_OVERLAY_TESTS: "true"
+      RUN_POSTGRES_MONITOR_DESCRIPTION_MIGRATION_TESTS: "true"
+      RUN_POSTGRES_HIDDEN_INCIDENT_NOTIFICATION_MIGRATION_TESTS: "true"
     steps:
       - uses: actions/checkout@v4
+      # Core is the Community Edition by construction: it must build and pass
+      # without ee/ in the checkout. ee/ has its own jobs (compile-ee, test.ee.yaml).
+      - name: Remove the Enterprise Edition (core runs without ee/)
+        run: rm -rf ee
       - uses: actions/setup-node@v4
         with:
           node-version: 26
-      - run: cd Common && bash test-setup.sh
-      - run: cd Common && npm install && rm -rf build && npm run test
-  
+          cache: npm
+          cache-dependency-path: packages/Common/package-lock.json
+      - name: Set up test services
+        working-directory: packages/Common
+        run: bash test-setup.sh
+      - name: Install dependencies
+        working-directory: packages/Common
+        run: npm install
+      - name: Run test shard
+        working-directory: packages/Common
+        run: rm -rf build && npm run test -- --shard=${{ matrix.shard }}/${{ strategy.job-total }}

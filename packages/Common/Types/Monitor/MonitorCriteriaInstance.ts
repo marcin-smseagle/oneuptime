@@ -1,0 +1,2027 @@
+import DatabaseProperty from "../Database/DatabaseProperty";
+import BadDataException from "../Exception/BadDataException";
+import FilterCondition from "../Filter/FilterCondition";
+import { JSONObject, ObjectType } from "../JSON";
+import JSONFunctions from "../JSONFunctions";
+import ObjectID from "../ObjectID";
+import Typeof from "../Typeof";
+import { CriteriaAlert, CriteriaAlertSchema } from "./CriteriaAlert";
+import {
+  CheckOn,
+  CriteriaFilter,
+  FilterType,
+  EvaluateOverTimeType,
+  CriteriaFilterUtil,
+  CriteriaFilterSchema,
+} from "./CriteriaFilter";
+import { CriteriaIncident, CriteriaIncidentSchema } from "./CriteriaIncident";
+import IncidentGroupingConfig, {
+  IncidentGroupingConfigSchema,
+} from "./IncomingMonitor/IncidentGroupingConfig";
+import MonitorType from "./MonitorType";
+import { FindOperator } from "typeorm";
+import Zod, { ZodSchema } from "../../Utils/Schema/Zod";
+
+export interface MonitorCriteriaInstanceType {
+  monitorStatusId: ObjectID | undefined;
+  filterCondition: FilterCondition;
+  filters: Array<CriteriaFilter>;
+  incidents: Array<CriteriaIncident>;
+  alerts: Array<CriteriaAlert>;
+  name: string;
+  description: string;
+  changeMonitorStatus?: boolean | undefined;
+  createIncidents?: boolean | undefined;
+  createAlerts?: boolean | undefined;
+  isEnabled?: boolean | undefined;
+  /**
+   * Incoming Request monitors only: opt-in config to open one incident
+   * per distinct value extracted from the webhook payload (e.g. one per
+   * Grafana alert name) instead of a single active incident per criteria.
+   */
+  incidentGrouping?: IncidentGroupingConfig | undefined;
+  id: string;
+}
+
+export default class MonitorCriteriaInstance extends DatabaseProperty {
+  /*
+   * Keyword the out-of-the-box criteria for the two incoming monitor types
+   * (Incoming Request and Incoming Email) look for in the payload body.
+   *
+   * These monitors are driven by whatever the sender pushes, so the default
+   * that is useful to the most people is "the sender told us something broke":
+   * a body carrying this keyword takes the monitor offline and opens an
+   * incident, a body without it puts the monitor back online. Users who want
+   * a dead-man's-switch instead can still add an Incoming Request /
+   * Email Received criteria by hand.
+   */
+  public static readonly DEFAULT_INCOMING_BODY_ERROR_KEYWORD: string = "error";
+
+  public data: MonitorCriteriaInstanceType | undefined = undefined;
+
+  public constructor() {
+    super();
+    this.data = {
+      id: ObjectID.generate().toString(),
+      monitorStatusId: undefined,
+      filterCondition: FilterCondition.All,
+      filters: [
+        {
+          checkOn: CheckOn.IsOnline,
+          /*
+           * Seed the condition too, matching
+           * getNewMonitorCriteriaInstanceAsJSON. A filter with no filter
+           * type shows an empty "Filter Condition" dropdown in the form
+           * and never matches anything at evaluation time, because every
+           * comparator in CompareCriteria switches on the filter type.
+           */
+          filterType: FilterType.True,
+          value: undefined,
+        },
+      ],
+      createIncidents: false,
+      createAlerts: false,
+      changeMonitorStatus: false,
+      isEnabled: true,
+      incidents: [],
+      alerts: [],
+      name: "",
+      description: "",
+    };
+  }
+
+  /*
+   * The monitor types whose criteria MonitorCriteriaEvaluator hands to
+   * MetricMonitorCriteria. That evaluator reads exactly one thing -
+   * CheckOn.MetricValue - so these types share a single pair of defaults:
+   * a metric that is reporting a value means online, a metric that has
+   * gone to zero means offline.
+   *
+   * Kept in step with the routing list in MonitorCriteriaEvaluator and
+   * with the check-on narrowing in the dashboard's CriteriaFilter util,
+   * which offers these types the metric value and nothing else. A type
+   * missing here falls through to `new MonitorCriteriaInstance()` and
+   * ships an unnamed criteria whose "Is Online" filter no evaluator on
+   * this path reads - a rule that can never fire and cannot be saved,
+   * since getValidationError requires a name and a description.
+   */
+  public static isMetricBackedMonitorType(monitorType: MonitorType): boolean {
+    return (
+      monitorType === MonitorType.Metrics ||
+      monitorType === MonitorType.Kubernetes ||
+      monitorType === MonitorType.Docker ||
+      monitorType === MonitorType.Host ||
+      monitorType === MonitorType.Podman ||
+      monitorType === MonitorType.DockerSwarm ||
+      monitorType === MonitorType.Proxmox ||
+      monitorType === MonitorType.VMware ||
+      monitorType === MonitorType.Ceph ||
+      monitorType === MonitorType.IoTDevice
+    );
+  }
+
+  public static getDefaultOnlineMonitorCriteriaInstance(arg: {
+    monitorType: MonitorType;
+    monitorStatusId: ObjectID;
+    monitorName: string;
+    metricOptions?: {
+      metricAliases: Array<string>;
+    };
+  }): MonitorCriteriaInstance | null {
+    if (arg.monitorType === MonitorType.IncomingRequest) {
+      const monitorCriteriaInstance: MonitorCriteriaInstance =
+        new MonitorCriteriaInstance();
+
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.All,
+        filters: [
+          {
+            checkOn: CheckOn.RequestBody,
+            filterType: FilterType.NotContains,
+            value: MonitorCriteriaInstance.DEFAULT_INCOMING_BODY_ERROR_KEYWORD,
+          },
+        ],
+        incidents: [],
+        alerts: [],
+        createAlerts: false,
+        changeMonitorStatus: true,
+        createIncidents: false,
+        name: `Check if ${arg.monitorName} is online`,
+        description: `This criteria checks if the request body of ${arg.monitorName} does not contain "${MonitorCriteriaInstance.DEFAULT_INCOMING_BODY_ERROR_KEYWORD}"`,
+      };
+
+      return monitorCriteriaInstance;
+    }
+
+    if (arg.monitorType === MonitorType.IncomingEmail) {
+      const monitorCriteriaInstance: MonitorCriteriaInstance =
+        new MonitorCriteriaInstance();
+
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.All,
+        filters: [
+          {
+            checkOn: CheckOn.EmailBody,
+            filterType: FilterType.NotContains,
+            value: MonitorCriteriaInstance.DEFAULT_INCOMING_BODY_ERROR_KEYWORD,
+          },
+        ],
+        incidents: [],
+        alerts: [],
+        createAlerts: false,
+        changeMonitorStatus: true,
+        createIncidents: false,
+        name: `Check if ${arg.monitorName} is online`,
+        description: `This criteria checks if the email body of ${arg.monitorName} does not contain "${MonitorCriteriaInstance.DEFAULT_INCOMING_BODY_ERROR_KEYWORD}"`,
+      };
+
+      return monitorCriteriaInstance;
+    }
+
+    if (arg.monitorType === MonitorType.SecurityEvents) {
+      const monitorCriteriaInstance: MonitorCriteriaInstance =
+        new MonitorCriteriaInstance();
+
+      /*
+       * Inverse of the Logs default on purpose: silence is the healthy
+       * state for a security-events monitor. Zero matching events means
+       * all clear; matches are what the offline/alerting criteria fires
+       * on.
+       */
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.Any,
+        filters: [
+          {
+            checkOn: CheckOn.SecurityEventCount,
+            filterType: FilterType.EqualTo,
+            value: 0, // no matching security events - all clear.
+          },
+        ],
+        incidents: [],
+        alerts: [],
+        changeMonitorStatus: true,
+        createIncidents: false,
+        createAlerts: false,
+        name: `Check if ${arg.monitorName} is clear`,
+        description: `This criteria checks that ${arg.monitorName} has no matching security events`,
+      };
+
+      return monitorCriteriaInstance;
+    }
+
+    if (arg.monitorType === MonitorType.Logs) {
+      const monitorCriteriaInstance: MonitorCriteriaInstance =
+        new MonitorCriteriaInstance();
+
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.Any,
+        filters: [
+          {
+            checkOn: CheckOn.LogCount,
+            filterType: FilterType.GreaterThan,
+            value: 0, // if there are some logs then monitor is online.
+          },
+        ],
+        incidents: [],
+        alerts: [],
+        changeMonitorStatus: true,
+        createIncidents: false,
+        createAlerts: false,
+        name: `Check if ${arg.monitorName} is online`,
+        description: `This criteria checks if the ${arg.monitorName} is online`,
+      };
+
+      return monitorCriteriaInstance;
+    }
+
+    if (arg.monitorType === MonitorType.Exceptions) {
+      const monitorCriteriaInstance: MonitorCriteriaInstance =
+        new MonitorCriteriaInstance();
+
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.Any,
+        filters: [
+          {
+            checkOn: CheckOn.ExceptionCount,
+            filterType: FilterType.EqualTo,
+            value: 0,
+          },
+        ],
+        incidents: [],
+        alerts: [],
+        changeMonitorStatus: true,
+        createIncidents: false,
+        createAlerts: false,
+        name: `Check if ${arg.monitorName} has no exceptions`,
+        description: `This criteria checks if the ${arg.monitorName} has no exceptions.`,
+      };
+
+      return monitorCriteriaInstance;
+    }
+
+    if (MonitorCriteriaInstance.isMetricBackedMonitorType(arg.monitorType)) {
+      const monitorCriteriaInstance: MonitorCriteriaInstance =
+        new MonitorCriteriaInstance();
+
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.Any,
+        filters: [
+          {
+            checkOn: CheckOn.MetricValue,
+            filterType: FilterType.GreaterThan,
+
+            metricMonitorOptions: {
+              metricAggregationType: EvaluateOverTimeType.AnyValue,
+              metricAlias:
+                arg.metricOptions &&
+                arg.metricOptions.metricAliases &&
+                arg.metricOptions.metricAliases.length > 0
+                  ? arg.metricOptions.metricAliases[0]
+                  : undefined,
+            },
+            value: 0, // the metric is reporting above zero, so the monitor is online.
+          },
+        ],
+        incidents: [],
+        alerts: [],
+        changeMonitorStatus: true,
+        createIncidents: false,
+        createAlerts: false,
+        name: `Check if ${arg.monitorName} is online`,
+        description: `This criteria checks if the ${arg.monitorName} is online`,
+      };
+
+      return monitorCriteriaInstance;
+    }
+
+    if (arg.monitorType === MonitorType.Profiles) {
+      const monitorCriteriaInstance: MonitorCriteriaInstance =
+        new MonitorCriteriaInstance();
+
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.Any,
+        filters: [
+          {
+            checkOn: CheckOn.ProfileCount,
+            filterType: FilterType.GreaterThan,
+            value: 0, // if profiles are arriving then the monitor is online.
+          },
+        ],
+        incidents: [],
+        alerts: [],
+        changeMonitorStatus: true,
+        createIncidents: false,
+        createAlerts: false,
+        name: `Check if ${arg.monitorName} is online`,
+        description: `This criteria checks if the ${arg.monitorName} is online`,
+      };
+
+      return monitorCriteriaInstance;
+    }
+
+    if (arg.monitorType === MonitorType.Traces) {
+      const monitorCriteriaInstance: MonitorCriteriaInstance =
+        new MonitorCriteriaInstance();
+
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.Any,
+        filters: [
+          {
+            checkOn: CheckOn.SpanCount,
+            filterType: FilterType.GreaterThan,
+            value: 0, // if there are some logs then monitor is online.
+          },
+        ],
+        incidents: [],
+        alerts: [],
+        createAlerts: false,
+        changeMonitorStatus: true,
+        createIncidents: false,
+        name: `Check if ${arg.monitorName} is online`,
+        description: `This criteria checks if the ${arg.monitorName} is online`,
+      };
+
+      return monitorCriteriaInstance;
+    }
+
+    if (arg.monitorType === MonitorType.SSLCertificate) {
+      const monitorCriteriaInstance: MonitorCriteriaInstance =
+        new MonitorCriteriaInstance();
+
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.All,
+        filters: [
+          {
+            checkOn: CheckOn.IsValidCertificate,
+            filterType: FilterType.True,
+            value: undefined,
+          },
+        ],
+        incidents: [],
+        alerts: [],
+        createAlerts: false,
+        changeMonitorStatus: true,
+        createIncidents: false,
+        name: `Check if ${arg.monitorName} is online`,
+        description: `This criteria checks if the ${arg.monitorName} is online`,
+      };
+
+      return monitorCriteriaInstance;
+    }
+
+    if (
+      arg.monitorType === MonitorType.CustomJavaScriptCode ||
+      arg.monitorType === MonitorType.SyntheticMonitor
+    ) {
+      const monitorCriteriaInstance: MonitorCriteriaInstance =
+        new MonitorCriteriaInstance();
+
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.All,
+        filters: [
+          {
+            checkOn: CheckOn.Error,
+            filterType: FilterType.IsEmpty,
+            value: undefined,
+          },
+        ],
+        incidents: [],
+        alerts: [],
+        createAlerts: false,
+        changeMonitorStatus: true,
+        createIncidents: false,
+        name: `Check if ${arg.monitorName} is online`,
+        description: `This criteria checks if the ${arg.monitorName} is online`,
+      };
+
+      return monitorCriteriaInstance;
+    }
+
+    if (arg.monitorType === MonitorType.Server) {
+      const monitorCriteriaInstance: MonitorCriteriaInstance =
+        new MonitorCriteriaInstance();
+
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.All,
+        filters: [
+          {
+            checkOn: CheckOn.IsOnline,
+            filterType: FilterType.True,
+            value: undefined,
+          },
+        ],
+        incidents: [],
+        alerts: [],
+        createAlerts: false,
+        changeMonitorStatus: true,
+        createIncidents: false,
+        name: `Check if ${arg.monitorName} is online`,
+        description: `This criteria checks if the ${arg.monitorName} is online`,
+      };
+
+      return monitorCriteriaInstance;
+    }
+
+    if (
+      arg.monitorType === MonitorType.Website ||
+      arg.monitorType === MonitorType.API ||
+      arg.monitorType === MonitorType.Ping ||
+      arg.monitorType === MonitorType.IP ||
+      arg.monitorType === MonitorType.Port
+    ) {
+      const monitorCriteriaInstance: MonitorCriteriaInstance =
+        new MonitorCriteriaInstance();
+
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.All,
+        filters: [
+          {
+            checkOn: CheckOn.IsOnline,
+            filterType: FilterType.True,
+            value: undefined,
+          },
+        ],
+        incidents: [],
+        alerts: [],
+        createAlerts: false,
+        changeMonitorStatus: true,
+        createIncidents: false,
+        name: `Check if ${arg.monitorName} is online`,
+        description: `This criteria checks if the ${arg.monitorName} is online`,
+      };
+
+      if (
+        arg.monitorType === MonitorType.Website ||
+        arg.monitorType === MonitorType.API
+      ) {
+        monitorCriteriaInstance.data.filters.push({
+          checkOn: CheckOn.ResponseStatusCode,
+          filterType: FilterType.EqualTo,
+          value: 200,
+        });
+      }
+
+      return monitorCriteriaInstance;
+    }
+
+    if (arg.monitorType === MonitorType.NetworkDevice) {
+      const monitorCriteriaInstance: MonitorCriteriaInstance =
+        new MonitorCriteriaInstance();
+
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.All,
+        filters: [
+          {
+            checkOn: CheckOn.SnmpIsOnline,
+            filterType: FilterType.True,
+            value: undefined,
+          },
+        ],
+        incidents: [],
+        alerts: [],
+        createAlerts: false,
+        changeMonitorStatus: true,
+        createIncidents: false,
+        name: `Check if ${arg.monitorName} is online`,
+        description: `This criteria checks if the ${arg.monitorName} SNMP device is online`,
+      };
+
+      return monitorCriteriaInstance;
+    }
+
+    if (arg.monitorType === MonitorType.DNS) {
+      const monitorCriteriaInstance: MonitorCriteriaInstance =
+        new MonitorCriteriaInstance();
+
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.All,
+        filters: [
+          {
+            checkOn: CheckOn.DnsIsOnline,
+            filterType: FilterType.True,
+            value: undefined,
+          },
+        ],
+        incidents: [],
+        alerts: [],
+        createAlerts: false,
+        changeMonitorStatus: true,
+        createIncidents: false,
+        name: `Check if ${arg.monitorName} is online`,
+        description: `This criteria checks if the ${arg.monitorName} DNS resolution is online`,
+      };
+
+      return monitorCriteriaInstance;
+    }
+
+    if (arg.monitorType === MonitorType.SQLQuery) {
+      const monitorCriteriaInstance: MonitorCriteriaInstance =
+        new MonitorCriteriaInstance();
+
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.All,
+        filters: [
+          {
+            checkOn: CheckOn.SqlIsOnline,
+            filterType: FilterType.True,
+            value: undefined,
+          },
+        ],
+        incidents: [],
+        alerts: [],
+        createAlerts: false,
+        changeMonitorStatus: true,
+        createIncidents: false,
+        name: `Check if ${arg.monitorName} is online`,
+        description: `This criteria checks if the ${arg.monitorName} database query ran successfully`,
+      };
+
+      return monitorCriteriaInstance;
+    }
+
+    if (arg.monitorType === MonitorType.Database) {
+      const monitorCriteriaInstance: MonitorCriteriaInstance =
+        new MonitorCriteriaInstance();
+
+      /*
+       * Online means one thing only: the probe connected and collected. It
+       * deliberately does NOT assert anything about the metrics. A database
+       * with a 97% cache hit ratio is not "down", and a monitor that treats
+       * every threshold as an outage teaches its operators to ignore it.
+       * Metric thresholds ship as templates the user opts into instead.
+       */
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.All,
+        filters: [
+          {
+            checkOn: CheckOn.DatabaseIsOnline,
+            filterType: FilterType.True,
+            value: undefined,
+          },
+        ],
+        incidents: [],
+        alerts: [],
+        createAlerts: false,
+        changeMonitorStatus: true,
+        createIncidents: false,
+        name: `Check if ${arg.monitorName} is online`,
+        description: `This criteria checks if ${arg.monitorName} is reachable and its health metrics were collected`,
+      };
+
+      return monitorCriteriaInstance;
+    }
+
+    if (arg.monitorType === MonitorType.Domain) {
+      const monitorCriteriaInstance: MonitorCriteriaInstance =
+        new MonitorCriteriaInstance();
+
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.All,
+        filters: [
+          // The registration lookup itself has to have worked.
+          {
+            checkOn: CheckOn.IsOnline,
+            filterType: FilterType.True,
+            value: undefined,
+          },
+          {
+            checkOn: CheckOn.DomainIsExpired,
+            filterType: FilterType.False,
+            value: undefined,
+          },
+        ],
+        incidents: [],
+        alerts: [],
+        createAlerts: false,
+        changeMonitorStatus: true,
+        createIncidents: false,
+        name: `Check if ${arg.monitorName} is not expired`,
+        description: `This criteria checks if the ${arg.monitorName} domain registration was read successfully and is not expired`,
+      };
+
+      return monitorCriteriaInstance;
+    }
+
+    if (arg.monitorType === MonitorType.DNSSEC) {
+      const monitorCriteriaInstance: MonitorCriteriaInstance =
+        new MonitorCriteriaInstance();
+
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.All,
+        filters: [
+          {
+            checkOn: CheckOn.DnssecChainValid,
+            filterType: FilterType.True,
+            value: undefined,
+          },
+        ],
+        incidents: [],
+        alerts: [],
+        createAlerts: false,
+        changeMonitorStatus: true,
+        createIncidents: false,
+        name: `Check if ${arg.monitorName} DNSSEC chain is valid`,
+        description: `This criteria checks if the ${arg.monitorName} DNSSEC chain is valid end-to-end`,
+      };
+
+      return monitorCriteriaInstance;
+    }
+
+    if (arg.monitorType === MonitorType.ExternalStatusPage) {
+      const monitorCriteriaInstance: MonitorCriteriaInstance =
+        new MonitorCriteriaInstance();
+
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.All,
+        filters: [
+          {
+            checkOn: CheckOn.ExternalStatusPageIsOnline,
+            filterType: FilterType.True,
+            value: undefined,
+          },
+          {
+            checkOn: CheckOn.ExternalStatusPageActiveIncidents,
+            filterType: FilterType.EqualTo,
+            value: 0,
+          },
+        ],
+        incidents: [],
+        alerts: [],
+        createAlerts: false,
+        changeMonitorStatus: true,
+        createIncidents: false,
+        name: `Check if ${arg.monitorName} is operational`,
+        description: `This criteria checks if the ${arg.monitorName} external status page is reachable and has no active incidents`,
+      };
+
+      return monitorCriteriaInstance;
+    }
+
+    return null;
+  }
+
+  public static getDefaultOfflineMonitorCriteriaInstance(arg: {
+    monitorType: MonitorType;
+    monitorStatusId: ObjectID;
+    incidentSeverityId: ObjectID;
+    alertSeverityId: ObjectID;
+    monitorName: string;
+    metricOptions?: {
+      metricAliases: Array<string>;
+    };
+  }): MonitorCriteriaInstance {
+    const monitorCriteriaInstance: MonitorCriteriaInstance =
+      new MonitorCriteriaInstance();
+
+    if (
+      arg.monitorType === MonitorType.Ping ||
+      arg.monitorType === MonitorType.IP ||
+      arg.monitorType === MonitorType.Port ||
+      arg.monitorType === MonitorType.Server
+    ) {
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.Any,
+        filters: [
+          {
+            checkOn: CheckOn.IsOnline,
+            filterType: FilterType.False,
+            value: undefined,
+          },
+        ],
+        incidents: [
+          {
+            title: `${arg.monitorName} is offline`,
+            description: `${arg.monitorName} is currently offline.`,
+            incidentSeverityId: arg.incidentSeverityId,
+            autoResolveIncident: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        changeMonitorStatus: true,
+        createIncidents: true,
+        createAlerts: false,
+        alerts: [
+          {
+            title: `${arg.monitorName} is offline`,
+            description: `${arg.monitorName} is currently offline.`,
+            alertSeverityId: arg.alertSeverityId,
+            autoResolveAlert: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        name: `Check if ${arg.monitorName} is offline`,
+        description: `This criteria checks if the ${arg.monitorName} is offline`,
+      };
+    }
+
+    if (arg.monitorType === MonitorType.NetworkDevice) {
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.Any,
+        filters: [
+          {
+            checkOn: CheckOn.SnmpIsOnline,
+            filterType: FilterType.False,
+            value: undefined,
+          },
+        ],
+        incidents: [
+          {
+            title: `${arg.monitorName} is offline`,
+            description: `${arg.monitorName} SNMP device is currently offline.`,
+            incidentSeverityId: arg.incidentSeverityId,
+            autoResolveIncident: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        changeMonitorStatus: true,
+        createIncidents: true,
+        createAlerts: false,
+        alerts: [
+          {
+            title: `${arg.monitorName} is offline`,
+            description: `${arg.monitorName} SNMP device is currently offline.`,
+            alertSeverityId: arg.alertSeverityId,
+            autoResolveAlert: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        name: `Check if ${arg.monitorName} is offline`,
+        description: `This criteria checks if the ${arg.monitorName} SNMP device is offline`,
+      };
+    }
+
+    if (arg.monitorType === MonitorType.DNS) {
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.Any,
+        filters: [
+          {
+            checkOn: CheckOn.DnsIsOnline,
+            filterType: FilterType.False,
+            value: undefined,
+          },
+        ],
+        incidents: [
+          {
+            title: `${arg.monitorName} is offline`,
+            description: `${arg.monitorName} DNS resolution is currently failing.`,
+            incidentSeverityId: arg.incidentSeverityId,
+            autoResolveIncident: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        changeMonitorStatus: true,
+        createIncidents: true,
+        createAlerts: false,
+        alerts: [
+          {
+            title: `${arg.monitorName} is offline`,
+            description: `${arg.monitorName} DNS resolution is currently failing.`,
+            alertSeverityId: arg.alertSeverityId,
+            autoResolveAlert: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        name: `Check if ${arg.monitorName} is offline`,
+        description: `This criteria checks if the ${arg.monitorName} DNS resolution is failing`,
+      };
+    }
+
+    if (arg.monitorType === MonitorType.Database) {
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.Any,
+        filters: [
+          {
+            checkOn: CheckOn.DatabaseIsOnline,
+            filterType: FilterType.False,
+            value: undefined,
+          },
+        ],
+        incidents: [
+          {
+            title: `${arg.monitorName} is offline`,
+            description: `${arg.monitorName} is not reachable, or the health check could not connect.`,
+            incidentSeverityId: arg.incidentSeverityId,
+            autoResolveIncident: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        changeMonitorStatus: true,
+        createIncidents: true,
+        createAlerts: false,
+        alerts: [
+          {
+            title: `${arg.monitorName} is offline`,
+            description: `${arg.monitorName} is not reachable, or the health check could not connect.`,
+            alertSeverityId: arg.alertSeverityId,
+            autoResolveAlert: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        name: `Check if ${arg.monitorName} is offline`,
+        description: `This criteria checks if ${arg.monitorName} is offline`,
+      };
+
+      return monitorCriteriaInstance;
+    }
+
+    if (arg.monitorType === MonitorType.SQLQuery) {
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.Any,
+        filters: [
+          {
+            checkOn: CheckOn.SqlIsOnline,
+            filterType: FilterType.False,
+            value: undefined,
+          },
+        ],
+        incidents: [
+          {
+            title: `${arg.monitorName} is offline`,
+            description: `${arg.monitorName} database query is currently failing.`,
+            incidentSeverityId: arg.incidentSeverityId,
+            autoResolveIncident: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        changeMonitorStatus: true,
+        createIncidents: true,
+        createAlerts: false,
+        alerts: [
+          {
+            title: `${arg.monitorName} is offline`,
+            description: `${arg.monitorName} database query is currently failing.`,
+            alertSeverityId: arg.alertSeverityId,
+            autoResolveAlert: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        name: `Check if ${arg.monitorName} is offline`,
+        description: `This criteria checks if the ${arg.monitorName} database query is failing`,
+      };
+    }
+
+    if (arg.monitorType === MonitorType.Domain) {
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.Any,
+        filters: [
+          {
+            checkOn: CheckOn.DomainIsExpired,
+            filterType: FilterType.True,
+            value: undefined,
+          },
+          /*
+           * Without this, a lookup that returns no registration data at all
+           * leaves every Domain* filter unable to decide, and the monitor
+           * keeps whatever status it had - so a domain whose registration
+           * data cannot be read looks exactly like a healthy one.
+           */
+          {
+            checkOn: CheckOn.IsOnline,
+            filterType: FilterType.False,
+            value: undefined,
+          },
+        ],
+        incidents: [
+          {
+            title: `${arg.monitorName} domain check failed`,
+            description: `${arg.monitorName} domain registration has expired, or its registration data could not be retrieved.`,
+            incidentSeverityId: arg.incidentSeverityId,
+            autoResolveIncident: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        changeMonitorStatus: true,
+        createIncidents: true,
+        createAlerts: false,
+        alerts: [
+          {
+            title: `${arg.monitorName} domain check failed`,
+            description: `${arg.monitorName} domain registration has expired, or its registration data could not be retrieved.`,
+            alertSeverityId: arg.alertSeverityId,
+            autoResolveAlert: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        name: `Check if ${arg.monitorName} domain check failed`,
+        description: `This criteria checks if the ${arg.monitorName} domain registration has expired or could not be read`,
+      };
+    }
+
+    if (arg.monitorType === MonitorType.DNSSEC) {
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.Any,
+        filters: [
+          {
+            checkOn: CheckOn.DnssecChainValid,
+            filterType: FilterType.False,
+            value: undefined,
+          },
+        ],
+        incidents: [
+          {
+            title: `${arg.monitorName} DNSSEC chain is broken`,
+            description: `${arg.monitorName} DNSSEC validation is currently failing.`,
+            incidentSeverityId: arg.incidentSeverityId,
+            autoResolveIncident: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        changeMonitorStatus: true,
+        createIncidents: true,
+        createAlerts: false,
+        alerts: [
+          {
+            title: `${arg.monitorName} DNSSEC chain is broken`,
+            description: `${arg.monitorName} DNSSEC validation is currently failing.`,
+            alertSeverityId: arg.alertSeverityId,
+            autoResolveAlert: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        name: `Check if ${arg.monitorName} DNSSEC chain is broken`,
+        description: `This criteria checks if the ${arg.monitorName} DNSSEC chain is broken`,
+      };
+    }
+
+    if (arg.monitorType === MonitorType.ExternalStatusPage) {
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.Any,
+        filters: [
+          {
+            checkOn: CheckOn.ExternalStatusPageIsOnline,
+            filterType: FilterType.False,
+            value: undefined,
+          },
+          {
+            checkOn: CheckOn.ExternalStatusPageActiveIncidents,
+            filterType: FilterType.GreaterThan,
+            value: 0,
+          },
+          {
+            checkOn: CheckOn.ExternalStatusPageComponentStatus,
+            filterType: FilterType.EqualTo,
+            value: "degraded_performance",
+          },
+          {
+            checkOn: CheckOn.ExternalStatusPageComponentStatus,
+            filterType: FilterType.EqualTo,
+            value: "partial_outage",
+          },
+          {
+            checkOn: CheckOn.ExternalStatusPageComponentStatus,
+            filterType: FilterType.EqualTo,
+            value: "major_outage",
+          },
+          {
+            checkOn: CheckOn.ExternalStatusPageComponentStatus,
+            filterType: FilterType.EqualTo,
+            value: "full_outage",
+          },
+        ],
+        incidents: [
+          {
+            title: `${arg.monitorName} has an active incident or outage`,
+            description: `${arg.monitorName} external status page is reporting an active incident or a non-operational component.`,
+            incidentSeverityId: arg.incidentSeverityId,
+            autoResolveIncident: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        changeMonitorStatus: true,
+        createIncidents: true,
+        createAlerts: false,
+        alerts: [
+          {
+            title: `${arg.monitorName} has an active incident or outage`,
+            description: `${arg.monitorName} external status page is reporting an active incident or a non-operational component.`,
+            alertSeverityId: arg.alertSeverityId,
+            autoResolveAlert: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        name: `Check if ${arg.monitorName} has an active incident or outage`,
+        description: `This criteria checks if the ${arg.monitorName} external status page is unreachable, has an active incident, or has a degraded, partial, or major outage`,
+      };
+    }
+
+    if (
+      arg.monitorType === MonitorType.API ||
+      arg.monitorType === MonitorType.Website
+    ) {
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.Any,
+        filters: [
+          {
+            checkOn: CheckOn.IsOnline,
+            filterType: FilterType.False,
+            value: undefined,
+          },
+          {
+            checkOn: CheckOn.ResponseStatusCode,
+            filterType: FilterType.NotEqualTo,
+            value: 200,
+          },
+        ],
+        alerts: [
+          {
+            title: `${arg.monitorName} is offline`,
+            description: `${arg.monitorName} is currently offline.`,
+            alertSeverityId: arg.alertSeverityId,
+            autoResolveAlert: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        createAlerts: false,
+        incidents: [
+          {
+            title: `${arg.monitorName} is offline`,
+            description: `${arg.monitorName} is currently offline.`,
+            incidentSeverityId: arg.incidentSeverityId,
+            autoResolveIncident: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        changeMonitorStatus: true,
+        createIncidents: true,
+        name: `Check if ${arg.monitorName} is offline`,
+        description: `This criteria checks if the ${arg.monitorName} is offline`,
+      };
+    }
+
+    if (arg.monitorType === MonitorType.SecurityEvents) {
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.Any,
+        filters: [
+          {
+            checkOn: CheckOn.SecurityEventCount,
+            filterType: FilterType.GreaterThan,
+            value: 0, // matching security events were found.
+          },
+        ],
+        incidents: [],
+        alerts: [
+          {
+            title: `${arg.monitorName} detected security events`,
+            description: `${arg.monitorName} found matching security events.`,
+            alertSeverityId: arg.alertSeverityId,
+            autoResolveAlert: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        createAlerts: true,
+        changeMonitorStatus: true,
+        createIncidents: false,
+        name: `Check if ${arg.monitorName} found security events`,
+        description: `This criteria fires when ${arg.monitorName} finds matching security events`,
+      };
+    }
+
+    if (arg.monitorType === MonitorType.Logs) {
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.Any,
+        filters: [
+          {
+            checkOn: CheckOn.LogCount,
+            filterType: FilterType.EqualTo,
+            value: 0, // if there are no logs then the monitor is offline
+          },
+        ],
+        incidents: [
+          {
+            title: `${arg.monitorName} is offline`,
+            description: `${arg.monitorName} is currently offline.`,
+            incidentSeverityId: arg.incidentSeverityId,
+            autoResolveIncident: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        alerts: [
+          {
+            title: `${arg.monitorName} is offline`,
+            description: `${arg.monitorName} is currently offline.`,
+            alertSeverityId: arg.alertSeverityId,
+            autoResolveAlert: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        createAlerts: false,
+        changeMonitorStatus: true,
+        createIncidents: true,
+        name: `Check if ${arg.monitorName} is offline`,
+        description: `This criteria checks if the ${arg.monitorName} is offline`,
+      };
+    }
+
+    if (arg.monitorType === MonitorType.Exceptions) {
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.Any,
+        filters: [
+          {
+            checkOn: CheckOn.ExceptionCount,
+            filterType: FilterType.GreaterThan,
+            value: 0,
+          },
+        ],
+        incidents: [
+          {
+            title: `${arg.monitorName} has exceptions`,
+            description: `${arg.monitorName} has active exceptions.`,
+            incidentSeverityId: arg.incidentSeverityId,
+            autoResolveIncident: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        alerts: [
+          {
+            title: `${arg.monitorName} has exceptions`,
+            description: `${arg.monitorName} has active exceptions.`,
+            alertSeverityId: arg.alertSeverityId,
+            autoResolveAlert: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        createAlerts: false,
+        changeMonitorStatus: true,
+        createIncidents: true,
+        name: `Check if ${arg.monitorName} has exceptions`,
+        description: `This criteria checks if the ${arg.monitorName} has exceptions.`,
+      };
+    }
+
+    if (MonitorCriteriaInstance.isMetricBackedMonitorType(arg.monitorType)) {
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.Any,
+        filters: [
+          {
+            checkOn: CheckOn.MetricValue,
+            filterType: FilterType.EqualTo,
+            metricMonitorOptions: {
+              metricAggregationType: EvaluateOverTimeType.AnyValue,
+              metricAlias:
+                arg.metricOptions &&
+                arg.metricOptions.metricAliases &&
+                arg.metricOptions.metricAliases.length > 0
+                  ? arg.metricOptions.metricAliases[0]
+                  : undefined,
+            },
+            /*
+             * A reported value of zero, not an absent one. When the window
+             * holds no samples at all the evaluator honours
+             * metricMonitorOptions.onNoDataPolicy, which defaults to
+             * Ignore, so silence alone does not fire this - a user who
+             * wants "stopped reporting" to page has to opt into
+             * NoDataPolicy.Trigger or TreatAsZero on the filter.
+             */
+            value: 0,
+          },
+        ],
+        incidents: [
+          {
+            title: `${arg.monitorName} is offline`,
+            description: `${arg.monitorName} is currently offline.`,
+            incidentSeverityId: arg.incidentSeverityId,
+            autoResolveIncident: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        alerts: [
+          {
+            title: `${arg.monitorName} is offline`,
+            description: `${arg.monitorName} is currently offline.`,
+            alertSeverityId: arg.alertSeverityId,
+            autoResolveAlert: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        createAlerts: false,
+        changeMonitorStatus: true,
+        createIncidents: true,
+        name: `Check if ${arg.monitorName} is offline`,
+        description: `This criteria checks if the ${arg.monitorName} is offline`,
+      };
+    }
+
+    if (arg.monitorType === MonitorType.Profiles) {
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.Any,
+        filters: [
+          {
+            checkOn: CheckOn.ProfileCount,
+            filterType: FilterType.EqualTo,
+            value: 0, // if no profiles are arriving then the monitor is offline
+          },
+        ],
+        incidents: [
+          {
+            title: `${arg.monitorName} is offline`,
+            description: `${arg.monitorName} is currently offline.`,
+            incidentSeverityId: arg.incidentSeverityId,
+            autoResolveIncident: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        alerts: [
+          {
+            title: `${arg.monitorName} is offline`,
+            description: `${arg.monitorName} is currently offline.`,
+            alertSeverityId: arg.alertSeverityId,
+            autoResolveAlert: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        createAlerts: false,
+        changeMonitorStatus: true,
+        createIncidents: true,
+        name: `Check if ${arg.monitorName} is offline`,
+        description: `This criteria checks if the ${arg.monitorName} is offline`,
+      };
+    }
+
+    if (arg.monitorType === MonitorType.Traces) {
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.Any,
+        filters: [
+          {
+            checkOn: CheckOn.SpanCount,
+            filterType: FilterType.EqualTo,
+            value: 0, // if there are no logs then the monitor is offline
+          },
+        ],
+        alerts: [
+          {
+            title: `${arg.monitorName} is offline`,
+            description: `${arg.monitorName} is currently offline.`,
+            alertSeverityId: arg.alertSeverityId,
+            autoResolveAlert: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        createAlerts: false,
+        incidents: [
+          {
+            title: `${arg.monitorName} is offline`,
+            description: `${arg.monitorName} is currently offline.`,
+            incidentSeverityId: arg.incidentSeverityId,
+            autoResolveIncident: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        changeMonitorStatus: true,
+        createIncidents: true,
+        name: `Check if ${arg.monitorName} is offline`,
+        description: `This criteria checks if the ${arg.monitorName} is offline`,
+      };
+    }
+
+    if (arg.monitorType === MonitorType.IncomingRequest) {
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.Any,
+        filters: [
+          {
+            /*
+             * If the sender reports an error in the request body, the monitor
+             * is offline.
+             */
+            checkOn: CheckOn.RequestBody,
+            filterType: FilterType.Contains,
+            value: MonitorCriteriaInstance.DEFAULT_INCOMING_BODY_ERROR_KEYWORD,
+          },
+        ],
+        alerts: [
+          {
+            title: `${arg.monitorName} is offline`,
+            description: `${arg.monitorName} is currently offline. The request body contains "${MonitorCriteriaInstance.DEFAULT_INCOMING_BODY_ERROR_KEYWORD}".`,
+            alertSeverityId: arg.alertSeverityId,
+            autoResolveAlert: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        createAlerts: false,
+        incidents: [
+          {
+            title: `${arg.monitorName} is offline`,
+            description: `${arg.monitorName} is currently offline. The request body contains "${MonitorCriteriaInstance.DEFAULT_INCOMING_BODY_ERROR_KEYWORD}".`,
+            incidentSeverityId: arg.incidentSeverityId,
+            autoResolveIncident: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        changeMonitorStatus: true,
+        createIncidents: true,
+        name: `Check if ${arg.monitorName} is offline`,
+        description: `This criteria checks if the request body of ${arg.monitorName} contains "${MonitorCriteriaInstance.DEFAULT_INCOMING_BODY_ERROR_KEYWORD}"`,
+      };
+    }
+
+    if (arg.monitorType === MonitorType.IncomingEmail) {
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.Any,
+        filters: [
+          {
+            /*
+             * If the received email reports an error in its body, the monitor
+             * is offline.
+             */
+            checkOn: CheckOn.EmailBody,
+            filterType: FilterType.Contains,
+            value: MonitorCriteriaInstance.DEFAULT_INCOMING_BODY_ERROR_KEYWORD,
+          },
+        ],
+        alerts: [
+          {
+            title: `${arg.monitorName} is offline`,
+            description: `${arg.monitorName} is currently offline. The email body contains "${MonitorCriteriaInstance.DEFAULT_INCOMING_BODY_ERROR_KEYWORD}".`,
+            alertSeverityId: arg.alertSeverityId,
+            autoResolveAlert: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        createAlerts: false,
+        incidents: [
+          {
+            title: `${arg.monitorName} is offline`,
+            description: `${arg.monitorName} is currently offline. The email body contains "${MonitorCriteriaInstance.DEFAULT_INCOMING_BODY_ERROR_KEYWORD}".`,
+            incidentSeverityId: arg.incidentSeverityId,
+            autoResolveIncident: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        changeMonitorStatus: true,
+        createIncidents: true,
+        name: `Check if ${arg.monitorName} is offline`,
+        description: `This criteria checks if the email body of ${arg.monitorName} contains "${MonitorCriteriaInstance.DEFAULT_INCOMING_BODY_ERROR_KEYWORD}"`,
+      };
+    }
+
+    if (
+      arg.monitorType === MonitorType.CustomJavaScriptCode ||
+      arg.monitorType === MonitorType.SyntheticMonitor
+    ) {
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.Any,
+        filters: [
+          {
+            checkOn: CheckOn.Error,
+            filterType: FilterType.IsNotEmpty,
+            value: undefined,
+          },
+        ],
+        alerts: [
+          {
+            title: `${arg.monitorName} is offline`,
+            description: `${arg.monitorName} is currently offline.`,
+            alertSeverityId: arg.alertSeverityId,
+            autoResolveAlert: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        createAlerts: false,
+        incidents: [
+          {
+            title: `${arg.monitorName} is offline`,
+            description: `${arg.monitorName} is currently offline.`,
+            incidentSeverityId: arg.incidentSeverityId,
+            autoResolveIncident: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        changeMonitorStatus: true,
+        createIncidents: true,
+        name: `Check if ${arg.monitorName} is offline`,
+        description: `This criteria checks if the ${arg.monitorName} is offline`,
+      };
+    }
+
+    if (arg.monitorType === MonitorType.SSLCertificate) {
+      monitorCriteriaInstance.data = {
+        id: ObjectID.generate().toString(),
+        monitorStatusId: arg.monitorStatusId,
+        filterCondition: FilterCondition.Any,
+        alerts: [
+          {
+            title: `${arg.monitorName} is offline`,
+            description: `${arg.monitorName} is currently offline.`,
+            alertSeverityId: arg.alertSeverityId,
+            autoResolveAlert: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        createAlerts: false,
+        filters: [
+          {
+            checkOn: CheckOn.IsNotAValidCertificate,
+            filterType: FilterType.True,
+            value: undefined,
+          },
+        ],
+        incidents: [
+          {
+            title: `${arg.monitorName} is offline`,
+            description: `${arg.monitorName} is currently offline.`,
+            incidentSeverityId: arg.incidentSeverityId,
+            autoResolveIncident: true,
+            id: ObjectID.generate().toString(),
+            onCallPolicyIds: [],
+          },
+        ],
+        changeMonitorStatus: true,
+        createIncidents: true,
+        name: `Check if ${arg.monitorName} is offline`,
+        description: `This criteria checks if the ${arg.monitorName} is offline`,
+      };
+    }
+
+    return monitorCriteriaInstance;
+  }
+
+  public static getNewMonitorCriteriaInstanceAsJSON(): JSONObject {
+    return {
+      id: ObjectID.generate().toString(),
+      monitorStatusId: undefined,
+      filterCondition: FilterCondition.All,
+      filters: [
+        {
+          checkOn: CheckOn.IsOnline,
+          filterType: FilterType.True,
+          value: undefined,
+        },
+      ],
+      incidents: [],
+      name: "",
+      description: "",
+      createIncidents: false,
+      changeMonitorStatus: false,
+    };
+  }
+
+  public static getValidationError(
+    value: MonitorCriteriaInstance,
+    monitorType: MonitorType,
+  ): string | null {
+    if (!value.data) {
+      return `Monitor Step is required.`;
+    }
+
+    if (value.data.filters.length === 0) {
+      return `Filter is required for criteria "${value.data.name}"`;
+    }
+
+    if (!value.data.name) {
+      return `Name is required for criteria "${value.data.name}"`;
+    }
+
+    if (!value.data.description) {
+      return `Description is required for criteria "${value.data.name}"`;
+    }
+
+    /*
+     * Each "when filters match, ..." action is validated only while its own
+     * switch is on.
+     *
+     * The criteria form keeps the incident / alert rows it seeded when a
+     * switch was turned on, so that turning the switch back on restores what
+     * was typed - the same retained-but-inert config that
+     * MonitorStepsReferenceExtractor documents for project references. The
+     * evaluator ignores those rows entirely while the flag is off
+     * (MonitorIncident.criteriaMetCreateIncidentsAndUpdateMonitorStatus,
+     * MonitorAlert.criteriaMetCreateAlertsAndUpdateMonitorStatus), so
+     * validating them anyway only blocked the form: the row is rendered only
+     * while its switch is on, which left the user staring at "Incident title
+     * is required" with no field on screen to type it into and no way past
+     * Next (issues #3410, #3413).
+     *
+     * The predicate is the falsy one the evaluator uses, not `!== false`, so
+     * a criteria saved before these flags existed - populated rows, no flag -
+     * is treated as off here exactly as it already is at runtime.
+     *
+     * Title and severity are the two fields the form marks required; the
+     * description is not one of them. It sits in a collapsed section labelled
+     * "Optional incident description" / "Optional alert description", and both
+     * Incident.description and Alert.description are nullable columns. So it is
+     * not required here either - demanding it stuck the form on a field the UI
+     * calls optional and keeps folded away, which is the second half of #3410.
+     */
+    if (value.data.createIncidents) {
+      for (const incident of value.data.incidents) {
+        if (!incident) {
+          continue;
+        }
+
+        if (!incident.title) {
+          return `Incident title is required for criteria "${value.data.name}"`;
+        }
+
+        if (!incident.incidentSeverityId) {
+          return `Incident severity is required for criteria "${value.data.name}"`;
+        }
+      }
+    }
+
+    if (value.data.createAlerts) {
+      for (const alert of value.data.alerts) {
+        if (!alert) {
+          continue;
+        }
+
+        if (!alert.title) {
+          return `Alert title is required for criteria "${value.data.name}"`;
+        }
+
+        if (!alert.alertSeverityId) {
+          return `Alert severity is required for criteria "${value.data.name}"`;
+        }
+      }
+    }
+
+    for (const filter of value.data.filters) {
+      if (!filter.checkOn) {
+        return `Filter Type is required for criteria "${value.data.name}"`;
+      }
+
+      /*
+       * A filter with no condition is silently dead: every comparator in
+       * CompareCriteria switches on the filter type and returns "no
+       * match" for one it does not recognise, so the criteria never
+       * fires. The empty dropdown is easy to walk past when every field
+       * around it is filled in, so refuse the save instead of accepting
+       * a rule that can never be true.
+       */
+      if (!filter.filterType) {
+        return `Filter Condition is required for criteria "${value.data.name}" on filter type: ${filter.checkOn}`;
+      }
+
+      if (
+        monitorType === MonitorType.Ping &&
+        filter.checkOn !== CheckOn.IsOnline &&
+        filter.checkOn !== CheckOn.ResponseTime &&
+        filter.checkOn !== CheckOn.IsRequestTimeout
+      ) {
+        return "Ping Monitor cannot have filter type: " + filter.checkOn;
+      }
+
+      if (
+        filter.checkOn === CheckOn.DiskUsagePercent &&
+        !filter.serverMonitorOptions?.diskPath
+      ) {
+        return "Disk Path is required for Disk Usage Percent";
+      }
+
+      if (
+        CriteriaFilterUtil.hasValueField({
+          checkOn: filter.checkOn,
+          filterType: filter.filterType,
+        })
+      ) {
+        if (!filter.value && filter.value !== 0) {
+          return `Value is required for criteria "${value.data.name}" on filter type: ${filter.checkOn}`;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  public setName(name: string): MonitorCriteriaInstance {
+    if (this.data) {
+      this.data.name = name;
+    }
+
+    return this;
+  }
+
+  public setDescription(description: string): MonitorCriteriaInstance {
+    if (this.data) {
+      this.data.description = description;
+    }
+
+    return this;
+  }
+
+  public static clone(
+    monitorCriteriaInstance: MonitorCriteriaInstance,
+  ): MonitorCriteriaInstance {
+    return MonitorCriteriaInstance.fromJSON(monitorCriteriaInstance.toJSON());
+  }
+
+  public setMonitorStatusId(
+    monitorStatusId: ObjectID | undefined,
+  ): MonitorCriteriaInstance {
+    if (this.data) {
+      this.data.monitorStatusId = monitorStatusId;
+    }
+
+    return this;
+  }
+
+  public setFilterCondition(
+    filterCondition: FilterCondition,
+  ): MonitorCriteriaInstance {
+    if (this.data) {
+      this.data.filterCondition = filterCondition;
+    }
+
+    return this;
+  }
+
+  public setFilters(filters: Array<CriteriaFilter>): MonitorCriteriaInstance {
+    if (this.data) {
+      this.data.filters = filters;
+    }
+
+    return this;
+  }
+
+  public setIncidents(
+    incidents: Array<CriteriaIncident>,
+  ): MonitorCriteriaInstance {
+    if (this.data) {
+      this.data.incidents = [...incidents];
+    }
+
+    return this;
+  }
+
+  public setAlerts(alerts: Array<CriteriaAlert>): MonitorCriteriaInstance {
+    if (this.data) {
+      this.data.alerts = [...alerts];
+    }
+
+    return this;
+  }
+
+  public setChangeMonitorStatus(
+    changeMonitorStatus: boolean | undefined,
+  ): MonitorCriteriaInstance {
+    if (this.data) {
+      this.data.changeMonitorStatus = changeMonitorStatus;
+    }
+
+    return this;
+  }
+
+  public setCreateIncidents(
+    createIncidents: boolean | undefined,
+  ): MonitorCriteriaInstance {
+    if (this.data) {
+      this.data.createIncidents = createIncidents;
+    }
+
+    return this;
+  }
+
+  public setCreateAlerts(
+    createAlerts: boolean | undefined,
+  ): MonitorCriteriaInstance {
+    if (this.data) {
+      this.data.createAlerts = createAlerts;
+    }
+
+    return this;
+  }
+
+  public setIsEnabled(isEnabled: boolean | undefined): MonitorCriteriaInstance {
+    if (this.data) {
+      this.data.isEnabled = isEnabled;
+    }
+
+    return this;
+  }
+
+  public setIncidentGrouping(
+    incidentGrouping: IncidentGroupingConfig | undefined,
+  ): MonitorCriteriaInstance {
+    if (this.data) {
+      this.data.incidentGrouping = incidentGrouping;
+    }
+
+    return this;
+  }
+
+  public override toJSON(): JSONObject {
+    if (!this.data) {
+      return MonitorCriteriaInstance.getNewMonitorCriteriaInstanceAsJSON();
+    }
+
+    return JSONFunctions.serialize({
+      _type: ObjectType.MonitorCriteriaInstance,
+      value: {
+        id: this.data.id,
+        monitorStatusId: this.data.monitorStatusId?.toString(),
+        filterCondition: this.data.filterCondition,
+        filters: this.data.filters,
+        incidents: this.data.incidents,
+        alerts: this.data.alerts,
+        createAlerts: this.data.createAlerts,
+        changeMonitorStatus: this.data.changeMonitorStatus,
+        createIncidents: this.data.createIncidents,
+        isEnabled: this.data.isEnabled,
+        incidentGrouping: this.data.incidentGrouping,
+        name: this.data.name,
+        description: this.data.description,
+      } as any,
+    });
+  }
+
+  public static override fromJSON(json: JSONObject): MonitorCriteriaInstance {
+    if (json instanceof MonitorCriteriaInstance) {
+      return json;
+    }
+
+    if (!json) {
+      throw new BadDataException("json is null");
+    }
+
+    if (!json["_type"]) {
+      throw new BadDataException("json._type is null");
+    }
+
+    if (json["_type"] !== ObjectType.MonitorCriteriaInstance) {
+      throw new BadDataException(
+        "json._type should be MonitorCriteriaInstance",
+      );
+    }
+
+    if (!json["value"]) {
+      throw new BadDataException("json.value is null");
+    }
+
+    json = json["value"] as JSONObject;
+
+    if (!json["filterCondition"]) {
+      throw new BadDataException("json.filterCondition is null");
+    }
+
+    if (!json["filters"]) {
+      throw new BadDataException("json.filters is null");
+    }
+
+    if (!Array.isArray(json["filters"])) {
+      throw new BadDataException("json.filters should be an array");
+    }
+
+    if (!json["incidents"]) {
+      json["incidents"] = [];
+    }
+
+    if (!Array.isArray(json["incidents"])) {
+      throw new BadDataException("json.incidents should be an array");
+    }
+
+    if (!json["alerts"]) {
+      json["alerts"] = [];
+    }
+
+    if (!Array.isArray(json["alerts"])) {
+      throw new BadDataException("json.alerts should be an array");
+    }
+
+    let monitorStatusId: ObjectID | undefined = undefined;
+
+    if (
+      json["monitorStatusId"] &&
+      typeof json["monitorStatusId"] === Typeof.String
+    ) {
+      monitorStatusId = new ObjectID(json["monitorStatusId"] as string);
+    } else if (
+      json["monitorStatusId"] &&
+      (json["monitorStatusId"] as JSONObject)["value"] !== null
+    ) {
+      monitorStatusId = new ObjectID(
+        (json["monitorStatusId"] as JSONObject)["value"] as string,
+      );
+    }
+
+    const filterCondition: FilterCondition = json[
+      "filterCondition"
+    ] as FilterCondition;
+
+    const filters: Array<CriteriaFilter> = [];
+
+    const incidents: Array<CriteriaIncident> = [];
+
+    for (const filter of json["filters"]) {
+      filters.push({ ...(filter as any) });
+    }
+
+    for (const incident of json["incidents"]) {
+      incidents.push({ ...(incident as any) });
+    }
+
+    const alerts: Array<CriteriaAlert> = [];
+
+    for (const alert of json["alerts"]) {
+      alerts.push({ ...(alert as any) });
+    }
+
+    const monitorCriteriaInstance: MonitorCriteriaInstance =
+      new MonitorCriteriaInstance();
+
+    monitorCriteriaInstance.data = JSONFunctions.deserialize({
+      id: (json["id"] as string) || ObjectID.generate().toString(),
+      monitorStatusId,
+      filterCondition,
+      changeMonitorStatus: (json["changeMonitorStatus"] as boolean) || false,
+      createIncidents: (json["createIncidents"] as boolean) || false,
+      createAlerts: (json["createAlerts"] as boolean) || false,
+      isEnabled:
+        json["isEnabled"] === undefined ? true : (json["isEnabled"] as boolean),
+      incidentGrouping: (json["incidentGrouping"] as any) || undefined,
+      filters: filters as any,
+      incidents: incidents as any,
+      alerts: alerts as any,
+      name: (json["name"] as string) || "",
+      description: (json["description"] as string) || "",
+    }) as any;
+
+    return monitorCriteriaInstance;
+  }
+
+  public static override getSchema(): ZodSchema {
+    return Zod.object({
+      _type: Zod.literal(ObjectType.MonitorCriteriaInstance),
+      value: Zod.object({
+        id: Zod.string(),
+        monitorStatusId: Zod.any(),
+        filterCondition: Zod.any(),
+        filters: Zod.array(CriteriaFilterSchema),
+        incidents: Zod.array(CriteriaIncidentSchema),
+        alerts: Zod.array(CriteriaAlertSchema),
+        name: Zod.string(),
+        description: Zod.string(),
+        changeMonitorStatus: Zod.boolean().optional(),
+        createIncidents: Zod.boolean().optional(),
+        createAlerts: Zod.boolean().optional(),
+        isEnabled: Zod.boolean().optional(),
+        incidentGrouping: IncidentGroupingConfigSchema.optional(),
+      }).openapi({
+        type: "object",
+        example: {
+          id: "id",
+          monitorStatusId: "statusId",
+          filterCondition: "All",
+          filters: [],
+          incidents: [],
+          alerts: [],
+          name: "Criteria Name",
+          description: "Description",
+        },
+      }),
+    }).openapi({
+      type: "object",
+      description: "MonitorCriteriaInstance object",
+      example: {
+        _type: ObjectType.MonitorCriteriaInstance,
+        value: {
+          id: "id",
+          monitorStatusId: "statusId",
+          filterCondition: "All",
+          filters: [],
+          incidents: [],
+          alerts: [],
+          name: "Criteria Name",
+          description: "Description",
+        },
+      },
+    });
+  }
+
+  public static isValid(_json: JSONObject): boolean {
+    return true;
+  }
+
+  protected static override toDatabase(
+    value: MonitorCriteriaInstance | FindOperator<MonitorCriteriaInstance>,
+  ): JSONObject | null {
+    if (value && value instanceof MonitorCriteriaInstance) {
+      return (value as MonitorCriteriaInstance).toJSON();
+    } else if (value) {
+      return JSONFunctions.serialize(value as any);
+    }
+
+    return null;
+  }
+
+  protected static override fromDatabase(
+    value: JSONObject,
+  ): MonitorCriteriaInstance | null {
+    if (value) {
+      return MonitorCriteriaInstance.fromJSON(value);
+    }
+
+    return null;
+  }
+
+  public override toString(): string {
+    return JSON.stringify(this.toJSON());
+  }
+}

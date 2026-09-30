@@ -12,8 +12,57 @@ Usage:
 {{- end -}}
 
 {{/*
+The effective settings for the cache/queue tier, which runs Valkey.
+
+These lived under `redis:` and `externalRedis:` until 13.0.0. Both old keys are
+still honoured -- a values.yaml written against any earlier chart has to keep
+working with no edits -- so every template reads through these helpers instead of
+touching `.Values.valkey` directly.
+
+Precedence is "whatever you actually wrote wins": the chart ships its defaults
+under `valkey:` and ships `redis:` EMPTY, so anything present in `.Values.redis`
+can only have come from the user and is layered on top. The consequence, for the
+one person who sets both names for the same setting, is that the legacy name
+wins; NOTES.txt tells them to drop it.
+
+Usage:
+{{- $valkey := include "oneuptime.valkey" . | fromYaml }}
+*/}}
+{{- define "oneuptime.valkey" -}}
+{{- mergeOverwrite (deepCopy (.Values.valkey | default dict)) (.Values.redis | default dict) | toYaml -}}
+{{- end -}}
+
+{{/*
+Same, for the external (bring-your-own) cache. Any Redis-protocol server is
+valid there, real Redis included -- only the values key changed name.
+
+Usage:
+{{- $externalValkey := include "oneuptime.externalValkey" . | fromYaml }}
+*/}}
+{{- define "oneuptime.externalValkey" -}}
+{{- mergeOverwrite (deepCopy (.Values.externalValkey | default dict)) (.Values.externalRedis | default dict) | toYaml -}}
+{{- end -}}
+
+{{/*
+The Service port for the in-cluster cache. `master.service.ports.valkey` is the
+current key and `ports.redis` is the legacy one, and this is the ONE setting
+where the two names differ, so the map merge cannot resolve it: it keeps both
+sub-keys, and the chart's own `valkey: "6379"` default would beat a legacy
+`redis: "6380"` override. Reading the legacy key first is what stops that, and
+it matches the precedence rule above -- if you wrote it, it wins.
+
+Usage:
+{{- include "oneuptime.valkey.port" . }}
+*/}}
+{{- define "oneuptime.valkey.port" -}}
+{{- $valkey := include "oneuptime.valkey" . | fromYaml -}}
+{{- $ports := (($valkey.master).service).ports | default dict -}}
+{{- $ports.redis | default $ports.valkey | default "6379" -}}
+{{- end -}}
+
+{{/*
 Convert a Kubernetes memory quantity (e.g. "3Gi", "512Mi", "2G", "1500M") to a
-plain byte count. Used to derive Redis' `maxmemory` from its container memory
+plain byte count. Used to derive the cache's `maxmemory` from its container memory
 limit so the two never drift apart. Unsuffixed input is treated as bytes.
 */}}
 {{- define "oneuptime.memoryToBytes" -}}
@@ -116,12 +165,34 @@ its userlist at startup.
   {{- $provisionSSL = default false $.Values.ssl.provision -}}
 {{- end }}
 
+{{- /*
+IS_ENTERPRISE_EDITION is deprecated and never turns anything on. It is derived
+from image.type, so it always agrees with the image (true on a Community image
+would make the App refuse to start). What the App runs is decided by the image (image.type picks the
+enterprise- tags, and the Enterprise image carries ONEUPTIME_EDITION=enterprise
+itself), so the chart must never set ONEUPTIME_EDITION: an empty or wrong value
+here would override the image's own marker.
+*/}}
 - name: IS_ENTERPRISE_EDITION
   value: {{ (ternary "true" "false" $isEnterpriseEdition) | squote }}
 - name: MICROSOFT_TEAMS_APP_CLIENT_ID
+  {{- if $.Values.microsoftTeamsApp.existingSecret }}
+  valueFrom:
+    secretKeyRef:
+      name: {{ $.Values.microsoftTeamsApp.existingSecret.name | quote }}
+      key: {{ $.Values.microsoftTeamsApp.existingSecret.clientIdKey | quote }}
+  {{- else }}
   value: {{ $.Values.microsoftTeamsApp.clientId }}
+  {{- end }}
 - name: MICROSOFT_TEAMS_APP_TENANT_ID
+  {{- if $.Values.microsoftTeamsApp.existingSecret }}
+  valueFrom:
+    secretKeyRef:
+      name: {{ $.Values.microsoftTeamsApp.existingSecret.name | quote }}
+      key: {{ $.Values.microsoftTeamsApp.existingSecret.tenantIdKey | quote }}
+  {{- else }}
   value: {{ $.Values.microsoftTeamsApp.tenantId }}
+  {{- end }}
 
 {{- if $.Values.openTelemetryExporter.endpoint }}
 - name: OPENTELEMETRY_EXPORTER_OTLP_ENDPOINT
@@ -130,6 +201,14 @@ its userlist at startup.
 {{- if $.Values.openTelemetryExporter.headers }}
 - name: OPENTELEMETRY_EXPORTER_OTLP_HEADERS
   value: {{ $.Values.openTelemetryExporter.headers }}
+{{- end }}
+{{- if $.Values.browserOpenTelemetryExporter.endpoint }}
+- name: PUBLIC_OPENTELEMETRY_EXPORTER_OTLP_ENDPOINT
+  value: {{ $.Values.browserOpenTelemetryExporter.endpoint }}
+{{- end }}
+{{- if $.Values.browserOpenTelemetryExporter.browserIngestionKey }}
+- name: PUBLIC_OPENTELEMETRY_EXPORTER_OTLP_BROWSER_INGESTION_KEY
+  value: {{ $.Values.browserOpenTelemetryExporter.browserIngestionKey }}
 {{- end }}
 - name: SLACK_APP_CLIENT_ID
   {{- if $.Values.slackApp.existingSecret }}
@@ -182,10 +261,28 @@ its userlist at startup.
   value: {{ $.Values.analytics.key }}
 - name: ANALYTICS_HOST
   value: {{ $.Values.analytics.host }}
+- name: MARKETING_WEBHOOK_URL
+  value: {{ default "" ((($.Values.marketing).webhook).url) | quote }}
+- name: MARKETING_WEBHOOK_SECRET
+  value: {{ default "" ((($.Values.marketing).webhook).secret) | quote }}
+{{- $googleTagManagerEnabled := ((($.Values.analytics).googleTagManager).enabled) }}
+- name: GOOGLE_TAG_MANAGER_ENABLED
+  value: {{ if kindIs "invalid" $googleTagManagerEnabled }}"true"{{ else }}{{ ternary "true" "false" $googleTagManagerEnabled | quote }}{{ end }}
 - name: CAPTCHA_ENABLED
   value: {{ ternary "true" "false" (default false $.Values.captcha.enabled) | quote }}
 - name: CAPTCHA_SITE_KEY
   value: {{ default "" $.Values.captcha.siteKey | quote }}
+# Outbound webhook egress policy. Off by default and instance-wide; there is no
+# per-project setting. See values.yaml for the full explanation.
+- name: ALLOW_PRIVATE_NETWORK_WEBHOOKS
+  value: {{ ternary "true" "false" (default false (($.Values.webhooks).allowPrivateNetwork)) | quote }}
+- name: PRIVATE_NETWORK_WEBHOOK_ALLOWLIST
+  value: {{ default "" (($.Values.webhooks).privateNetworkAllowlist) | quote }}
+# Egress policy for everything that is not a webhook (data sources, LLM
+# providers, SMTP, OIDC, runbook HTTP steps). Off by default, so private ranges
+# stay reachable on a self-hosted install. See values.yaml.
+- name: DATA_SOURCE_BLOCK_PRIVATE_ADDRESSES
+  value: {{ ternary "true" "false" (default false (($.Values.outboundConnections).blockPrivateNetwork)) | quote }}
 - name: VAPID_PUBLIC_KEY
   value: {{ $.Values.vapid.publicKey }}
 - name: VAPID_SUBJECT
@@ -206,6 +303,12 @@ its userlist at startup.
   value: {{ $.Values.home.ports.http | squote }}
 - name: WORKER_CONCURRENCY
   value: {{ $.Values.app.workerConcurrency | default 100 | squote }}
+# Ack mode for telemetry ClickHouse inserts. Default false = fire-and-forget
+# async inserts (ClickHouse owns flushing; acks mean "accepted into the
+# async-insert buffer"). Set true to make acks wait for the durable flush —
+# each waiting insert then holds a ClickHouse query slot until flushed.
+- name: TELEMETRY_WAIT_FOR_ASYNC_INSERT
+  value: {{ $.Values.telemetryWaitForAsyncInsert | default false | quote }}
 - name: IP_WHITELIST
   value: {{ default "" $.Values.ipWhitelist | quote }}
 {{- include "oneuptime.env.globalLlmProvider" $ }}
@@ -260,11 +363,11 @@ GLOBAL_LLM_PROVIDER_API_KEY is rendered only when an API key is configured.
   {{- if $.Values.oneuptimeSecret }}
   value: {{ $.Values.oneuptimeSecret }}
   {{- else }}
-  {{- if $.Values.externalSecrets.oneuptimeSecret.existingSecret.name }}
+  {{- if ((($.Values.externalSecrets).oneuptimeSecret).existingSecret).name }}
   valueFrom:
     secretKeyRef:
-        name: {{ $.Values.externalSecrets.oneuptimeSecret.existingSecret.name }}
-        key: {{ $.Values.externalSecrets.oneuptimeSecret.existingSecret.passwordKey }}
+      name: {{ ((($.Values.externalSecrets).oneuptimeSecret).existingSecret).name }}
+      key: {{ ((($.Values.externalSecrets).oneuptimeSecret).existingSecret).passwordKey }}
   {{- else }}
   valueFrom:
     secretKeyRef:
@@ -279,11 +382,11 @@ GLOBAL_LLM_PROVIDER_API_KEY is rendered only when an API key is configured.
   {{- if $.Values.registerProbeKey }}
   value: {{ $.Values.registerProbeKey }}
   {{- else }}
-  {{- if $.Values.externalSecrets.registerProbeKey.existingSecret.name }}
+  {{- if ((($.Values.externalSecrets).registerProbeKey).existingSecret).name }}
   valueFrom:
     secretKeyRef:
-        name: {{ $.Values.externalSecrets.registerProbeKey.existingSecret.name }}
-        key: {{ $.Values.externalSecrets.registerProbeKey.existingSecret.passwordKey }}
+      name: {{ ((($.Values.externalSecrets).registerProbeKey).existingSecret).name }}
+      key: {{ ((($.Values.externalSecrets).registerProbeKey).existingSecret).passwordKey }}
   {{- else }}
   valueFrom:
     secretKeyRef:
@@ -325,7 +428,14 @@ GLOBAL_LLM_PROVIDER_API_KEY is rendered only when an API key is configured.
   {{- end }}
 
 - name: MICROSOFT_TEAMS_APP_CLIENT_SECRET
+  {{- if $.Values.microsoftTeamsApp.existingSecret }}
+  valueFrom:
+    secretKeyRef:
+      name: {{ $.Values.microsoftTeamsApp.existingSecret.name | quote }}
+      key: {{ $.Values.microsoftTeamsApp.existingSecret.clientSecretKey | quote }}
+  {{- else }}
   value: {{ $.Values.microsoftTeamsApp.clientSecret }}
+  {{- end }}
 
 - name: GITHUB_APP_CLIENT_SECRET
   value: {{ $.Values.gitHubApp.clientSecret }}
@@ -364,11 +474,11 @@ GLOBAL_LLM_PROVIDER_API_KEY is rendered only when an API key is configured.
   {{- if $.Values.encryptionSecret }}
   value: {{ $.Values.encryptionSecret }}
   {{- else }}
-  {{- if $.Values.externalSecrets.encryptionSecret.existingSecret.name }}
+  {{- if ((($.Values.externalSecrets).encryptionSecret).existingSecret).name }}
   valueFrom:
     secretKeyRef:
-        name: {{ $.Values.externalSecrets.encryptionSecret.existingSecret.name }}
-        key: {{ $.Values.externalSecrets.encryptionSecret.existingSecret.passwordKey }}
+      name: {{ ((($.Values.externalSecrets).encryptionSecret).existingSecret).name }}
+      key: {{ ((($.Values.externalSecrets).encryptionSecret).existingSecret).passwordKey }}
   {{- else }}
   valueFrom:
     secretKeyRef:
@@ -509,91 +619,90 @@ GLOBAL_LLM_PROVIDER_API_KEY is rendered only when an API key is configured.
 
 
 
-- name: REDIS_HOST
-  {{- if $.Values.redis.enabled }}
-  value: {{ $.Release.Name }}-redis-master.{{ $.Release.Namespace }}.svc.{{ $.Values.global.clusterDomain }}
-  {{- else }}
-  value: {{ $.Values.externalRedis.host }}
-  {{- end }}
-- name: REDIS_PORT
-  {{- if $.Values.redis.enabled }}
-  value: {{ printf "%s" $.Values.redis.master.service.ports.redis | quote }}
-  {{- else }}
-  value: {{ $.Values.externalRedis.port | quote }}
-  {{- end }}
-- name: REDIS_PASSWORD
-  {{- if $.Values.redis.enabled }}
+{{/*
+  Cache / queue wiring.
+
+  Every setting is emitted TWICE: once as VALKEY_*, and once as the REDIS_* name
+  it used until 13.0.0, carrying the identical value. The app reads VALKEY_*
+  and only falls back to REDIS_*, so for a matching image the second copy is
+  dead weight -- it is here because `image.tag` is a documented pin (the
+  production checklist tells you to set it), so a chart from after the rename
+  routinely runs an app image from before it. Dropping the REDIS_* copy silently
+  points those pods at the "redis" default hostname instead.
+*/}}
+{{- $valkey := include "oneuptime.valkey" . | fromYaml }}
+{{- $externalValkey := include "oneuptime.externalValkey" . | fromYaml }}
+
+{{- $valkeyHost := ternary (printf "%s-valkey-master.%s.svc.%s" $.Release.Name $.Release.Namespace $.Values.global.clusterDomain) (toString ($externalValkey.host | default "")) $valkey.enabled }}
+{{- $valkeyPort := ternary (include "oneuptime.valkey.port" .) (toString ($externalValkey.port | default "")) $valkey.enabled }}
+{{- $valkeyDb := ternary "0" (toString ($externalValkey.database | default "")) $valkey.enabled }}
+{{- $valkeyUsername := ternary "default" (toString ($externalValkey.username | default "")) $valkey.enabled }}
+{{- $valkeyIpFamily := ternary (toString ($valkey.ipFamily | default "")) (toString ($externalValkey.ipFamily | default "")) $valkey.enabled }}
+
+{{- range $name := (list "VALKEY" "REDIS") }}
+- name: {{ $name }}_HOST
+  value: {{ $valkeyHost | quote }}
+- name: {{ $name }}_PORT
+  value: {{ $valkeyPort | quote }}
+- name: {{ $name }}_PASSWORD
+  {{- if $valkey.enabled }}
   valueFrom:
     secretKeyRef:
-      {{- if .Values.redis.auth.existingSecret.name }}
-      name: {{ .Values.redis.auth.existingSecret.name }}
-      key: {{ .Values.redis.auth.existingSecret.passwordKey }}
+      {{- if $valkey.auth.existingSecret.name }}
+      name: {{ $valkey.auth.existingSecret.name }}
+      key: {{ $valkey.auth.existingSecret.passwordKey }}
       {{- else }}
-      name: {{ .Release.Name }}-redis
-      key: redis-password
+      name: {{ $.Release.Name }}-valkey
+      key: valkey-password
       {{- end }}
   {{- else }}
-  {{- if $.Values.externalRedis.password }}
+  {{- if $externalValkey.password }}
   valueFrom:
     secretKeyRef:
-        name: {{ printf "%s-%s" $.Release.Name "external-redis"  }}
+        name: {{ printf "%s-%s" $.Release.Name "external-valkey"  }}
         key: password
   {{- end }}
-  {{- if $.Values.externalRedis.existingSecret.name }}
+  {{- if $externalValkey.existingSecret.name }}
   valueFrom:
     secretKeyRef:
-        name: {{ printf "%s" $.Values.externalRedis.existingSecret.name }}
-        key: {{ $.Values.externalRedis.existingSecret.passwordKey }}
+        name: {{ printf "%s" $externalValkey.existingSecret.name }}
+        key: {{ $externalValkey.existingSecret.passwordKey }}
   {{- end }}
   {{- end }}
-- name: REDIS_IP_FAMILY
-  {{- if $.Values.redis.enabled }}
-  value: {{ $.Values.redis.ipFamily | quote }}
-  {{- else }}
-  value: {{ $.Values.externalRedis.ipFamily | quote }}
-  {{- end }}
-- name: REDIS_DB
-  {{- if $.Values.redis.enabled }}
-  value: {{ printf "0" | squote}}
-  {{- else }}
-  value: {{ $.Values.externalRedis.database | quote }}
-  {{- end }}
-- name: REDIS_USERNAME
-  {{- if $.Values.redis.enabled }}
-  value: default
-  {{- else }}
-  value: {{ $.Values.externalRedis.username }}
-  {{- end }}
+- name: {{ $name }}_IP_FAMILY
+  value: {{ $valkeyIpFamily | quote }}
+- name: {{ $name }}_DB
+  value: {{ $valkeyDb | quote }}
+- name: {{ $name }}_USERNAME
+  value: {{ $valkeyUsername | quote }}
 
+## CACHE TLS BLOCK -- only an external cache can carry certificates.
+{{- if not $valkey.enabled }}
+{{- if $externalValkey.tls.enabled }}
 
-## REDIS SSL BLOCK
-{{- if $.Values.redis.enabled }}
-# do nothing here.
-{{- else }}
-{{- if $.Values.externalRedis.tls.enabled }}
-
-{{- if $.Values.externalRedis.tls.ca }}
-- name: REDIS_TLS_CA
+{{- if $externalValkey.tls.ca }}
+- name: {{ $name }}_TLS_CA
   valueFrom:
     secretKeyRef:
-        name: {{ printf "%s-%s" $.Release.Name "external-redis"  }}
+        name: {{ printf "%s-%s" $.Release.Name "external-valkey"  }}
         key: tls-ca
 {{- end }}
 
-{{- if $.Values.externalRedis.tls.cert }}
-- name: REDIS_TLS_CERT
+{{- if $externalValkey.tls.cert }}
+- name: {{ $name }}_TLS_CERT
   valueFrom:
     secretKeyRef:
-        name: {{ printf "%s-%s" $.Release.Name "external-redis"  }}
+        name: {{ printf "%s-%s" $.Release.Name "external-valkey"  }}
         key: tls-cert
 {{- end }}
 
-{{- if $.Values.externalRedis.tls.key }}
-- name: REDIS_TLS_KEY
+{{- if $externalValkey.tls.key }}
+- name: {{ $name }}_TLS_KEY
   valueFrom:
     secretKeyRef:
-        name: {{ printf "%s-%s" $.Release.Name "external-redis"  }}
+        name: {{ printf "%s-%s" $.Release.Name "external-valkey"  }}
         key: tls-key
+{{- end }}
 {{- end }}
 {{- end }}
 {{- end }}
@@ -733,11 +842,75 @@ GLOBAL_LLM_PROVIDER_API_KEY is rendered only when an API key is configured.
 - name: DISABLE_TELEMETRY_INGESTION
   value: {{ default false $.Values.telemetry.disableIngestion | squote }}
 
+- name: DISABLE_UPDATE_CHECK
+  value: {{ default false $.Values.updateCheck.disabled | squote }}
+
+- name: LATEST_RELEASE_CHECK_URL
+  value: {{ default "" $.Values.updateCheck.url | quote }}
+
+{{/*
+  Not `default 1 ...`: Helm's default treats 0 as empty, and 0 is a meaningful
+  setting here (ignore X-Forwarded-For, use the connecting address).
+*/}}
+- name: TRUSTED_PROXY_HOPS
+{{- if kindIs "invalid" $.Values.trustedProxyHops }}
+  value: '1'
+{{- else }}
+  value: {{ $.Values.trustedProxyHops | squote }}
+{{- end }}
+
+{{/*
+  On-call calendar feeds: the kill switch and the fixed-window rate limits for
+  the token-in-URL .ics routes. `default` is safe on the limits because 0 is
+  not a valid value for any of them (the app falls back to its default too).
+*/}}
+- name: DISABLE_ON_CALL_CALENDAR_FEED
+  value: {{ default false $.Values.onCallCalendarFeed.disabled | squote }}
+
+- name: ON_CALL_CALENDAR_FEED_RATE_LIMIT_WINDOW_SECONDS
+  value: {{ default 60 $.Values.onCallCalendarFeed.rateLimit.windowSeconds | squote }}
+
+- name: ON_CALL_CALENDAR_FEED_RATE_LIMIT_PER_TOKEN_PER_WINDOW
+  value: {{ default 60 $.Values.onCallCalendarFeed.rateLimit.perTokenPerWindow | squote }}
+
+- name: ON_CALL_CALENDAR_FEED_RATE_LIMIT_PER_IP_PER_WINDOW
+  value: {{ default 3000 $.Values.onCallCalendarFeed.rateLimit.perIpPerWindow | squote }}
+
+{{/*
+  Source map ingestion and resolution limits. `default` is safe on all of
+  these because 0 is not a valid value for any of them -- the app falls back
+  to its own default too -- and every one is clamped app-side, so a value the
+  chart cannot honour is narrowed rather than silently ignored.
+
+  `int64` before quoting is NOT decoration. Helm parses values.yaml through
+  JSON, so a number arrives as a float64, and Go prints a float64 above 1e6 in
+  exponent form: the 52428800 an operator wrote in a values file would reach
+  the container as '5.24288e+07'. The same value passed with --set goes
+  through strvals as an int64 and renders plainly, so without this the env var
+  depends on HOW it was set, not what it was set to. Node's Number() happens
+  to accept exponent notation, which is the only reason that was not already a
+  bug -- and not a property to rely on.
+*/}}
+- name: SOURCE_MAP_MAX_MAPS_PER_RELEASE
+  value: {{ default 1000 $.Values.sourceMaps.maxMapsPerRelease | int64 | squote }}
+
+- name: SOURCE_MAP_MAX_FILES_PER_REQUEST
+  value: {{ default 50 $.Values.sourceMaps.maxFilesPerRequest | int64 | squote }}
+
+- name: SOURCE_MAP_MAX_FILE_SIZE_BYTES
+  value: {{ default 52428800 $.Values.sourceMaps.maxFileSizeBytes | int64 | squote }}
+
+- name: SOURCE_MAP_MAX_BYTES_PER_RESOLVE
+  value: {{ default 536870912 $.Values.sourceMaps.maxBytesPerResolve | int64 | squote }}
+
+- name: SOURCE_MAP_RETENTION_DAYS
+  value: {{ default 90 $.Values.sourceMaps.retentionDays | int64 | squote }}
+
 - name: WORKFLOW_SCRIPT_TIMEOUT_IN_MS
   value: {{ $.Values.script.workflowScriptTimeoutInMs | squote }}
 
 - name: WORKFLOW_TIMEOUT_IN_MS
-  value: {{ $.Values.script.workflowScriptTimeoutInMs | squote }}
+  value: {{ $.Values.script.workflowTimeoutInMs | squote }}
 
 - name: AVERAGE_SPAN_ROW_SIZE_IN_BYTES
   value: {{ $.Values.billing.telemetry.averageSpanRowSizeInBytes | quote }}
@@ -784,6 +957,26 @@ GLOBAL_LLM_PROVIDER_API_KEY is rendered only when an API key is configured.
       fieldPath: status.podIP
 {{- end }}
 
+{{/*
+Kubernetes identity for OneUptime's own telemetry. Without it the OpenTelemetry
+SDK only reports host.name — the pod hostname — so every pod that ever ran is
+catalogued as a separate "host". Usage:
+  include "oneuptime.env.telemetryIdentity" (dict "Values" $.Values "DeploymentName" (printf "%s-%s" $.Release.Name "app"))
+*/}}
+{{- define "oneuptime.env.telemetryIdentity" }}
+{{- include "oneuptime.env.pod" . }}
+- name: POD_UID
+  valueFrom:
+    fieldRef:
+      fieldPath: metadata.uid
+- name: K8S_DEPLOYMENT_NAME
+  value: {{ .DeploymentName | quote }}
+{{- if .Values.openTelemetryExporter.kubernetesClusterName }}
+- name: K8S_CLUSTER_NAME
+  value: {{ .Values.openTelemetryExporter.kubernetesClusterName | quote }}
+{{- end }}
+{{- end }}
+
 
 
 {{- define "oneuptime.service" }}
@@ -826,6 +1019,32 @@ spec:
   {{- else }}
   type: ClusterIP
   {{- end}}
+{{- end }}
+
+
+{{/*
+Pod nodeSelector with the Linux-only pin merged in.
+
+Every image this chart deploys — the OneUptime services as well as the
+bundled postgres, valkey, clickhouse, pgbouncer, kubectl and vLLM images —
+is built for linux only. On mixed-OS clusters (e.g. AKS with Windows node
+pools) an unpinned pod spec can be scheduled onto a Windows node, where the
+image pull can never succeed and the pod sits in ImagePullBackOff forever.
+The kubelet labels every node with kubernetes.io/os (stable since
+Kubernetes 1.14), so requiring "linux" is always safe.
+
+Takes the workload's user-configured nodeSelector map (or an empty dict when
+the workload has no such knob). User-supplied keys win on conflict.
+
+Usage (the include is nindent-ed under the `nodeSelector:` key):
+  nodeSelector:
+    {{`{{- include "oneuptime.nodeSelector" .Values.app.nodeSelector | nindent 8 }}`}}
+*/}}
+{{- define "oneuptime.nodeSelector" -}}
+{{- /* mergeOverwrite, not merge: sprig merge won't let a zero value ("")
+     in the user map displace the pin, breaking last-writer-wins. The
+     dest dict is a fresh literal, so .Values is never mutated. */ -}}
+{{- toYaml (mergeOverwrite (dict "kubernetes.io/os" "linux") (. | default dict)) -}}
 {{- end }}
 
 
@@ -885,19 +1104,17 @@ spec:
       {{- if $.Values.tolerations }}
       tolerations: {{- $.Values.tolerations | toYaml | nindent 8 }}
       {{- end }}
-      {{- if $.NodeSelector }}
       nodeSelector:
-        {{- toYaml $.NodeSelector | nindent 8 }}
-      {{- else if $.Values.nodeSelector }}
-      nodeSelector:
-        {{- toYaml $.Values.nodeSelector | nindent 8 }}
-      {{- end }}
-      {{- if $.Volumes }}
+        {{- include "oneuptime.nodeSelector" ($.NodeSelector | default $.Values.nodeSelector) | nindent 8 }}
+      {{- if or $.Volumes $.ExtraVolumes }}
       volumes:
       {{- range $key, $val := $.Volumes }}
         - name: {{ $key }}
           emptyDir:
             sizeLimit: {{ $val.SizeLimit }}
+      {{- end }}
+      {{- with $.ExtraVolumes }}
+        {{- toYaml . | nindent 8 }}
       {{- end }}
       {{- end }}
       containers:
@@ -924,11 +1141,17 @@ spec:
               value: {{ $val | squote }}
             {{- end }}
             {{- end }}
-          {{- if $.Volumes }}
+            {{- with $.ExtraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if or $.Volumes $.ExtraVolumeMounts }}
           volumeMounts:
             {{- range $key, $val := $.Volumes }}
             - name: {{ $key }}
               mountPath: {{ $val.MountPath }}
+            {{- end }}
+            {{- with $.ExtraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
             {{- end }}
           {{- end }}
           {{- if $.Ports }}
@@ -1101,11 +1324,46 @@ spec:
 
 
 {{/*
+Whether THIS release installs the bundled KEDA operator subchart. Returns the
+string "true" or "" so it composes with `if`/`eq`.
+
+This must agree with the `condition: keda.install,keda.enabled` on the keda
+dependency in Chart.yaml, because Helm evaluates that condition itself and the
+templates never see the result. Helm walks the comma-separated paths in order and
+takes the FIRST one that resolves to an actual bool — a path that is absent, null
+or a quoted string is skipped (with a warning, in the non-absent cases) and the
+next path is tried. `kindIs "bool"` reproduces that test exactly; anything looser
+(hasKey, a plain truthiness check, `default`) would disagree with Helm on a
+`--set-string keda.install=true`, and the guard that reads this would then talk
+about an operator that is not there, or stay silent about one that is. (`install:
+~` cannot get this far — values.schema.json pins install to boolean — but the
+test costs nothing and keeps this honest if that ever loosens.)
+
+Usage: include "oneuptime.kedaOperatorInstalled" .   ($ or any ctx with .Values)
+*/}}
+{{- define "oneuptime.kedaOperatorInstalled" -}}
+{{- $install := .Values.keda.enabled -}}
+{{- if kindIs "bool" .Values.keda.install -}}
+{{- $install = .Values.keda.install -}}
+{{- end -}}
+{{- if $install }}true{{ end -}}
+{{- end }}
+
+
+{{/*
 KEDA ScaledObject template for metric-based autoscaling
 Usage: include "oneuptime.kedaScaledObject" (dict "ServiceName" "service-name" "Release" .Release "Values" .Values "MetricsConfig" {...})
+
+This helper emits TWO objects (a ScaledObject and a TriggerAuthentication) and is
+included back to back, once per enabled tier. Both objects therefore MUST open
+with their own `---`: Helm's manifest splitter only breaks documents on a `---`
+line, so without the leading separator each TriggerAuthentication would be glued
+into the same YAML document as the next include's ScaledObject, and on decode the
+later duplicate top-level keys win — silently dropping the earlier object.
 */}}
 {{- define "oneuptime.kedaScaledObject" }}
 {{- if and .Values.keda.enabled .MetricsConfig.enabled (not .DisableAutoscaler) }}
+---
 apiVersion: keda.sh/v1alpha1
 kind: ScaledObject
 metadata:
@@ -1160,8 +1418,7 @@ spec:
       metadata:
         targetValue: {{ .threshold | quote }}
         url: http://{{ printf "%s-%s" $.Release.Name $.ServiceName }}:{{ .port }}{{ if .urlPath }}{{ .urlPath }}{{ else }}/metrics/queue-size{{ end }}
-        valueLocation: 'queueSize'
-        method: 'GET'
+        valueLocation: {{ .valueLocation | default "queueSize" | squote }}
       # authenticationRef:
       #   name: {{ printf "%s-%s-trigger-auth" $.Release.Name $.ServiceName }}
     {{- end }}
@@ -1193,14 +1450,31 @@ metadata:
     meta.helm.sh/release-namespace: {{ .Release.Namespace }}
 spec:
   secretTargetRef:
-    {{- if .Values.externalSecrets.oneuptimeSecret.existingSecret.name }}
+    {{- if (((.Values.externalSecrets).oneuptimeSecret).existingSecret).name }}
     - parameter: clusterkey
-      name: {{ .Values.externalSecrets.oneuptimeSecret.existingSecret.name }}
-      key: {{ .Values.externalSecrets.oneuptimeSecret.existingSecret.passwordKey }}
+      name: {{ (((.Values.externalSecrets).oneuptimeSecret).existingSecret).name }}
+      key: {{ (((.Values.externalSecrets).oneuptimeSecret).existingSecret).passwordKey }}
     {{- else }}
     - parameter: clusterkey
       name: {{ printf "%s-%s" .Release.Name "secrets" }}
       key: oneuptime-secret
     {{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+TELEMETRY_WRITER_URL for pods that process telemetry ingest (app, worker).
+Emitted only when the dedicated telemetry-writer tier is enabled: the fan-in
+writer on these pods then ships ClickHouse inserts to that tier over HTTP, so
+ClickHouse insert concurrency is (telemetryWriter.replicaCount x
+telemetryWriter.telemetryFanInMaxConcurrentInserts) no matter how far the
+worker fleet scales. The telemetry-writer pods themselves MUST NOT get this
+var — its absence is what makes them insert directly (and they refuse to
+serve inserts when it is set, to prevent forwarding loops).
+*/}}
+{{- define "oneuptime.env.telemetryWriterUrl" }}
+{{- if $.Values.telemetryWriter.enabled }}
+- name: TELEMETRY_WRITER_URL
+  value: http://{{ $.Release.Name }}-telemetry-writer.{{ $.Release.Namespace }}.svc.{{ $.Values.global.clusterDomain }}:{{ $.Values.telemetryWriter.ports.http }}
 {{- end }}
 {{- end }}

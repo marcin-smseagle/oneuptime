@@ -1,0 +1,230 @@
+import { Blue500 } from "../../Types/BrandColors";
+import Color from "../../Types/Color";
+import OneUptimeDate from "../../Types/Date";
+import BadDataException from "../../Types/Exception/BadDataException";
+import ObjectID from "../../Types/ObjectID";
+import PositiveNumber from "../../Types/PositiveNumber";
+import CountBy from "../Types/Database/CountBy";
+import DeleteBy from "../Types/Database/DeleteBy";
+import FindBy from "../Types/Database/FindBy";
+import { OnDelete, OnFind, OnUpdate } from "../Types/Database/Hooks";
+import UpdateBy from "../Types/Database/UpdateBy";
+import { IsBillingEnabled } from "../EnvironmentConfig";
+import logger, { LogAttributes } from "../Utils/Logger";
+import DatabaseService from "./DatabaseService";
+import IncidentFeed, {
+  IncidentFeedEventType,
+} from "../../Models/DatabaseModels/IncidentFeed";
+import WorkspaceNotificationRuleService, {
+  MessageBlocksByWorkspaceType,
+} from "./WorkspaceNotificationRuleService";
+import { applyIncidentRelatedRecordPrivacyFilter } from "../Utils/Incident/IncidentPrivacyFilter";
+import CaptureSpan from "../Utils/Telemetry/CaptureSpan";
+
+export class Service extends DatabaseService<IncidentFeed> {
+  public constructor() {
+    super(IncidentFeed);
+
+    if (IsBillingEnabled) {
+      this.hardDeleteItemsOlderThanInDays("createdAt", 3 * 365); // 3 years
+    }
+  }
+
+  @CaptureSpan()
+  protected override async onBeforeFind(
+    findBy: FindBy<IncidentFeed>,
+  ): Promise<OnFind<IncidentFeed>> {
+    findBy.query = applyIncidentRelatedRecordPrivacyFilter(
+      findBy.query,
+      findBy.props,
+    );
+    return { findBy, carryForward: null };
+  }
+
+  @CaptureSpan()
+  public override async countBy(
+    countBy: CountBy<IncidentFeed>,
+  ): Promise<PositiveNumber> {
+    countBy.query = applyIncidentRelatedRecordPrivacyFilter(
+      countBy.query,
+      countBy.props,
+    );
+    return super.countBy(countBy);
+  }
+
+  @CaptureSpan()
+  protected override async onBeforeUpdate(
+    updateBy: UpdateBy<IncidentFeed>,
+  ): Promise<OnUpdate<IncidentFeed>> {
+    updateBy.query = applyIncidentRelatedRecordPrivacyFilter(
+      updateBy.query,
+      updateBy.props,
+    );
+    return { updateBy, carryForward: null };
+  }
+
+  @CaptureSpan()
+  protected override async onBeforeDelete(
+    deleteBy: DeleteBy<IncidentFeed>,
+  ): Promise<OnDelete<IncidentFeed>> {
+    deleteBy.query = applyIncidentRelatedRecordPrivacyFilter(
+      deleteBy.query,
+      deleteBy.props,
+    );
+    return { deleteBy, carryForward: null };
+  }
+
+  @CaptureSpan()
+  public async createIncidentFeedItem(data: {
+    incidentId: ObjectID;
+    feedInfoInMarkdown: string;
+    incidentFeedEventType: IncidentFeedEventType;
+    projectId: ObjectID;
+    moreInformationInMarkdown?: string | undefined;
+    displayColor?: Color | undefined;
+    userId?: ObjectID | undefined;
+    postedAt?: Date | undefined;
+    aiRunId?: ObjectID | undefined;
+    // send notifificatin to slack and teams. This is optional
+    workspaceNotification?:
+      | {
+          notifyUserId?: ObjectID | undefined; // this is oneuptime user id.
+          sendWorkspaceNotification: boolean;
+          appendMessageBlocks?: Array<MessageBlocksByWorkspaceType> | undefined;
+        }
+      | undefined;
+  }): Promise<void> {
+    try {
+      logger.debug("IncidentFeedService.createIncidentFeedItem", {
+        projectId: data.projectId?.toString(),
+        incidentId: data.incidentId?.toString(),
+      } as LogAttributes);
+      logger.debug(data, {
+        projectId: data.projectId?.toString(),
+        incidentId: data.incidentId?.toString(),
+      } as LogAttributes);
+
+      const incidentFeed: IncidentFeed = new IncidentFeed();
+
+      if (!data.incidentId) {
+        throw new BadDataException("Incident ID is required");
+      }
+
+      if (!data.feedInfoInMarkdown) {
+        throw new BadDataException("Log in markdown is required");
+      }
+
+      if (!data.incidentFeedEventType) {
+        throw new BadDataException("Incident log event is required");
+      }
+
+      if (!data.projectId) {
+        throw new BadDataException("Project ID is required");
+      }
+
+      if (!data.displayColor) {
+        data.displayColor = Blue500;
+      }
+
+      incidentFeed.displayColor = data.displayColor;
+      incidentFeed.incidentId = data.incidentId;
+      incidentFeed.feedInfoInMarkdown = data.feedInfoInMarkdown;
+      incidentFeed.incidentFeedEventType = data.incidentFeedEventType;
+      incidentFeed.projectId = data.projectId;
+
+      if (data.aiRunId) {
+        incidentFeed.aiRunId = data.aiRunId;
+      }
+
+      if (!data.postedAt) {
+        incidentFeed.postedAt = OneUptimeDate.getCurrentDate();
+      }
+
+      if (data.userId) {
+        incidentFeed.userId = data.userId;
+      }
+
+      if (data.moreInformationInMarkdown) {
+        incidentFeed.moreInformationInMarkdown = data.moreInformationInMarkdown;
+      }
+
+      const createdIncidentFeed: IncidentFeed = await this.create({
+        data: incidentFeed,
+        props: {
+          isRoot: true,
+        },
+      });
+
+      logger.debug("Incident Feed created", {
+        projectId: data.projectId?.toString(),
+        incidentId: data.incidentId?.toString(),
+      } as LogAttributes);
+      logger.debug(createdIncidentFeed, {
+        projectId: data.projectId?.toString(),
+        incidentId: data.incidentId?.toString(),
+      } as LogAttributes);
+
+      try {
+        // send notification to slack and teams
+        if (
+          data.workspaceNotification &&
+          data.workspaceNotification?.sendWorkspaceNotification
+        ) {
+          await this.sendWorkspaceNotification({
+            projectId: data.projectId,
+            incidentId: data.incidentId,
+            feedInfoInMarkdown: data.feedInfoInMarkdown,
+            workspaceNotification: data.workspaceNotification,
+          });
+        }
+      } catch (e) {
+        logger.error("Error in sending notification to slack and teams", {
+          projectId: data.projectId?.toString(),
+          incidentId: data.incidentId?.toString(),
+        } as LogAttributes);
+        logger.error(e, {
+          projectId: data.projectId?.toString(),
+          incidentId: data.incidentId?.toString(),
+        } as LogAttributes);
+
+        // we dont throw this error as it is not a critical error
+      }
+    } catch (e) {
+      logger.error("Error in creating incident feed", {
+        projectId: data.projectId?.toString(),
+        incidentId: data.incidentId?.toString(),
+      } as LogAttributes);
+      logger.error(e, {
+        projectId: data.projectId?.toString(),
+        incidentId: data.incidentId?.toString(),
+      } as LogAttributes);
+
+      // we dont throw this error as it is not a critical error
+    }
+  }
+
+  @CaptureSpan()
+  public async sendWorkspaceNotification(data: {
+    projectId: ObjectID;
+    incidentId: ObjectID;
+    feedInfoInMarkdown: string;
+    workspaceNotification: {
+      notifyUserId?: ObjectID | undefined; // this is oneuptime user id.
+      sendWorkspaceNotification: boolean;
+      appendMessageBlocks?: Array<MessageBlocksByWorkspaceType> | undefined;
+    };
+  }): Promise<void> {
+    return await WorkspaceNotificationRuleService.sendWorkspaceMarkdownNotification(
+      {
+        projectId: data.projectId,
+        notificationFor: {
+          incidentId: data.incidentId,
+        },
+        feedInfoInMarkdown: data.feedInfoInMarkdown,
+        workspaceNotification: data.workspaceNotification,
+      },
+    );
+  }
+}
+
+export default new Service();

@@ -1,6 +1,6 @@
 {
   "name": "@oneuptime/fluentd",
-  "version": "11.5.2",
+  "version": "14.0.10",
   "description": "",
   "repository": {
     "type": "git",
@@ -15,5 +15,8 @@
   "dependencies": {
     "@fluent-org/logger": "^1.0.10",
     "express": "^4.18.2"
+  },
+  "overrides": {
+    "qs": "^6.16.0"
   }
 }

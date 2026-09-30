@@ -60,12 +60,11 @@ spec:
       {{- if $.Values.tolerations }}
       tolerations: {{- $.Values.tolerations | toYaml | nindent 8 }}
       {{- end }}
-      {{- if $.Values.app.nodeSelector }}
       nodeSelector:
-        {{- toYaml $.Values.app.nodeSelector | nindent 8 }}
-      {{- else if $.Values.nodeSelector }}
-      nodeSelector:
-        {{- toYaml $.Values.nodeSelector | nindent 8 }}
+        {{- include "oneuptime.nodeSelector" ($.Values.app.nodeSelector | default $.Values.nodeSelector) | nindent 8 }}
+      {{- with (default $.Values.extraVolumes $.Values.app.extraVolumes) }}
+      volumes:
+        {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
         - image: {{ include "oneuptime.image" (dict "Values" $.Values "ServiceName" "app") }}
@@ -110,6 +109,7 @@ spec:
           imagePullPolicy: {{ $.Values.image.pullPolicy }}
           env:
             {{- include "oneuptime.env.common" . | nindent 12 }}
+            {{- include "oneuptime.env.telemetryIdentity" (dict "Values" $.Values "DeploymentName" (printf "%s-%s" $.Release.Name "app")) | nindent 12 }}
             {{- include "oneuptime.env.runtime" (dict "Values" $.Values "Release" $.Release "DatabaseMaxOpenConnections" ($.Values.app.databaseMaxOpenConnections | default $.Values.deployment.databaseMaxOpenConnections)) | nindent 12 }}
             - name: PORT
               value: {{ $.Values.app.ports.http | quote }}
@@ -129,6 +129,38 @@ spec:
               value: {{ $.Values.app.enableProfiling | quote }}
             - name: TELEMETRY_CONCURRENCY
               value: {{ $.Values.app.telemetryConcurrency | default 100 | squote }}
+            {{- if $.Values.app.networkDevicePollFetchLimit }}
+            # How many NetworkDevice SNMP walks one probe is handed per fetch,
+            # and so the ceiling on how fast that probe's fleet can be polled
+            # (it fetches once a minute). Pair it with the probe's own
+            # probe.<name>.networkDevicePollConcurrency.
+            - name: NETWORK_DEVICE_POLL_FETCH_LIMIT
+              value: {{ $.Values.app.networkDevicePollFetchLimit | squote }}
+            {{- end }}
+            # Fan-in telemetry writer knobs (defaults match the code —
+            # Common/Server/Utils/Telemetry/TelemetryFanInWriter.ts). Fleet-wide
+            # ClickHouse insert concurrency is replicas x maxConcurrentInserts.
+            - name: TELEMETRY_FANIN_MAX_BATCH_ROWS
+              value: {{ $.Values.app.telemetryFanInMaxBatchRows | default 100000 | squote }}
+            - name: TELEMETRY_FANIN_MAX_WAIT_MS
+              value: {{ $.Values.app.telemetryFanInMaxWaitMs | default 5000 | squote }}
+            - name: TELEMETRY_FANIN_MAX_CONCURRENT_INSERTS
+              value: {{ $.Values.app.telemetryFanInMaxConcurrentInserts | default 4 | squote }}
+            - name: TELEMETRY_FANIN_MAX_PENDING_ROWS
+              value: {{ $.Values.app.telemetryFanInMaxPendingRows | default 200000 | squote }}
+            - name: TELEMETRY_FANIN_RETRY_MAX_ATTEMPTS
+              value: {{ $.Values.app.telemetryFanInRetryMaxAttempts | default 6 | squote }}
+            - name: TELEMETRY_FANIN_RETRY_BASE_DELAY_MS
+              value: {{ $.Values.app.telemetryFanInRetryBaseDelayMs | default 250 | squote }}
+            - name: TELEMETRY_FANIN_RETRY_MAX_DELAY_MS
+              value: {{ $.Values.app.telemetryFanInRetryMaxDelayMs | default 10000 | squote }}
+            # Per-pod ClickHouse pool ceilings; the ingest pool inherits the
+            # query pool size when unset (same fallback the code applies).
+            - name: CLICKHOUSE_MAX_OPEN_CONNECTIONS
+              value: {{ $.Values.app.clickhouseMaxOpenConnections | default 100 | squote }}
+            - name: CLICKHOUSE_INGEST_MAX_OPEN_CONNECTIONS
+              value: {{ $.Values.app.clickhouseIngestMaxOpenConnections | default ($.Values.app.clickhouseMaxOpenConnections | default 100) | squote }}
+            {{- include "oneuptime.env.telemetryWriterUrl" . | nindent 12 }}
             # When the dedicated worker deployment is enabled, the app stops
             # consuming BullMQ queues so heavy background/telemetry processing
             # can't stall API requests on the shared event loop. Flips
@@ -136,6 +168,13 @@ spec:
             - name: DISABLE_QUEUE_WORKERS
               value: {{ $.Values.worker.enabled | default false | quote }}
             {{- include "oneuptime.env.registerProbeKey" (dict "Values" $.Values "Release" $.Release) | nindent 12 }}
+            {{- with (default $.Values.extraEnv $.Values.app.extraEnv) }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with (default $.Values.extraVolumeMounts $.Values.app.extraVolumeMounts) }}
+          volumeMounts:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           ports:
             - containerPort: {{ $.Values.app.ports.http }}
               protocol: TCP

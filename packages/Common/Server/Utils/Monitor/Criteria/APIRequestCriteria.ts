@@ -1,0 +1,298 @@
+import DataToProcess from "../DataToProcess";
+import CompareCriteria from "./CompareCriteria";
+import EvaluateOverTime, { OverTimeCriteriaValue } from "./EvaluateOverTime";
+import { JSONObject } from "../../../../Types/JSON";
+import {
+  CheckOn,
+  CriteriaFilter,
+  FilterType,
+} from "../../../../Types/Monitor/CriteriaFilter";
+import ProbeMonitorResponse from "../../../../Types/Probe/ProbeMonitorResponse";
+import Typeof from "../../../../Types/Typeof";
+import CaptureSpan from "../../Telemetry/CaptureSpan";
+
+export default class APIRequestCriteria {
+  @CaptureSpan()
+  public static async isMonitorInstanceCriteriaFilterMet(input: {
+    dataToProcess: DataToProcess;
+    criteriaFilter: CriteriaFilter;
+    /*
+     * The monitor's monitoringInterval cron. Over-time filters use it to
+     * work out how many samples a fully covered window should hold, so a
+     * monitor that has only just started is not mistaken for one whose
+     * whole window is breaching.
+     */
+    monitoringInterval?: string | undefined;
+  }): Promise<string | null> {
+    // Server Monitoring Checks
+
+    let threshold: number | string | undefined | null =
+      input.criteriaFilter.value;
+
+    const overTime: OverTimeCriteriaValue =
+      await EvaluateOverTime.getOverTimeValueForCriteriaFilter({
+        projectId: (input.dataToProcess as ProbeMonitorResponse).projectId,
+        monitorId: input.dataToProcess.monitorId!,
+        criteriaFilter: input.criteriaFilter,
+        /*
+         * Only the disk-usage series carries a diskPath attribute, so
+         * scoping any other series by it would filter against an attribute
+         * no row has - and an empty window now means "cannot judge yet"
+         * rather than "compare the live value", which would silence the
+         * filter outright.
+         */
+        miscData:
+          input.criteriaFilter.checkOn === CheckOn.DiskUsagePercent
+            ? (input.criteriaFilter.serverMonitorOptions as JSONObject)
+            : undefined,
+        monitoringInterval: input.monitoringInterval,
+      });
+
+    /*
+     * The window could not back this over-time filter (nothing recorded yet,
+     * or the monitor has not been running long enough to cover it). Return
+     * the decision the no-data policy already made instead of falling
+     * through to the value that arrived with this one check - that fallback
+     * is what let "all values over the last N minutes" fire off a single
+     * bad reading.
+     */
+    if (overTime.earlyReturn) {
+      return overTime.earlyReturn.result;
+    }
+
+    const overTimeValue:
+      | Array<number | boolean>
+      | number
+      | boolean
+      | undefined = overTime.value;
+
+    if (input.criteriaFilter.checkOn === CheckOn.IsOnline) {
+      const currentIsOnline: boolean | Array<boolean> =
+        (overTimeValue as Array<boolean>) ??
+        (input.dataToProcess as ProbeMonitorResponse).isOnline;
+
+      return CompareCriteria.compareCriteriaBoolean({
+        value: currentIsOnline,
+        criteriaFilter: input.criteriaFilter,
+      });
+    }
+
+    if (input.criteriaFilter.checkOn === CheckOn.IsRequestTimeout) {
+      const currentIsTimeout: boolean | Array<boolean> =
+        (overTimeValue as Array<boolean>) ??
+        (input.dataToProcess as ProbeMonitorResponse).isTimeout;
+
+      return CompareCriteria.compareCriteriaBoolean({
+        value: currentIsTimeout,
+        criteriaFilter: input.criteriaFilter,
+      });
+    }
+
+    // check response time filter
+    if (input.criteriaFilter.checkOn === CheckOn.ResponseTime) {
+      threshold = CompareCriteria.convertToNumber(threshold);
+
+      const value: Array<number> | number =
+        (overTimeValue as Array<number>) ??
+        (input.dataToProcess as ProbeMonitorResponse).responseTimeInMs!;
+
+      return CompareCriteria.compareCriteriaNumbers({
+        value: value,
+        threshold: threshold as number,
+        criteriaFilter: input.criteriaFilter,
+      });
+    }
+
+    if (
+      input.criteriaFilter.checkOn === CheckOn.PortDnsLookupTime ||
+      input.criteriaFilter.checkOn === CheckOn.PortTcpConnectTime
+    ) {
+      const portTimings: ProbeMonitorResponse["portTimings"] = (
+        input.dataToProcess as ProbeMonitorResponse
+      ).portTimings;
+
+      const currentValue: number | undefined =
+        input.criteriaFilter.checkOn === CheckOn.PortDnsLookupTime
+          ? portTimings?.dnsLookupInMs
+          : portTimings?.tcpConnectInMs;
+
+      const value: Array<number> | number | undefined =
+        (overTimeValue as Array<number> | number | undefined) ?? currentValue;
+
+      if (value === undefined) {
+        return null;
+      }
+
+      threshold = CompareCriteria.convertToNumber(threshold);
+
+      return CompareCriteria.compareCriteriaNumbers({
+        value: value,
+        threshold: threshold as number,
+        criteriaFilter: input.criteriaFilter,
+      });
+    }
+
+    // check packet loss (Ping/IP monitors with multi-packet checks)
+    if (input.criteriaFilter.checkOn === CheckOn.PacketLossPercent) {
+      const packetLossPercent: number | undefined = (
+        input.dataToProcess as ProbeMonitorResponse
+      ).pingResponse?.packetLossPercent;
+
+      const value: Array<number> | number | undefined =
+        (overTimeValue as Array<number>) ?? packetLossPercent;
+
+      if (value === undefined) {
+        return null;
+      }
+
+      threshold = CompareCriteria.convertToNumber(threshold);
+
+      return CompareCriteria.compareCriteriaNumbers({
+        value: value,
+        threshold: threshold as number,
+        criteriaFilter: input.criteriaFilter,
+      });
+    }
+
+    // check jitter (Ping/IP monitors with multi-packet checks)
+    if (input.criteriaFilter.checkOn === CheckOn.Jitter) {
+      const jitterInMs: number | undefined = (
+        input.dataToProcess as ProbeMonitorResponse
+      ).pingResponse?.jitterInMs;
+
+      const value: Array<number> | number | undefined =
+        (overTimeValue as Array<number>) ?? jitterInMs;
+
+      if (value === undefined) {
+        return null;
+      }
+
+      threshold = CompareCriteria.convertToNumber(threshold);
+
+      return CompareCriteria.compareCriteriaNumbers({
+        value: value,
+        threshold: threshold as number,
+        criteriaFilter: input.criteriaFilter,
+      });
+    }
+
+    //check response code
+    if (
+      input.criteriaFilter.checkOn === CheckOn.ResponseStatusCode &&
+      (input.dataToProcess as ProbeMonitorResponse).responseCode
+    ) {
+      threshold = CompareCriteria.convertToNumber(threshold);
+
+      const value: Array<number> | number =
+        (overTimeValue as Array<number>) ??
+        (input.dataToProcess as ProbeMonitorResponse).responseCode!;
+
+      return CompareCriteria.compareCriteriaNumbers({
+        value: value,
+        threshold: threshold as number,
+        criteriaFilter: input.criteriaFilter,
+      });
+    }
+
+    if (input.criteriaFilter.checkOn === CheckOn.ResponseBody) {
+      let responseBody: string | JSONObject | undefined = (
+        input.dataToProcess as ProbeMonitorResponse
+      ).responseBody;
+
+      if (responseBody && typeof responseBody === Typeof.Object) {
+        responseBody = JSON.stringify(responseBody);
+      }
+
+      if (!responseBody) {
+        return null;
+      }
+
+      // contains
+      if (input.criteriaFilter.filterType === FilterType.Contains) {
+        if (
+          threshold &&
+          responseBody &&
+          (responseBody as string).includes(threshold as string)
+        ) {
+          return `Response body contains ${threshold}.`;
+        }
+        return null;
+      }
+
+      if (input.criteriaFilter.filterType === FilterType.NotContains) {
+        if (
+          threshold &&
+          responseBody &&
+          !(responseBody as string).includes(threshold as string)
+        ) {
+          return `Response body does not contain ${threshold}.`;
+        }
+        return null;
+      }
+    }
+
+    if (input.criteriaFilter.checkOn === CheckOn.ResponseHeader) {
+      const headerKeys: Array<string> = Object.keys(
+        (input.dataToProcess as ProbeMonitorResponse).responseHeaders || {},
+      ).map((key: string) => {
+        return key.toLowerCase();
+      });
+
+      // contains
+      if (input.criteriaFilter.filterType === FilterType.Contains) {
+        if (
+          threshold &&
+          headerKeys &&
+          headerKeys.includes(threshold as string)
+        ) {
+          return `Response header contains ${threshold}.`;
+        }
+        return null;
+      }
+
+      if (input.criteriaFilter.filterType === FilterType.NotContains) {
+        if (
+          threshold &&
+          headerKeys &&
+          !headerKeys.includes(threshold as string)
+        ) {
+          return `Response header does not contain ${threshold}.`;
+        }
+        return null;
+      }
+    }
+
+    if (input.criteriaFilter.checkOn === CheckOn.ResponseHeaderValue) {
+      const headerValues: Array<string> = Object.values(
+        (input.dataToProcess as ProbeMonitorResponse).responseHeaders || {},
+      ).map((key: string) => {
+        return key.toLowerCase();
+      });
+
+      // contains
+      if (input.criteriaFilter.filterType === FilterType.Contains) {
+        if (
+          threshold &&
+          headerValues &&
+          headerValues.includes(threshold as string)
+        ) {
+          return `Response header threshold contains ${threshold}.`;
+        }
+        return null;
+      }
+
+      if (input.criteriaFilter.filterType === FilterType.NotContains) {
+        if (
+          threshold &&
+          headerValues &&
+          !headerValues.includes(threshold as string)
+        ) {
+          return `Response header threshold does not contain ${threshold}.`;
+        }
+        return null;
+      }
+    }
+
+    return null;
+  }
+}

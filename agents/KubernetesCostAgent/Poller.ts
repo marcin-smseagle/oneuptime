@@ -1,0 +1,216 @@
+import {
+  ENGINE_SETTLE_SECONDS,
+  LOOKBACK_WINDOWS,
+  POLL_INTERVAL_SECONDS,
+  WINDOW_SECONDS,
+} from "./Config";
+import {
+  attachMemoryPeaks,
+  floorToWindow,
+  mapAllocationToRow,
+} from "./AllocationMapper";
+import { CostEngineClient } from "./CostEngineClient";
+import Logger from "./Logger";
+import { PrometheusClient } from "./PrometheusClient";
+import { Shipper } from "./Shipper";
+import {
+  EngineAllocation,
+  KubernetesCostAllocationIngestRow,
+  PollerStatus,
+} from "./Types";
+
+export class Poller {
+  private readonly engine: CostEngineClient;
+  private readonly shipper: Shipper;
+  private readonly prometheus: PrometheusClient;
+
+  /*
+   * End (ms) of the newest window that was fully shipped. Windows are
+   * shipped strictly in order; a failed window blocks the checkpoint so
+   * nothing is skipped. In-memory only — on restart the agent re-ships the
+   * last LOOKBACK_WINDOWS closed windows and the server's already-ingested
+   * check makes that idempotent.
+   */
+  private checkpointMs: number;
+
+  private timer: NodeJS.Timeout | null = null;
+  private running: boolean = false;
+  private stopped: boolean = false;
+  private lastPollErr: string | null = null;
+
+  /*
+   * Progress bookkeeping for /healthz. A window that drained counts even
+   * when the engine reported no allocations: an empty window is a round
+   * trip the engine answered, which is exactly what a stalled agent cannot
+   * do. Shipping is tracked separately by the Shipper, because an engine
+   * that answers 200 with nothing, forever, drains windows happily and
+   * still never delivers a row.
+   */
+  private readonly startedAtMs: number = Date.now();
+  private lastWindowCompletedAtMs: number = 0;
+  private windowsCompleted: number = 0;
+  private consecutivePollFailures: number = 0;
+
+  public constructor(
+    engine: CostEngineClient,
+    shipper: Shipper,
+    prometheus?: PrometheusClient,
+  ) {
+    this.engine = engine;
+    this.shipper = shipper;
+    this.prometheus = prometheus || new PrometheusClient();
+
+    const latestClosed: number = floorToWindow(Date.now(), WINDOW_SECONDS);
+    this.checkpointMs = Math.max(
+      0,
+      latestClosed - LOOKBACK_WINDOWS * WINDOW_SECONDS * 1000,
+    );
+  }
+
+  public lastError(): string | null {
+    return this.lastPollErr;
+  }
+
+  public status(): PollerStatus {
+    return {
+      startedAtMs: this.startedAtMs,
+      lastWindowCompletedAtMs: this.lastWindowCompletedAtMs,
+      windowsCompleted: this.windowsCompleted,
+      consecutivePollFailures: this.consecutivePollFailures,
+      lastPollError: this.lastPollErr,
+    };
+  }
+
+  public start(): void {
+    Logger.info("cost poller started", {
+      windowSeconds: WINDOW_SECONDS,
+      pollIntervalSeconds: POLL_INTERVAL_SECONDS,
+      lookbackWindows: LOOKBACK_WINDOWS,
+      firstWindowStart: new Date(this.checkpointMs).toISOString(),
+    });
+
+    void this.tick();
+    this.timer = setInterval((): void => {
+      void this.tick();
+    }, POLL_INTERVAL_SECONDS * 1000);
+  }
+
+  public stop(): void {
+    this.stopped = true;
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+  }
+
+  private async tick(): Promise<void> {
+    if (this.running || this.stopped) {
+      return;
+    }
+    this.running = true;
+
+    try {
+      /*
+       * Ship every closed-and-settled window past the checkpoint, oldest
+       * first. Normally that is zero or one window per tick; after
+       * downtime it catches up in order.
+       */
+      const windowMs: number = WINDOW_SECONDS * 1000;
+      const settleMs: number = ENGINE_SETTLE_SECONDS * 1000;
+
+      while (!this.stopped) {
+        const windowStartMs: number = this.checkpointMs;
+        const windowEndMs: number = windowStartMs + windowMs;
+
+        if (windowEndMs + settleMs > Date.now()) {
+          break; // Window still open or not settled yet.
+        }
+
+        const windowStart: Date = new Date(windowStartMs);
+        const windowEnd: Date = new Date(windowEndMs);
+
+        const allocations: Array<EngineAllocation> =
+          await this.engine.fetchAllocations({ windowStart, windowEnd });
+
+        if (allocations.length > 0) {
+          const rows: Array<KubernetesCostAllocationIngestRow> =
+            allocations.map(
+              (
+                allocation: EngineAllocation,
+              ): KubernetesCostAllocationIngestRow => {
+                return mapAllocationToRow({
+                  allocation,
+                  windowStart,
+                  windowEnd,
+                });
+              },
+            );
+
+          /*
+           * Enrich with per-container memory peaks before shipping.
+           *
+           * Guarded here as well as inside the client: peaks are an
+           * enrichment, and letting anything from that path reach the tick's
+           * catch would leave the checkpoint pinned and stall SPEND
+           * collection over a Prometheus outage. The client already answers
+           * with an empty map on failure, but the poller must not depend on
+           * a collaborator's politeness for something it can do without.
+           */
+          let peaks: Map<string, number> = new Map<string, number>();
+          try {
+            peaks = await this.prometheus.fetchMemoryPeaks({
+              windowStart,
+              windowEnd,
+            });
+          } catch (err: unknown) {
+            const message: string =
+              err instanceof Error ? err.message : String(err);
+            Logger.warn("memory peak collection failed; shipping without it", {
+              windowStart: windowStart.toISOString(),
+              error: message,
+            });
+          }
+
+          attachMemoryPeaks({ rows, peaks });
+
+          await this.shipper.ship(rows);
+
+          Logger.info("shipped cost window", {
+            windowStart: windowStart.toISOString(),
+            windowEnd: windowEnd.toISOString(),
+            rows: rows.length,
+            containersWithMemoryPeak: peaks.size,
+          });
+        } else {
+          Logger.info("cost window had no allocations; skipping", {
+            windowStart: windowStart.toISOString(),
+            windowEnd: windowEnd.toISOString(),
+          });
+        }
+
+        this.checkpointMs = windowEndMs;
+        this.lastPollErr = null;
+        this.lastWindowCompletedAtMs = Date.now();
+        this.windowsCompleted++;
+      }
+
+      /*
+       * The tick ran end to end. That includes the do-nothing tick where no
+       * window is closed yet — which is only reachable once the backlog is
+       * drained, so it is genuine progress, not silence: a broken engine
+       * pins the checkpoint in the past and every tick has work that throws.
+       */
+      this.consecutivePollFailures = 0;
+    } catch (err: unknown) {
+      const message: string = err instanceof Error ? err.message : String(err);
+      this.lastPollErr = message;
+      this.consecutivePollFailures++;
+      Logger.error("cost poll failed; will retry next tick", {
+        error: message,
+        consecutiveFailures: this.consecutivePollFailures,
+      });
+    } finally {
+      this.running = false;
+    }
+  }
+}

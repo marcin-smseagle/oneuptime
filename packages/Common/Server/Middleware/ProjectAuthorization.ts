@@ -1,0 +1,298 @@
+import ApiKeyService from "../Services/ApiKeyService";
+import GlobalConfigService from "../Services/GlobalConfigService";
+import UserService from "../Services/UserService";
+import {
+  ExpressRequest,
+  ExpressResponse,
+  NextFunction,
+  OneUptimeRequest,
+} from "../Utils/Express";
+import Dictionary from "../../Types/Dictionary";
+import BadDataException from "../../Types/Exception/BadDataException";
+import ObjectID from "../../Types/ObjectID";
+import { UserTenantAccessPermission } from "../../Types/Permission";
+import UserType from "../../Types/UserType";
+import GlobalConfig from "../../Models/DatabaseModels/GlobalConfig";
+import User from "../../Models/DatabaseModels/User";
+import APIKeyAccessPermission from "../Utils/APIKey/AccessPermission";
+import CaptureSpan from "../Utils/Telemetry/CaptureSpan";
+import SpanUtil from "../Utils/Telemetry/SpanUtil";
+
+export default class ProjectMiddleware {
+  @CaptureSpan()
+  public static getProjectId(req: ExpressRequest): ObjectID | null {
+    let projectId: ObjectID | null = null;
+    if (req.params && req.params["projectId"]) {
+      projectId = new ObjectID(req.params["projectId"]);
+    } else if (req.params && req.params["tenantid"]) {
+      projectId = new ObjectID(req.params["tenantid"]);
+    } else if (req.query && req.query["tenantid"]) {
+      projectId = new ObjectID(req.query["tenantid"] as string);
+    } else if (req.headers && req.headers["tenantid"]) {
+      // Header keys are automatically transformed to lowercase
+      projectId = new ObjectID(req.headers["tenantid"] as string);
+    } else if (req.headers && req.headers["projectid"]) {
+      // Header keys are automatically transformed to lowercase
+      projectId = new ObjectID(req.headers["projectid"] as string);
+    } else if (req.body && req.body.projectId) {
+      projectId = new ObjectID(req.body.projectId as string);
+    }
+
+    return projectId;
+  }
+
+  /*
+   * The `apikey` header exactly as it arrived, or null when it was never
+   * sent at all. Node lower-cases header names, and a caller that sends the
+   * header twice arrives here as one comma-joined string — never a usable
+   * key, but unmistakably a caller who meant to authenticate by key.
+   *
+   * An empty or whitespace-only value is a header that WAS sent. Keeping that
+   * distinct from "absent" is the whole point of this helper; see hasApiKey.
+   */
+  private static getRawApiKeyHeader(req: ExpressRequest): string | null {
+    const rawHeader: string | Array<string> | undefined =
+      req.headers?.["apikey"];
+
+    if (rawHeader === undefined) {
+      return null;
+    }
+
+    return Array.isArray(rawHeader) ? rawHeader.join(",") : rawHeader;
+  }
+
+  @CaptureSpan()
+  public static getApiKey(req: ExpressRequest): ObjectID | null {
+    const rawHeader: string | null = ProjectMiddleware.getRawApiKeyHeader(req);
+
+    if (rawHeader === null) {
+      return null;
+    }
+
+    const apiKey: string = rawHeader.trim();
+
+    /*
+     * `ApiKey.apiKey` is a Postgres `uuid` column, so a non-UUID value makes
+     * the lookup raise "invalid input syntax for type uuid" down in the query
+     * layer. A raw QueryFailedError is not a OneUptime Exception, so it slips
+     * past the error translator and answers 500 to what is really a malformed
+     * request. Reject the shape here and let the caller get `Invalid API Key`.
+     */
+    if (!ObjectID.isValidUUID(apiKey)) {
+      return null;
+    }
+
+    return new ObjectID(apiKey);
+  }
+
+  /*
+   * Presence, not usability — deliberately NOT `Boolean(this.getApiKey(req))`.
+   *
+   * A request carrying an empty or malformed `ApiKey` header is a caller
+   * trying to authenticate by key and getting it wrong. Answering false here
+   * routed it down the anonymous path, where it failed much later with
+   * "A user should be logged in to <op> record of <Model>." — an error about
+   * session auth, raised against a caller who never attempted session auth,
+   * naming a model as though the model were what went wrong. It reads as an
+   * RBAC bug in whichever resource happened to be asked for, and has been
+   * reported as one more than once (issues #1754, #3004). An unset shell
+   * variable, a client that sends the header blank, and our own CLI's
+   * partial-credential path all land here.
+   *
+   * Claim the request instead, so it fails as `Invalid API Key`.
+   */
+  @CaptureSpan()
+  public static hasApiKey(req: ExpressRequest): boolean {
+    return ProjectMiddleware.getRawApiKeyHeader(req) !== null;
+  }
+
+  @CaptureSpan()
+  public static hasProjectID(req: ExpressRequest): boolean {
+    return Boolean(this.getProjectId(req));
+  }
+
+  /*
+   * Whether the given key is the instance-wide master API key
+   * (Admin Dashboard → Settings → API Key) and that key is currently enabled.
+   * The master key has root/master-admin access, so this is shared with
+   * MasterAdminAuthorization to let the key reach master-admin-only endpoints
+   * (e.g. OneUptime Health) as well.
+   */
+  @CaptureSpan()
+  public static async isMasterApiKey(apiKey: ObjectID): Promise<boolean> {
+    /*
+     * masterApiKey is a Postgres `uuid` column, so a non-UUID header value would
+     * make the lookup raise an "invalid input syntax for type uuid" error on
+     * every request. Reject it cleanly up front — a malformed key is never the
+     * master key anyway — so callers can safely fall through to other auth.
+     */
+    if (!ObjectID.isValidUUID(apiKey.toString())) {
+      return false;
+    }
+
+    const masterKeyGlobalConfig: GlobalConfig | null =
+      await GlobalConfigService.findOneBy({
+        query: {
+          _id: ObjectID.getZeroObjectID().toString(),
+          isMasterApiKeyEnabled: true,
+          masterApiKey: apiKey,
+        },
+        props: {
+          isRoot: true,
+        },
+        select: {
+          _id: true,
+        },
+      });
+
+    return Boolean(masterKeyGlobalConfig);
+  }
+
+  @CaptureSpan()
+  public static async isValidProjectIdAndApiKeyMiddleware(
+    req: ExpressRequest,
+    _res: ExpressResponse,
+    next: NextFunction,
+  ): Promise<void> {
+    try {
+      let tenantId: ObjectID | null = this.getProjectId(req);
+
+      const apiKey: ObjectID | null = this.getApiKey(req);
+
+      if (tenantId) {
+        (req as OneUptimeRequest).tenantId = tenantId;
+
+        // Tag the current span with project context for observability
+        SpanUtil.addAttributesToCurrentSpan({
+          projectId: tenantId.toString(),
+        });
+      }
+
+      if (!apiKey) {
+        /*
+         * Separate "no header at all" from "header sent, but unusable".
+         * getUserMiddleware only routes here once the header is present, so
+         * in practice it is always the second: an empty value from an unset
+         * variable, a non-UUID string, or duplicate headers that Node joined
+         * into a comma-separated list.
+         */
+        if (ProjectMiddleware.hasApiKey(req)) {
+          throw new BadDataException("Invalid API Key");
+        }
+
+        throw new BadDataException(
+          "API Key not found in the request header. Please provide a valid API Key in the request header.",
+        );
+      }
+
+      /*
+       * Cached lookup — see ApiKeyService.findApiKey. Hot path for any
+       * automated caller hitting the API by key.
+       */
+      const apiKeyRow: { id: ObjectID; projectId: ObjectID } | null =
+        await ApiKeyService.findApiKey(apiKey);
+
+      if (apiKeyRow) {
+        tenantId = apiKeyRow.projectId;
+
+        (req as OneUptimeRequest).tenantId = tenantId;
+        (req as OneUptimeRequest).userType = UserType.API;
+
+        /*
+         * The two halves of an API key's authority. The global half is the
+         * fixed marker set every key carries (see APIKeyAccessPermission); the
+         * per-key grants an administrator actually configured are read from
+         * ApiKeyPermission just below. That second half is what the long-lived
+         * "TODO: Add API key permissions" here was asking for, and it is done -
+         * the TODO outlived the work.
+         */
+        (req as OneUptimeRequest).userGlobalAccessPermission =
+          await APIKeyAccessPermission.getDefaultApiGlobalPermission(tenantId);
+
+        const userTenantAccessPermission: UserTenantAccessPermission | null =
+          await APIKeyAccessPermission.getApiTenantAccessPermission(
+            tenantId,
+            apiKeyRow.id,
+          );
+
+        if (userTenantAccessPermission) {
+          (req as OneUptimeRequest).userTenantAccessPermission = {};
+          (
+            (req as OneUptimeRequest)
+              .userTenantAccessPermission as Dictionary<UserTenantAccessPermission>
+          )[tenantId.toString()] = userTenantAccessPermission;
+
+          return next();
+        }
+      }
+
+      if (!apiKeyRow) {
+        // check master key.
+        const isMasterApiKey: boolean =
+          await ProjectMiddleware.isMasterApiKey(apiKey);
+
+        if (isMasterApiKey) {
+          (req as OneUptimeRequest).userType = UserType.MasterAdmin;
+
+          // get master admin user
+
+          const user: User | null = await UserService.findOneBy({
+            query: {
+              isMasterAdmin: true,
+            },
+            select: {
+              _id: true,
+              email: true,
+              name: true,
+            },
+            props: {
+              isRoot: true,
+            },
+          });
+
+          if (!user) {
+            throw new BadDataException(
+              "Master Admin user not found. Please make sure you have created a master admin user.",
+            );
+          }
+
+          (req as OneUptimeRequest).userAuthorization = {
+            userId: user.id!,
+            isMasterAdmin: true,
+            email: user.email!,
+            name: user.name!,
+            isGlobalLogin: true,
+          };
+
+          return next();
+        }
+      }
+
+      if (apiKey) {
+        // If we have an API key but no tenant ID, we throw an error.
+        throw new BadDataException("Invalid API Key");
+      }
+
+      if (!tenantId) {
+        throw new BadDataException(
+          "ProjectID not found in the request header.",
+        );
+      }
+
+      throw new BadDataException("Invalid Project ID or API Key");
+    } catch (err) {
+      /*
+       * Record on THIS middleware's own @CaptureSpan span before handing the
+       * error to Express. The decorator sees a normal return (we call
+       * next(err) rather than rethrowing — Express 4 does not catch a
+       * rejection from an async middleware), so its recorder never runs and
+       * without this the error is invisible on the span it actually belongs
+       * to. Goes through SpanUtil so the event is typed by class name rather
+       * than by HTTP status, and so a rejected credential produces a `fault`
+       * event instead of an Issue.
+       */
+      SpanUtil.recordExceptionOnCurrentSpan(err);
+      next(err);
+    }
+  }
+}

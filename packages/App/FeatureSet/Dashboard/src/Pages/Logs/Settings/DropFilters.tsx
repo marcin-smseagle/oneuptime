@@ -1,0 +1,375 @@
+import PageComponentProps from "../../PageComponentProps";
+import SortOrder from "Common/Types/BaseDatabase/SortOrder";
+import FormFieldSchemaType from "Common/UI/Components/Forms/Types/FormFieldSchemaType";
+import FormValues from "Common/UI/Components/Forms/Types/FormValues";
+import { CustomElementProps } from "Common/UI/Components/Forms/Types/Field";
+import { ModalWidth } from "Common/UI/Components/Modal/Modal";
+import ModelTable from "Common/UI/Components/ModelTable/ModelTable";
+import FieldType from "Common/UI/Components/Types/FieldType";
+import Pill from "Common/UI/Components/Pill/Pill";
+import { Green, Red, Yellow } from "Common/Types/BrandColors";
+import Navigation from "Common/UI/Utils/Navigation";
+import LogDropFilter from "Common/Models/DatabaseModels/LogDropFilter";
+import LogDropFilterAction from "Common/Types/Log/LogDropFilterAction";
+import ProjectUtil from "Common/UI/Utils/Project";
+import FilterQueryBuilderField from "../../../Components/FilterQueryBuilder/FilterQueryBuilderField";
+import LogFilterConfig from "../../../Components/FilterQueryBuilder/LogFilterConfig";
+import {
+  MAX_SAMPLE_PERCENTAGE,
+  MIN_SAMPLE_PERCENTAGE,
+} from "Common/Types/Telemetry/DropFilterSampling";
+import React, { FunctionComponent, ReactElement } from "react";
+
+const documentationMarkdown: string = `
+### How Log Drop Filters Work
+
+Drop filters let you **discard or sample logs before they are stored**, reducing storage costs and noise. They run **before** pipeline processing.
+
+\`\`\`mermaid
+flowchart TD
+    A[Log Arrives] --> B{Match Against Drop Filters}
+    B -->|Filter Matches| C{Action Type}
+    B -->|No Match| D[Continue to Pipelines]
+    C -->|Drop| E[Log Discarded]
+    C -->|Sample| F{Random Check}
+    F -->|Keep %| D
+    F -->|Discard %| E
+\`\`\`
+
+---
+
+### Actions
+
+| Action | Description |
+|--------|-------------|
+| **Drop** | Permanently discard all matching logs — they will never be stored |
+| **Sample** | Keep only a percentage of matching logs. For example, 10% means ~1 in 10 matching logs are kept |
+
+---
+
+### Filter Query Syntax
+
+Filter queries determine which logs this drop filter applies to.
+
+| Operator | Example | Description |
+|----------|---------|-------------|
+| \`=\` | \`severityText = 'Debug'\` | Exact match |
+| \`!=\` | \`severityText != 'Error'\` | Not equal |
+| \`LIKE\` | \`body LIKE 'healthcheck'\` | Substring match (use \`%\` for SQL-style wildcards) |
+| \`IN\` | \`severityText IN ('Debug', 'Trace')\` | Match any value in list |
+| \`AND\` / \`OR\` | \`severityText = 'Debug' AND attributes.source = 'loadbalancer'\` | Combine conditions |
+
+**Available fields:** \`severityText\`, \`body\`, \`primaryEntityId\`, \`attributes.<key>\`
+
+**Severity values:** \`Unspecified\`, \`Trace\`, \`Debug\`, \`Information\`, \`Warning\`, \`Error\`, \`Fatal\`
+
+> \`=\`, \`!=\` and \`IN\` are **case-sensitive** — \`'Debug'\` matches, \`'DEBUG'\` never will. Only \`LIKE\` ignores case. Note the level is \`Information\` (not \`INFO\`) and \`Warning\` (not \`WARN\`).
+
+---
+
+### Examples
+
+#### Example 1: Drop all debug logs
+- **Filter Query:** \`severityText = 'Debug'\`
+- **Action:** Drop
+- **Result:** All debug-level logs are discarded before storage
+
+#### Example 2: Sample verbose health check logs
+- **Filter Query:** \`body LIKE 'healthcheck' AND severityText = 'Information'\`
+- **Action:** Sample
+- **Sample Percentage:** 5
+- **Result:** Only 5% of health check info logs are kept — enough to spot trends without the noise
+
+#### Example 3: Drop internal load balancer logs
+- **Filter Query:** \`attributes.source = 'internal-lb'\`
+- **Action:** Drop
+- **Result:** All logs from the internal load balancer are discarded
+
+---
+
+### Tips
+- **Order matters** — filters run in order. Drag rows to reorder
+- **Start with Sample** — if unsure, sample at 50% first to see the impact before dropping entirely
+- **Be specific** — use narrow filters to avoid accidentally dropping important logs
+- **Drop filters run before pipelines** — a dropped log will never reach any pipeline processor
+`;
+
+const LogDropFilters: FunctionComponent<
+  PageComponentProps
+> = (): ReactElement => {
+  return (
+    <ModelTable<LogDropFilter>
+      modelType={LogDropFilter}
+      query={{
+        projectId: ProjectUtil.getCurrentProjectId()!,
+      }}
+      id="log-drop-filters-table"
+      name="Logs > Settings > Drop Filters"
+      userPreferencesKey="log-drop-filters-table"
+      isDeleteable={false}
+      isEditable={false}
+      isCreateable={true}
+      isViewable={true}
+      createEditModalWidth={ModalWidth.Large}
+      sortBy="sortOrder"
+      sortOrder={SortOrder.Ascending}
+      enableDragAndDrop={true}
+      dragDropIndexField="sortOrder"
+      cardProps={{
+        title: "Log Drop Filters",
+        description:
+          "Discard or sample logs before they are stored to reduce noise and storage costs. Click a filter to configure its conditions and action.",
+      }}
+      helpContent={{
+        title: "How Log Drop Filters Work",
+        description:
+          "Understanding drop vs sample actions, filter queries, and how logs are discarded at ingest time",
+        markdown: documentationMarkdown,
+      }}
+      noItemsMessage={"No drop filters found."}
+      selectMoreFields={{
+        samplePercentage: true,
+      }}
+      viewPageRoute={Navigation.getCurrentRoute()}
+      createInitialValues={{
+        isEnabled: true,
+        action: LogDropFilterAction.Drop,
+      }}
+      onBeforeCreate={async (item: LogDropFilter) => {
+        if (!item.sortOrder) {
+          item.sortOrder = 1;
+        }
+        if (!item.action) {
+          item.action = LogDropFilterAction.Drop;
+        }
+        if (item.isEnabled === undefined || item.isEnabled === null) {
+          item.isEnabled = true;
+        }
+        return item;
+      }}
+      formSteps={[
+        { title: "Basic Info", id: "basic-info" },
+        { title: "Filter Conditions", id: "filter-conditions" },
+        { title: "Action", id: "action" },
+      ]}
+      formFields={[
+        {
+          field: {
+            name: true,
+          },
+          title: "Name",
+          stepId: "basic-info",
+          fieldType: FormFieldSchemaType.Text,
+          required: true,
+          placeholder: "e.g. Drop Debug Logs",
+          validation: {
+            minLength: 2,
+          },
+        },
+        {
+          field: {
+            description: true,
+          },
+          title: "Description",
+          stepId: "basic-info",
+          fieldType: FormFieldSchemaType.LongText,
+          required: false,
+          placeholder: "Describe what this filter does.",
+        },
+        {
+          field: {
+            isEnabled: true,
+          },
+          title: "Enabled",
+          stepId: "basic-info",
+          fieldType: FormFieldSchemaType.Toggle,
+          required: false,
+        },
+        {
+          field: {
+            filterQuery: true,
+          },
+          title: "Filter Query",
+          stepId: "filter-conditions",
+          description:
+            "Which logs this filter applies to. Build rules with fields like severity, body, service, or custom attributes.",
+          fieldType: FormFieldSchemaType.CustomComponent,
+          required: true,
+          getCustomElement: (
+            values: FormValues<LogDropFilter>,
+            fieldProps: CustomElementProps,
+          ): ReactElement => {
+            return (
+              <FilterQueryBuilderField
+                initialValue={(values.filterQuery as string) || ""}
+                onChange={(value: string) => {
+                  if (fieldProps.onChange) {
+                    fieldProps.onChange(value);
+                  }
+                }}
+                error={fieldProps.error}
+                config={LogFilterConfig}
+              />
+            );
+          },
+        },
+        {
+          field: {
+            action: true,
+          },
+          title: "Action",
+          stepId: "action",
+          description:
+            "Drop permanently discards matching logs. Sample keeps a percentage of them.",
+          fieldType: FormFieldSchemaType.Dropdown,
+          required: true,
+          dropdownOptions: [
+            { label: "Drop", value: LogDropFilterAction.Drop },
+            { label: "Sample", value: LogDropFilterAction.Sample },
+          ],
+        },
+        {
+          field: {
+            samplePercentage: true,
+          },
+          title: "Sample Percentage",
+          stepId: "action",
+          description:
+            "Required when Action is Sample. Percentage of matching logs to keep, between 1 and 99 (e.g. 10 = keep 10%, discard 90%).",
+          fieldType: FormFieldSchemaType.Number,
+          /*
+           * Required, but only while the Sample action is selected — the
+           * form skips validation for fields hidden by showIf. Leaving this
+           * optional let a sample filter be saved with no percentage, which
+           * the engine used to read as "throw away half".
+           */
+          required: true,
+          validation: {
+            minValue: MIN_SAMPLE_PERCENTAGE,
+            maxValue: MAX_SAMPLE_PERCENTAGE,
+          },
+          placeholder: "e.g. 10",
+          showIf: (values: FormValues<LogDropFilter>): boolean => {
+            return values.action === LogDropFilterAction.Sample;
+          },
+        },
+      ]}
+      showRefreshButton={true}
+      searchableFields={["name", "description"]}
+      showViewIdButton={true}
+      filters={[
+        {
+          field: {
+            name: true,
+          },
+          type: FieldType.Text,
+          title: "Name",
+        },
+        {
+          field: {
+            action: true,
+          },
+          type: FieldType.Text,
+          title: "Action",
+        },
+        {
+          field: {
+            isEnabled: true,
+          },
+          type: FieldType.Boolean,
+          title: "Enabled",
+        },
+      ]}
+      columns={[
+        {
+          field: {
+            name: true,
+          },
+          title: "Name",
+          type: FieldType.Text,
+        },
+        {
+          field: {
+            description: true,
+          },
+          noValueMessage: "-",
+          title: "Description",
+          type: FieldType.LongText,
+        },
+        {
+          field: {
+            action: true,
+          },
+          title: "Action",
+          type: FieldType.Text,
+          getElement: (item: LogDropFilter): ReactElement => {
+            if (item.action === "drop") {
+              return <Pill color={Red} text="Drop" />;
+            }
+            if (item.action === "sample") {
+              return (
+                <Pill
+                  color={Yellow}
+                  text={`Sample ${item.samplePercentage ? item.samplePercentage + "%" : ""}`}
+                />
+              );
+            }
+            return <Pill color={Red} text={item.action || "-"} />;
+          },
+        },
+        {
+          field: {
+            isEnabled: true,
+          },
+          title: "Status",
+          type: FieldType.Boolean,
+          getElement: (item: LogDropFilter): ReactElement => {
+            if (item.isEnabled) {
+              return <Pill color={Green} text="Enabled" />;
+            }
+            return <Pill color={Red} text="Disabled" />;
+          },
+        },
+        /*
+         * A drop filter used to discard logs leaving no trace at all, so
+         * "are my logs missing because of this filter?" was unanswerable
+         * without reading the database. These two columns answer it.
+         */
+        {
+          field: {
+            droppedCount: true,
+          },
+          title: "Dropped",
+          type: FieldType.Number,
+          getElement: (item: LogDropFilter): ReactElement => {
+            const dropped: number = item.droppedCount || 0;
+
+            if (dropped === 0) {
+              return (
+                <span className="text-sm text-gray-400">
+                  Nothing dropped yet
+                </span>
+              );
+            }
+
+            return (
+              <span className="text-sm text-gray-900">
+                {dropped.toLocaleString()}
+              </span>
+            );
+          },
+        },
+        {
+          field: {
+            lastDroppedAt: true,
+          },
+          title: "Last Dropped",
+          type: FieldType.DateTime,
+          noValueMessage: "Never",
+        },
+      ]}
+    />
+  );
+};
+
+export default LogDropFilters;

@@ -1,0 +1,58 @@
+{{> Start this}}
+
+
+{{> Logo this}}
+{{> EmailTitle title=(concat incidentCount " new " incidentCountLabel " added to Episode " episodeNumber) }}
+
+{{> InfoBlock info=(concat incidentCount " new " incidentCountLabel " added to incident episode " episodeNumber " (" episodeTitle ") in project - " projectName) }}
+
+{{> DetailBoxStart this }}
+{{> DetailBoxField title="Episode Title:" text=episodeTitle }}
+{{> DetailBoxField title="Episode Number:" text=episodeNumber }}
+{{> DetailBoxField title="Current Episode State: " text=currentState  }}
+{{> DetailBoxField title="Incidents Added: " text=incidentCount  }}
+{{> DetailBoxEnd this }}
+
+{{> InfoBlock info="Incidents added in this update:"}}
+
+<table role="presentation" class="st-Copy st-Width st-Width--mobile" border="0" cellpadding="0" cellspacing="0" width="100%" style="width: 100%; max-width: 100%; table-layout: fixed;">
+  <tbody>
+    <tr>
+      <td class="st-Spacer st-Spacer--gutter" width="40" style="padding: 0;"></td>
+      <td style="padding: 0 0 24px;">
+        <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="width: 100%; table-layout: fixed; border: 1px solid #e2e8f0; border-radius: 12px; border-collapse: separate; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Ubuntu, sans-serif;">
+          <tbody>
+            {{#each incidents}}
+            <tr>
+              <td style="padding: 18px 20px; border-bottom: 1px solid #e2e8f0; overflow-wrap: anywhere; word-break: break-word;">
+                <p style="margin: 0 0 6px; font-size: 12px; line-height: 18px; font-weight: 600; color: #64748b;">Incident {{this.incidentNumber}}</p>
+                <p style="margin: 0; font-size: 15px; line-height: 24px; font-weight: 600;"><a href="{{this.incidentViewLink}}" style="color: #111111; text-decoration: underline; text-underline-offset: 3px;">{{this.incidentTitle}}</a></p>
+                <p style="margin: 8px 0 0; font-size: 13px; line-height: 20px; color: #475569;"><strong style="font-weight: 600;">Severity:</strong> {{this.incidentSeverity}}</p>
+                <div style="margin: 4px 0 0; font-size: 13px; line-height: 20px; color: #64748b;"><strong style="font-weight: 500;">Added:</strong> {{{this.addedAt}}}</div>
+              </td>
+            </tr>
+            {{/each}}
+          </tbody>
+        </table>
+      </td>
+      <td class="st-Spacer st-Spacer--gutter" width="40" style="padding: 0;"></td>
+    </tr>
+  </tbody>
+</table>
+
+{{#ifCond hasMore "true"}}
+{{> InfoBlock info=(concat "...and " remainingCount " more. Open the episode on the dashboard to see the full list.")}}
+{{/ifCond}}
+
+{{> InfoBlock info="Open this incident episode to see everything in one place:"}}
+
+{{> ButtonBlock buttonUrl=episodeViewLink buttonText="View Incident Episode"}}
+
+{{> LinkBlock linkUrl=episodeViewLink linkLabel="You can also copy and paste this link:"}}
+
+{{> OwnerInfo this }}
+{{> UnsubscribeOwnerEmail this }}
+
+{{> Footer this }}
+
+{{> End this}}

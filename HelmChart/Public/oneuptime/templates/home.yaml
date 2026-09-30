@@ -58,12 +58,11 @@ spec:
       {{- if $.Values.tolerations }}
       tolerations: {{- $.Values.tolerations | toYaml | nindent 8 }}
       {{- end }}
-      {{- if $.Values.home.nodeSelector }}
       nodeSelector:
-        {{- toYaml $.Values.home.nodeSelector | nindent 8 }}
-      {{- else if $.Values.nodeSelector }}
-      nodeSelector:
-        {{- toYaml $.Values.nodeSelector | nindent 8 }}
+        {{- include "oneuptime.nodeSelector" ($.Values.home.nodeSelector | default $.Values.nodeSelector) | nindent 8 }}
+      {{- with (default $.Values.extraVolumes $.Values.home.extraVolumes) }}
+      volumes:
+        {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
         - image: {{ include "oneuptime.image" (dict "Values" $.Values "ServiceName" "home") }}
@@ -109,6 +108,7 @@ spec:
           imagePullPolicy: {{ $.Values.image.pullPolicy }}
           env:
             {{- include "oneuptime.env.common" . | nindent 12 }}
+            {{- include "oneuptime.env.telemetryIdentity" (dict "Values" $.Values "DeploymentName" (printf "%s-%s" $.Release.Name "home")) | nindent 12 }}
             {{- include "oneuptime.env.runtime" (dict "Values" $.Values "Release" $.Release) | nindent 12 }}
             - name: PORT
               value: {{ $.Values.home.ports.http | quote }}
@@ -116,6 +116,13 @@ spec:
               value: {{ $.Values.home.disableTelemetryCollection | quote }}
             - name: ENABLE_PROFILING
               value: {{ $.Values.home.enableProfiling | quote }}
+            {{- with (default $.Values.extraEnv $.Values.home.extraEnv) }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with (default $.Values.extraVolumeMounts $.Values.home.extraVolumeMounts) }}
+          volumeMounts:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           ports:
             - containerPort: {{ $.Values.home.ports.http }}
               protocol: TCP

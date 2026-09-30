@@ -1,0 +1,84 @@
+import { useQuery, UseQueryResult } from "@tanstack/react-query";
+import {
+  fetchAlertEpisodeById,
+  fetchAlertEpisodeStates,
+  fetchAlertEpisodeStateTimeline,
+  fetchAlertEpisodeNotes,
+  fetchAlertEpisodeFeed,
+} from "../api/alertEpisodes";
+import type {
+  AlertEpisodeItem,
+  AlertState,
+  StateTimelineItem,
+  NoteItem,
+  FeedItem,
+} from "../api/types";
+
+/*
+ * `AlertEpisodeItem | null`, because `fetchAlertEpisodeById` resolves `null`
+ * for an episode that is gone. That miss is settled DATA, so `isError` here
+ * means the request failed and a null `data` means there is no such episode.
+ */
+export function useAlertEpisodeDetail(
+  projectId: string,
+  episodeId: string,
+): UseQueryResult<AlertEpisodeItem | null, Error> {
+  return useQuery({
+    queryKey: ["alert-episode", projectId, episodeId],
+    queryFn: () => {
+      return fetchAlertEpisodeById(projectId, episodeId);
+    },
+    enabled: Boolean(projectId) && Boolean(episodeId),
+  });
+}
+
+export function useAlertEpisodeStates(
+  projectId: string,
+): UseQueryResult<AlertState[], Error> {
+  return useQuery({
+    queryKey: ["alert-states", projectId],
+    queryFn: () => {
+      return fetchAlertEpisodeStates(projectId);
+    },
+    enabled: Boolean(projectId),
+  });
+}
+
+export function useAlertEpisodeStateTimeline(
+  projectId: string,
+  episodeId: string,
+): UseQueryResult<StateTimelineItem[], Error> {
+  return useQuery({
+    queryKey: ["alert-episode-state-timeline", projectId, episodeId],
+    queryFn: () => {
+      return fetchAlertEpisodeStateTimeline(projectId, episodeId);
+    },
+    enabled: Boolean(projectId) && Boolean(episodeId),
+  });
+}
+
+export function useAlertEpisodeNotes(
+  projectId: string,
+  episodeId: string,
+): UseQueryResult<NoteItem[], Error> {
+  return useQuery({
+    queryKey: ["alert-episode-notes", projectId, episodeId],
+    queryFn: () => {
+      return fetchAlertEpisodeNotes(projectId, episodeId);
+    },
+    enabled: Boolean(projectId) && Boolean(episodeId),
+  });
+}
+
+export function useAlertEpisodeFeed(
+  projectId: string,
+  episodeId: string,
+): UseQueryResult<FeedItem[], Error> {
+  return useQuery({
+    queryKey: ["alert-episode-feed", projectId, episodeId],
+    queryFn: () => {
+      return fetchAlertEpisodeFeed(projectId, episodeId);
+    },
+    enabled: Boolean(projectId) && Boolean(episodeId),
+  });
+}

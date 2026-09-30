@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en" id="home">
+
+<head>
+  <title>OneUptime | Open-Source Observability & Incident Management</title>
+  <meta name="description"
+    content="Detect outages in seconds, page the right engineer, update your status page, and ship the fix — open-source observability and incident management.">
+  <%- include('head', {
+    enableGoogleTagManager: typeof enableGoogleTagManager !== 'undefined' ? enableGoogleTagManager : false
+}) -%>
+
+</head>
+
+<body>
+  <%- include('nav') -%>
+
+  <main id="main-content">
+    <%- include('./Partials/home-motion') -%>
+
+    <%- include('./Partials/home-hero') -%>
+
+    <%- include('logo-roll') -%>
+
+    <%- include('./Partials/home-stakes') -%>
+
+    <%- include('./Partials/home-detect') -%>
+
+    <%- include('./Partials/home-respond') -%>
+
+    <%- include('./Partials/home-communicate') -%>
+
+    <%- include('./Partials/home-diagnose') -%>
+
+    <%- include('./Partials/home-autofix') -%>
+
+    <%- include('./Partials/home-results') -%>
+
+    <%- include('./Partials/home-consolidate') -%>
+
+    <%- include('./Partials/home-products') -%>
+
+    <%- include('./Partials/home-integrations') -%>
+
+    <%- include('./Partials/home-own-it') -%>
+
+    <%- include('./Partials/reviews') -%>
+
+    <%- include('cta') -%>
+  </main>
+
+  <%- include('footer') -%>
+
+  <%- include('./Partials/cta-tracking') -%>
+
+</body>
+
+</html>

@@ -1,6 +1,19 @@
 {{- if not $.Values.deployment.disableDeployments }}
 {{- range $key, $val := $.Values.probes }}
 {{- if or (not (hasKey $val "enabled")) $val.enabled }}
+{{- $probeContainerSecurityContext := deepCopy (default (dict) $.Values.probeContainerSecurityContext) }}
+{{- if $.Values.containerSecurityContext }}
+{{- $probeContainerSecurityContext = mergeOverwrite $probeContainerSecurityContext $.Values.containerSecurityContext }}
+{{- if hasKey $.Values.containerSecurityContext "seccompProfile" }}
+{{- $_ := set $probeContainerSecurityContext "seccompProfile" (deepCopy $.Values.containerSecurityContext.seccompProfile) }}
+{{- end }}
+{{- end }}
+{{- if $val.containerSecurityContext }}
+{{- $probeContainerSecurityContext = mergeOverwrite $probeContainerSecurityContext $val.containerSecurityContext }}
+{{- if hasKey $val.containerSecurityContext "seccompProfile" }}
+{{- $_ := set $probeContainerSecurityContext "seccompProfile" (deepCopy $val.containerSecurityContext.seccompProfile) }}
+{{- end }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -35,6 +48,7 @@ spec:
         {{- end }}
         appname: oneuptime
     spec:
+      automountServiceAccountToken: {{ default false $val.automountServiceAccountToken }}
       # DNS resolution for probe pods. Probes resolve mostly EXTERNAL hostnames,
       # so the cluster default (ndots:5 + a multi-entry search list) fans every
       # lookup out into ~7 queries and funnels them through a single upstream
@@ -79,24 +93,28 @@ spec:
       {{- if $.Values.tolerations }}
       tolerations: {{- $.Values.tolerations | toYaml | nindent 8 }}
       {{- end }}
-      {{- if $val.nodeSelector }}
       nodeSelector:
-        {{- toYaml $val.nodeSelector | nindent 8 }}
-      {{- else if $.Values.nodeSelector }}
-      nodeSelector:
-        {{- toYaml $.Values.nodeSelector | nindent 8 }}
-      {{- end }}
+        {{- include "oneuptime.nodeSelector" ($val.nodeSelector | default $.Values.nodeSelector) | nindent 8 }}
       containers:
         - image: {{ include "oneuptime.image" (dict "Values" $.Values "ServiceName" "probe") }}
           name: {{ printf "%s-%s" $.Release.Name (printf "probe-%s" $key)  }}
-          {{- if $val.containerSecurityContext }}
+          {{- if $probeContainerSecurityContext }}
           securityContext:
-            {{- toYaml $val.containerSecurityContext | nindent 12 }}
-          {{- else if $.Values.containerSecurityContext }}
-          securityContext:
-            {{- toYaml $.Values.containerSecurityContext | nindent 12 }}
+            {{- toYaml $probeContainerSecurityContext | nindent 12 }}
           {{- end }}
           imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          volumeMounts:
+            - name: synthetic-runtime-tmp
+              mountPath: /tmp
+            # Not used by the synthetic runtime's browsers: Playwright starts
+            # Chromium with --disable-dev-shm-usage, so Chromium keeps its
+            # shared memory in the per-execution run directory under /tmp
+            # (above), and Firefox uses memfd.
+            - name: dshm
+              mountPath: /dev/shm
+            {{- with (default $.Values.extraVolumeMounts $val.extraVolumeMounts) }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           env:
             - name: BILLING_ENABLED
               value: {{ $.Values.billing.enabled | squote }}
@@ -112,6 +130,7 @@ spec:
               value: {{ $.Values.openTelemetryExporter.headers }}
             - name: OPENTELEMETRY_EXPORTER_OTLP_ENDPOINT
               value: {{ $.Values.openTelemetryExporter.endpoint }}
+            {{- include "oneuptime.env.telemetryIdentity" (dict "Values" $.Values "DeploymentName" (printf "%s-%s" $.Release.Name (printf "probe-%s" $key))) | nindent 12 }}
             - name: ONEUPTIME_URL
               value: http://{{ $.Release.Name }}-app.{{ $.Release.Namespace }}.svc.{{ $.Values.global.clusterDomain }}:{{ $.Values.app.ports.http }}
             - name: PROBE_NAME
@@ -120,21 +139,44 @@ spec:
               value: {{ $val.description }}
             - name: PROBE_MONITORING_WORKERS
               value: {{ $val.monitoringWorkers | squote }}
-              {{- if $val.monitorRetryLimit }}
+            # Retries after the first attempt; 0 turns retries off. Only an unset
+            # value falls back to 3: `if` and `default` both read 0 as empty.
             - name: PROBE_MONITOR_RETRY_LIMIT
-              value: {{ $val.monitorRetryLimit | squote }}
-              {{- else }}
-            - name: PROBE_MONITOR_RETRY_LIMIT
+              {{- if kindIs "invalid" $val.monitorRetryLimit }}
               value: {{ 3 | squote }}
+              {{- else }}
+              value: {{ $val.monitorRetryLimit | squote }}
               {{- end }}
             # syntheticMonitorScriptTimeoutInMs
             - name: PROBE_SYNTHETIC_MONITOR_SCRIPT_TIMEOUT_IN_MS
               value: {{ $val.syntheticMonitorScriptTimeoutInMs | squote }}
+            - name: PROBE_SYNTHETIC_MONITOR_MAX_CONCURRENCY
+              value: {{ default 4 $val.syntheticMonitorMaxConcurrency | squote }}
+            - name: PROBE_SYNTHETIC_MONITOR_MAX_PROCESS_TREE_RSS_BYTES
+              value: {{ printf "%.0f" (float64 (default 1610612736 $val.syntheticMonitorMaxProcessTreeRssBytes)) | squote }}
+            - name: PROBE_SYNTHETIC_MONITOR_MAX_DISK_BYTES
+              value: {{ printf "%.0f" (float64 (default 268435456 $val.syntheticMonitorMaxDiskBytes)) | squote }}
+            - name: PROBE_SYNTHETIC_MONITOR_CHROMIUM_SANDBOX_ENABLED
+              value: {{ default false $val.syntheticMonitorChromiumSandboxEnabled | squote }}
+            # Whether API, Website, External Status Page and Custom JavaScript
+            # Code monitors on this probe may reach private network addresses.
+            # The probe honors only the exact string "true", so a YAML boolean
+            # is rendered quoted. This probe also gets REGISTER_PROBE_KEY
+            # below, which makes it a global probe: the setting then applies to
+            # every project on the instance, and the probe ignores it (logging
+            # a warning) when BILLING_ENABLED above is "true". Issue #3879.
+            - name: PROBE_ALLOW_PRIVATE_NETWORK_MONITORS
+              value: {{ default false $val.allowPrivateNetworkMonitors | squote }}
             - name: PROBE_CUSTOM_CODE_MONITOR_SCRIPT_TIMEOUT_IN_MS
               value: {{ $val.customCodeMonitorScriptTimeoutInMs | squote }}
             - name: PROBE_KEY
               {{- if $val.key }}
               value: {{ $val.key }}
+              {{- else if (($val.existingSecret).name) }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $val.existingSecret.name }}
+                  key: {{ $val.existingSecret.passwordKey }}
               {{- else }}
               valueFrom:
                 secretKeyRef:
@@ -143,6 +185,14 @@ spec:
               {{- end }}
             - name: PROBE_MONITOR_FETCH_LIMIT
               value: {{ $val.monitorFetchLimit | squote }}
+            {{- if $val.networkDevicePollConcurrency }}
+            - name: PROBE_NETWORK_DEVICE_POLL_CONCURRENCY
+              value: {{ $val.networkDevicePollConcurrency | squote }}
+            {{- end }}
+            {{- if $val.snmpGetChunkSize }}
+            - name: PROBE_SNMP_GET_CHUNK_SIZE
+              value: {{ $val.snmpGetChunkSize | squote }}
+            {{- end }}
             {{- if $val.disableTelemetryCollection }}
             - name: DISABLE_TELEMETRY
               value: {{ $val.disableTelemetryCollection | quote }}
@@ -164,6 +214,9 @@ spec:
               value: {{ $val.proxy.noProxy | squote }}
             {{- end }}
             {{- include "oneuptime.env.registerProbeKey" (dict "Values" $.Values "Release" $.Release) | nindent 12 }}
+            {{- with (default $.Values.extraEnv $val.extraEnv) }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           ports:
             - containerPort: {{ if and $val.ports $val.ports.http }}{{ $val.ports.http }}{{ else }}3874{{ end }}
               protocol: TCP
@@ -174,6 +227,17 @@ spec:
           {{- end }}
         {{- if $val.additionalContainers }}
         {{ toYaml $val.additionalContainers | nindent 8 }}
+        {{- end }}
+      volumes:
+        - name: synthetic-runtime-tmp
+          emptyDir:
+            sizeLimit: {{ default "2Gi" $val.syntheticMonitorTempStorageSizeLimit | quote }}
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ default "512Mi" $val.syntheticMonitorSharedMemorySizeLimit | quote }}
+        {{- with (default $.Values.extraVolumes $val.extraVolumes) }}
+        {{- toYaml . | nindent 8 }}
         {{- end }}
       restartPolicy: {{ $.Values.image.restartPolicy }}
 ---

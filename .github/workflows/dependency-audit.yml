@@ -1,0 +1,61 @@
+name: Dependency Audit
+
+on:
+  pull_request:
+    paths:
+      - "**/package.json"
+      - "**/package-lock.json"
+      - "**/npm-shrinkwrap.json"
+      - "Scripts/Security/npm-audit-check.sh"
+      - "Scripts/Security/npm-audit-fix.sh"
+      - "Scripts/Security/npm-audit-exceptions.json"
+      - "Scripts/Security/ValidateNpmAudit.js"
+      - "Scripts/Security/PruneNpmAuditExceptions.js"
+      - "Scripts/GHA/Tests/npm_audit_check_test.sh"
+      - "Scripts/GHA/Tests/npm_audit_fix_test.sh"
+      - ".github/workflows/dependency-audit.yml"
+  push:
+    branches:
+      - master
+    paths:
+      - "**/package.json"
+      - "**/package-lock.json"
+      - "**/npm-shrinkwrap.json"
+      - "Scripts/Security/npm-audit-check.sh"
+      - "Scripts/Security/npm-audit-fix.sh"
+      - "Scripts/Security/npm-audit-exceptions.json"
+      - "Scripts/Security/ValidateNpmAudit.js"
+      - "Scripts/Security/PruneNpmAuditExceptions.js"
+      - "Scripts/GHA/Tests/npm_audit_check_test.sh"
+      - "Scripts/GHA/Tests/npm_audit_fix_test.sh"
+      - ".github/workflows/dependency-audit.yml"
+  schedule:
+    # Advisories can be published without any lockfile changing. Recheck the
+    # current master tree weekly so new disclosures and expired exceptions
+    # cannot remain invisible until the next dependency update.
+    - cron: "0 8 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  npm-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 26
+
+      - name: Test repository-wide audit gate
+        run: bash Scripts/GHA/Tests/npm_audit_check_test.sh
+
+      - name: Test audit exception pruning in the nightly fix job
+        run: bash Scripts/GHA/Tests/npm_audit_fix_test.sh
+
+      - name: Audit every npm lockfile
+        run: bash Scripts/Security/npm-audit-check.sh

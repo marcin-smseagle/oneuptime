@@ -10,7 +10,9 @@ Do not worry about circular dependencies. All the import should be on the top of
 
 If you are doing any postgres migration. Please do not write migraton code manually, run npm run generate-postgres-migration instead.
 
-After generating the migration file, you MUST also register it in `Common/Server/Infrastructure/Postgres/SchemaMigrations/Index.ts` — add the import at the top and append the class to the default export array. The migration will not run on app startup until it is registered there.
+After generating the migration file, you MUST also register it in `packages/Common/Server/Infrastructure/Postgres/SchemaMigrations/Index.ts` — add the import at the top and append the class to the default export array. The migration will not run on app startup until it is registered there.
+
+CI enforces this. The "Postgres Schema Drift" workflow migrates an empty database with every registered migration and then generates a migration against the result; anything it can still generate is drift and fails the job. Run the same check locally with `npm run check-postgres-schema-drift` — it prints the exact statements that are missing.
 
 #### Clickhouse
 
@@ -18,8 +20,40 @@ Clickhouse migrations are written manually. Please write the migration code in D
 
 ### After you make a change.
 
-Please run "npm run fix" in root to fix all the lint issues. Please run "npm run compile" in projects that you made changes to make sure compile works.
+Do not lint the entire project. Only lint the files you have modified by passing their paths explicitly to `npx eslint --fix` from the root. Do not run `npm run lint`, `npm run fix-lint`, or `npm run fix`, as these commands lint the entire project.
 
-### Project docs
+Please run "npm run compile" in projects that you made changes to make sure compile works.
 
-Internal roadmaps live in `Internal/Roadmap/` (see its README for the index). If you change AI/Sentinel behavior (`Common/Server/Utils/AI/` or `AIAgent/`), update the status table in `Internal/Roadmap/AISentinelExecution.md` in the same PR.
+### Tests
+
+Please write extensive tests for your changes. If you are adding a new feature, please write unit tests and integration tests. If you are fixing a bug, please write a regression test.
+
+There are a lot of tests in the app, please do not run all of them, run only the tests that are relevant to your changes. Running all the tests is a waste of time and resources. We run all the tests in CI, so you can be sure that your changes are not breaking anything. Only run test suites relevant to your changes.
+
+### Helm chart
+
+Two charts are published: the product itself in `HelmChart/Public/oneuptime`, and the
+Kubernetes agent in `HelmChart/Public/kubernetes-agent`. Both have cluster-free unit tests
+in their own `tests/` directory (helm-unittest); run them with `npm run test-helm-chart`
+(it installs the plugin for you through the runner, or install it yourself with
+`helm plugin install https://github.com/helm-unittest/helm-unittest`).
+
+The agent chart writes the OpenTelemetry collector configuration, which decides what
+resource attributes ingest actually sees — so a mistake there surfaces as wrong data
+rather than as a failed deploy. Prefer a render assertion over a careful reading.
+
+`npm run test-helm-chart-all` runs every chart test — lint, those unit tests, and the
+cluster-backed suites that install the chart on a throwaway KinD cluster. That is the
+`helm-test` job in the "Common Jobs" workflow. Suites live in `HelmChart/Tests/suites`;
+see `HelmChart/README.md` for how to add one.
+
+### Mobile app releases
+
+Before building or publishing the Android or iOS app, read
+[packages/MobileApp/RELEASING.md](packages/MobileApp/RELEASING.md). It contains the existing store and
+Expo identifiers, the verified release procedure, privacy checks, and the steps
+needed after uploading a binary to actually submit and publish the update.
+
+### Commit frequently
+
+Committing frequently helps keep your changes small and manageable. It also makes it easier to identify which changes introduced a bug if something goes wrong. Aim to commit logically related changes together and write clear commit messages that describe the purpose of the change. It also costs less when the work session is interrupted and resumed later.

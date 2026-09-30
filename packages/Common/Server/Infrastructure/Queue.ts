@@ -1,0 +1,865 @@
+import { QueueDashboardSecret } from "../EnvironmentConfig";
+import Dictionary from "../../Types/Dictionary";
+import { JSONObject } from "../../Types/JSON";
+import { Queue as BullQueue, Job, JobsOptions, RepeatableJob } from "bullmq";
+import { ExpressAdapter } from "@bull-board/express";
+import { createBullBoard } from "@bull-board/api";
+import { BullMQAdapter } from "@bull-board/api/bullMQAdapter";
+import { ExpressRouter } from "../Utils/Express";
+import CaptureSpan from "../Utils/Telemetry/CaptureSpan";
+import logger from "../Utils/Logger";
+import Telemetry from "../Utils/Telemetry";
+import type { Attributes, ObservableResult } from "@opentelemetry/api";
+import Redis from "./Redis";
+
+export enum QueueName {
+  Workflow = "Workflow",
+  Worker = "Worker",
+  Telemetry = "Telemetry",
+  Runbook = "Runbook",
+  /*
+   * Outbound marketing conversion webhooks. Data-carrying (the job holds the
+   * whole event), unlike Worker, which looks its function up by name. Nothing
+   * stores these events, so this queue is the only thing that survives a
+   * receiver being briefly unreachable.
+   */
+  MarketingEvent = "MarketingEvent",
+}
+
+export type QueueJob = Job;
+type BullBoardQueues = Parameters<typeof createBullBoard>[0]["queues"];
+
+export default class Queue {
+  private static queueDict: Dictionary<BullQueue> = {};
+  // track queues we have already run initial cleanup on
+  private static cleanedQueueNames: Set<string> = new Set<string>();
+  private static queueSizeMetricRegistered: boolean = false;
+  // store repeatable jobs to re-add on reconnect
+  private static repeatableJobs: Dictionary<
+    Dictionary<{
+      jobName: string;
+      data: JSONObject;
+      options: JobsOptions;
+    }>
+  > = {};
+
+  // BullMQ rejects custom IDs containing colons, so normalize them early.
+  private static sanitizeJobId(jobId: string): string {
+    return jobId.replace(/:/g, "-");
+  }
+
+  private static async setupReconnectListener(
+    queue: BullQueue,
+    queueName: QueueName,
+  ): Promise<void> {
+    const client: Awaited<typeof queue.client> = await queue.client;
+    client.on("ready", async () => {
+      logger.debug(`Queue ${queueName} reconnected, re-adding repeatable jobs`);
+      const jobs:
+        | Dictionary<{
+            jobName: string;
+            data: JSONObject;
+            options: JobsOptions;
+          }>
+        | undefined = Queue.repeatableJobs[queueName];
+      if (jobs) {
+        for (const jobId in jobs) {
+          const job:
+            | { jobName: string; data: JSONObject; options: JobsOptions }
+            | undefined = jobs[jobId];
+          if (job) {
+            try {
+              logger.debug(
+                `Re-adding repeatable job ${job.jobName} to queue ${queueName}`,
+              );
+              await queue.add(job.jobName, job.data, job.options);
+            } catch (err: unknown) {
+              logger.error("Error re-adding repeatable job");
+              logger.error(err);
+            }
+          }
+        }
+      }
+    });
+  }
+
+  @CaptureSpan()
+  public static getQueue(queueName: QueueName): BullQueue {
+    // check if the queue is already created
+    if (this.queueDict[queueName]) {
+      return this.queueDict[queueName] as BullQueue;
+    }
+
+    const queue: BullQueue = new BullQueue(queueName, {
+      connection: Redis.getRedisOptions(),
+      // Keep BullMQ data under control to avoid Redis bloat
+      defaultJobOptions: {
+        // keep only recent completed/failed jobs
+        removeOnComplete: { count: 500 }, // keep last 500 completed jobs
+        removeOnFail: { count: 100 }, // keep last 100 failed jobs
+      },
+      /*
+       * Optionally cap the event stream length (supported in BullMQ >= v5)
+       * This helps prevent the :events stream from growing indefinitely
+       */
+      streams: {
+        events: { maxLen: 1000 },
+      },
+    });
+
+    // save it to the dictionary
+    this.queueDict[queueName] = queue;
+
+    // Register the observable gauge once any queue exists in this process.
+    this.registerQueueSizeMetric();
+
+    // Add event listener to re-add repeatable jobs on reconnect
+    this.setupReconnectListener(queue, queueName).catch((err: unknown) => {
+      logger.error("Error setting up reconnect listener for queue");
+      logger.error(err);
+    });
+
+    /*
+     * Lazy fallback for the startup sweep: the first time a queue is created in
+     * this process, kick off its once-per-process terminal-job cleanup. The
+     * eager path (cleanAllQueuesOnStartup, called at service boot) normally
+     * wins; whichever runs first is the only one to sweep, via the gate inside
+     * cleanQueueOnStartup(). Fire and forget so it never blocks enqueue.
+     */
+    void this.cleanQueueOnStartup(queueName);
+
+    return queue;
+  }
+
+  /**
+   * Eagerly sweeps every queue's terminal (completed/failed) jobs at process
+   * startup, so the Completed/Failed counts on the admin Health page reset on a
+   * pod (re)start regardless of when — or whether — each queue next produces a
+   * job. Call once during service boot (see App/Index.ts). Each queue is swept
+   * at most once per process via the cleanedQueueNames gate, so this is safe to
+   * call alongside the lazy getQueue() path and from any service role.
+   */
+  @CaptureSpan()
+  public static async cleanAllQueuesOnStartup(): Promise<void> {
+    await Promise.all(
+      Object.values(QueueName).map((queueName: QueueName) => {
+        return this.cleanQueueOnStartup(queueName);
+      }),
+    );
+  }
+
+  /*
+   * How old (in ms) a completed/failed job must be before the startup sweep
+   * removes it. 0 means "remove all terminal jobs on every restart", which
+   * resets the Completed/Failed counts on the admin Health page so operators
+   * stop seeing stale failures after a deploy/restart. Raise this (e.g. to
+   * 24 * 60 * 60 * 1000) if you'd rather keep recent failures around for
+   * crash-loop debugging.
+   */
+  private static readonly STARTUP_CLEANUP_GRACE_MS: number = 0;
+  // Number of jobs removed per clean() call; we loop until the state is drained.
+  private static readonly STARTUP_CLEANUP_BATCH_SIZE: number = 1000;
+  // Safety cap so a pathologically large backlog can't loop forever.
+  private static readonly STARTUP_CLEANUP_MAX_BATCHES: number = 1000;
+
+  /**
+   * Removes terminal (completed/failed) jobs for a single queue, at most once
+   * per process (gated by cleanedQueueNames). Drains in batches because
+   * BullMQ's clean() caps each call at `limit` removals. Leaves live states
+   * (waiting/active/delayed) untouched. Best-effort: any error is logged and
+   * swallowed so a transient Redis hiccup at boot never breaks queue setup.
+   */
+  private static async cleanQueueOnStartup(
+    queueName: QueueName,
+  ): Promise<void> {
+    /*
+     * Gate synchronously, before any await, so the lazy getQueue() trigger and
+     * the eager cleanAllQueuesOnStartup() call can't both sweep the same queue.
+     */
+    if (this.cleanedQueueNames.has(queueName)) {
+      return;
+    }
+    this.cleanedQueueNames.add(queueName);
+
+    const queue: BullQueue = this.getQueue(queueName);
+
+    const terminalStates: Array<"completed" | "failed"> = [
+      "completed",
+      "failed",
+    ];
+
+    for (const state of terminalStates) {
+      try {
+        let removedTotal: number = 0;
+
+        for (
+          let batch: number = 0;
+          batch < this.STARTUP_CLEANUP_MAX_BATCHES;
+          batch++
+        ) {
+          const removed: string[] = await queue.clean(
+            this.STARTUP_CLEANUP_GRACE_MS,
+            this.STARTUP_CLEANUP_BATCH_SIZE,
+            state,
+          );
+
+          removedTotal += removed.length;
+
+          // A short batch means the state is drained; stop looping.
+          if (removed.length < this.STARTUP_CLEANUP_BATCH_SIZE) {
+            break;
+          }
+        }
+
+        if (removedTotal > 0) {
+          logger.debug(
+            `Queue ${queueName}: removed ${removedTotal} ${state} job(s) on startup`,
+          );
+        }
+      } catch (err) {
+        // Ignore cleanup errors to not impact normal flow.
+        logger.debug(`Queue ${queueName}: startup ${state} cleanup failed`);
+        logger.debug(err);
+      }
+    }
+  }
+
+  /**
+   * Removes a one-off job by id, and also removes a repeatable whose repeat
+   * KEY equals `jobId` (QueueWorkflow persists `job.repeatJobKey` on the
+   * Workflow row and passes it back here).
+   *
+   * Note the asymmetry between the two removals, which is easy to get wrong:
+   * BullMQ rejects custom job ids containing ":", so the job lookup must use
+   * the sanitized id. But removeRepeatableByKey() expects the repeat KEY
+   * exactly as it appears in the `bull:<queue>:repeat` zset (an md5 hash, or a
+   * legacy "name:id:endDate:tz:pattern" string) — it ZREMs that exact member.
+   * Sanitizing would mangle the legacy colon form into a member that does not
+   * exist, and the removal would silently no-op. So the raw value is passed
+   * through.
+   *
+   * To remove a repeatable by its job NAME (e.g. to retire a renamed cron),
+   * use removeRepeatableByName() — passing a job name here does nothing.
+   */
+  @CaptureSpan()
+  public static async removeJob(
+    queueName: QueueName,
+    jobId: string,
+  ): Promise<void> {
+    if (!jobId) {
+      return;
+    }
+
+    const queue: BullQueue = this.getQueue(queueName);
+
+    const sanitizedJobId: string = this.sanitizeJobId(jobId.toString());
+
+    const job: Job | undefined = await queue.getJob(sanitizedJobId);
+
+    if (job) {
+      await job.remove();
+    }
+
+    /*
+     * Remove an existing repeatable keyed by this value. Raw, not sanitized —
+     * see the note above.
+     */
+    await queue.removeRepeatableByKey(jobId.toString());
+  }
+
+  /**
+   * Removes every repeatable job DEFINITION on `queueName` whose job NAME is
+   * `jobName`, and returns how many were removed. Idempotent: removing a name
+   * that isn't registered is a no-op that returns 0.
+   *
+   * Why this cannot be done with removeJob(): BullMQ keys a repeatable by an
+   * opaque `key` (the member of the `bull:<queue>:repeat` zset — an md5 hash),
+   * never by the job's name. removeRepeatableByKey() ZREMs that exact member,
+   * so handing it a job name (or a job id) matches nothing and silently
+   * succeeds as a no-op. BullMQ's own docs say so:
+   *
+   *   "Removes a repeatable job by its key. Note that the key is the one used
+   *    to store the repeatable job metadata and not one of the job iterations
+   *    themselves. You can use "getRepeatableJobs" in order to get the keys."
+   *
+   * So the only supported name -> key path is to enumerate getRepeatableJobs()
+   * and match on `.name`. Removing by key also deletes the already-materialized
+   * next delayed iteration, so the job stops firing immediately.
+   *
+   * This exists to retire a RENAMED cron: RunCron registers a repeatable keyed
+   * by the new name, and addJob() above only clears a pre-existing repeatable
+   * that matches the NEW name — nothing clears the old one, so a renamed cron
+   * leaves its old definition behind in Redis, firing forever.
+   */
+  @CaptureSpan()
+  public static async removeRepeatableByName(
+    queueName: QueueName,
+    jobName: string,
+  ): Promise<number> {
+    if (!jobName) {
+      return 0;
+    }
+
+    const queue: BullQueue = this.getQueue(queueName);
+
+    const repeatableJobs: RepeatableJob[] = await queue.getRepeatableJobs();
+
+    let removedCount: number = 0;
+
+    for (const repeatableJob of repeatableJobs) {
+      if (repeatableJob.name !== jobName) {
+        continue;
+      }
+
+      // `.key` is the zset member BullMQ expects here — never the name or id.
+      const isRemoved: boolean = await queue.removeRepeatableByKey(
+        repeatableJob.key,
+      );
+
+      if (isRemoved) {
+        removedCount++;
+      }
+    }
+
+    return removedCount;
+  }
+
+  @CaptureSpan()
+  public static getInspectorRoute(): string {
+    return "/worker/inspect/queue/:dashboardSecret";
+  }
+
+  @CaptureSpan()
+  public static getQueueInspectorRouter(): ExpressRouter {
+    const serverAdapter: ExpressAdapter = new ExpressAdapter();
+
+    const queueAdapters: BullMQAdapter[] = Object.values(QueueName).map(
+      (queueName: QueueName) => {
+        return new BullMQAdapter(this.getQueue(queueName));
+      },
+    );
+
+    createBullBoard({
+      // Cast keeps compatibility until bull-board widens QueueJob.progress
+      queues: queueAdapters as unknown as BullBoardQueues,
+      serverAdapter: serverAdapter,
+    });
+
+    serverAdapter.setBasePath(
+      this.getInspectorRoute().replace(
+        "/:dashboardSecret",
+        "/" + QueueDashboardSecret,
+      ),
+    );
+
+    return serverAdapter.getRouter();
+  }
+
+  @CaptureSpan()
+  public static async addJob(
+    queueName: QueueName,
+    jobId: string,
+    jobName: string,
+    data: JSONObject,
+    options?: {
+      scheduleAt?: string | undefined;
+      repeatableKey?: string | undefined;
+      /**
+       * One-off delay in milliseconds before the job becomes eligible to run.
+       * Mutually exclusive with `scheduleAt` (a repeatable cron pattern); if
+       * both are set, `scheduleAt` wins. Used to park a delayed job (e.g. the
+       * Sleep component's durable resume).
+       */
+      delayInMs?: number | undefined;
+      /**
+       * Total number of times BullMQ runs the job before marking it
+       * failed (1 = no retries). Defaults to 3 for the Telemetry queue
+       * (consumers there are idempotent via insert dedup tokens) and 1
+       * everywhere else, preserving prior behavior.
+       */
+      attempts?: number | undefined;
+      /**
+       * Base delay in milliseconds for exponential backoff between
+       * attempts (delay * 2^attempt). Only used when attempts > 1.
+       */
+      backoffDelayInMs?: number | undefined;
+      /**
+       * Skip the getJob()+remove() round trips that guard against
+       * duplicate job ids. Safe (and two Redis calls cheaper per
+       * enqueue) when the caller's job ids are globally unique, e.g.
+       * the telemetry enqueue path which suffixes ids with a unix-nano
+       * timestamp.
+       */
+      skipExistenceCheck?: boolean | undefined;
+      /**
+       * Coalesce same-key jobs so they are never processed in parallel.
+       * When set, BullMQ keeps at most one active + one waiting job per
+       * `deduplication.id`: additional adds while one is active collapse into
+       * the single waiting slot, keeping only the latest job data
+       * (keepLastIfActive). Used by the incoming-request ingest path to stop
+       * an external sender hammering one monitor's URL from fanning out into
+       * many concurrent same-monitor jobs that contend on the per-monitor
+       * lock. Independent of `jobId`, which stays unique.
+       */
+      deduplication?:
+        | { id: string; keepLastIfActive?: boolean | undefined }
+        | undefined;
+    },
+  ): Promise<Job> {
+    const sanitizedJobId: string = this.sanitizeJobId(jobId.toString());
+
+    const optionsObject: JobsOptions = {
+      jobId: sanitizedJobId,
+    };
+
+    if (options && options.delayInMs && options.delayInMs > 0) {
+      optionsObject.delay = options.delayInMs;
+    }
+
+    const attempts: number =
+      options?.attempts ?? (queueName === QueueName.Telemetry ? 3 : 1);
+
+    if (attempts > 1) {
+      optionsObject.attempts = attempts;
+      optionsObject.backoff = {
+        type: "exponential",
+        delay: options?.backoffDelayInMs ?? 5000,
+      };
+    }
+
+    if (options?.deduplication?.id) {
+      optionsObject.deduplication = {
+        id: this.sanitizeJobId(options.deduplication.id),
+        keepLastIfActive: options.deduplication.keepLastIfActive ?? false,
+      };
+    }
+
+    const queue: BullQueue = this.getQueue(queueName);
+
+    if (options && options.scheduleAt) {
+      optionsObject.repeat = {
+        pattern: options.scheduleAt,
+        // keep repeatable job keyed by jobId so multiple workers do not register duplicates
+        jobId: sanitizedJobId,
+      };
+
+      const repeatableJobs: RepeatableJob[] = await queue.getRepeatableJobs();
+
+      for (const repeatableJob of repeatableJobs) {
+        const isSameJob: boolean =
+          repeatableJob.name === jobName &&
+          repeatableJob.pattern === options.scheduleAt;
+
+        if (isSameJob) {
+          await queue.removeRepeatableByKey(repeatableJob.key);
+        }
+      }
+    }
+
+    if (!options?.skipExistenceCheck) {
+      const job: Job | undefined = await queue.getJob(sanitizedJobId);
+
+      if (job) {
+        await job.remove();
+      }
+    }
+
+    if (options?.repeatableKey) {
+      // remove existing repeatable job
+      await queue.removeRepeatableByKey(options?.repeatableKey);
+    }
+
+    // Store repeatable jobs for re-adding on reconnect
+    if (options && options.scheduleAt) {
+      if (!this.repeatableJobs[queueName]) {
+        this.repeatableJobs[queueName] = {};
+      }
+      this.repeatableJobs[queueName]![sanitizedJobId] = {
+        jobName,
+        data,
+        options: optionsObject,
+      };
+    }
+
+    const jobAdded: Job = await queue.add(jobName, data, optionsObject);
+
+    return jobAdded;
+  }
+
+  private static registerQueueSizeMetric(): void {
+    if (this.queueSizeMetricRegistered) {
+      return;
+    }
+
+    if (!Telemetry.isMetricsEnabled()) {
+      return;
+    }
+
+    try {
+      Telemetry.getObservableGauge({
+        name: "queue.size",
+        description:
+          "Number of BullMQ jobs in each queue, partitioned by job state.",
+        unit: "1",
+        callback: async (
+          result: ObservableResult<Attributes>,
+        ): Promise<void> => {
+          for (const queueName of Object.keys(this.queueDict)) {
+            try {
+              const stats: {
+                waiting: number;
+                active: number;
+                completed: number;
+                failed: number;
+                delayed: number;
+                total: number;
+              } = await this.getQueueStats(queueName as QueueName);
+
+              const baseAttrs: Attributes = {
+                "messaging.system": "bullmq",
+                "messaging.destination.name": queueName,
+              };
+
+              result.observe(stats.waiting, { ...baseAttrs, state: "waiting" });
+              result.observe(stats.active, { ...baseAttrs, state: "active" });
+              result.observe(stats.delayed, { ...baseAttrs, state: "delayed" });
+              result.observe(stats.failed, { ...baseAttrs, state: "failed" });
+            } catch (err) {
+              // Don't let one queue's stat failure break others.
+              logger.debug("Failed to read queue stats");
+              logger.debug(err);
+            }
+          }
+        },
+      });
+
+      this.queueSizeMetricRegistered = true;
+    } catch (err) {
+      logger.error("Failed to register queue.size metric");
+      logger.error(err);
+    }
+  }
+
+  private static normalizeFailedReason(reason: string | undefined): string {
+    if (typeof reason !== "string") {
+      return "No reason provided";
+    }
+
+    const normalized: string = reason.trim().toLowerCase();
+    if (
+      normalized.length === 0 ||
+      normalized === "null" ||
+      normalized === "undefined"
+    ) {
+      return "No reason provided";
+    }
+
+    return reason;
+  }
+
+  @CaptureSpan()
+  public static async getQueueSize(queueName: QueueName): Promise<number> {
+    const queue: BullQueue = this.getQueue(queueName);
+    const waitingCount: number = await queue.getWaitingCount();
+    const activeCount: number = await queue.getActiveCount();
+    const delayedCount: number = await queue.getDelayedCount();
+
+    return waitingCount + activeCount + delayedCount;
+  }
+
+  /*
+   * How many job schedulers (BullMQ's repeatable/cron registrations) this
+   * queue holds. This is a ZCARD of the repeat zset, so it is O(1) and safe
+   * to call on every scrape of the scaling metric — unlike getJobSchedulers(),
+   * which pages the whole set.
+   *
+   * Guarded because the count is only ever used to *correct* the backlog
+   * number: a BullMQ build without this method (it is newer than the
+   * repeatable API it replaces) must degrade to the uncorrected
+   * waiting + delayed sum rather than throw and take the whole scaling
+   * metric offline with it.
+   */
+  private static async getJobSchedulerCount(queue: BullQueue): Promise<number> {
+    if (typeof queue.getJobSchedulersCount !== "function") {
+      return 0;
+    }
+
+    return (await queue.getJobSchedulersCount()) || 0;
+  }
+
+  /*
+   * Backlog = jobs still waiting for a worker, for autoscaling signals.
+   *
+   * ACTIVE jobs are deliberately excluded: they are already being served, so
+   * to a scaler they are capacity, not demand. Telemetry jobs in particular
+   * sit in the active state for the fan-in writer's full flush window (up to
+   * TELEMETRY_FANIN_MAX_WAIT_MS) while awaiting their ClickHouse ack, so a
+   * fleet scaled on an active-inclusive count converges on pod count =
+   * job rate x ack latency — every new pod just parks more jobs without
+   * shortening the flush window. Scaling on waiting + delayed only breaks
+   * that feedback loop. getQueueSize above keeps the active-inclusive sum for
+   * ingest backpressure checks, where in-flight work genuinely counts against
+   * capacity.
+   *
+   * The job SCHEDULERS are then subtracted back off — but ONLY from the
+   * delayed side, which is the whole subtlety here. Every RunCron()
+   * registration parks exactly one entry in the DELAYED set: the placeholder
+   * holding its next fire time. That placeholder is not work anybody can
+   * drain, and getDelayedCount() counts it. Left in, the placeholders put a
+   * hard floor under the metric equal to the number of registered crons (127
+   * on the Worker queue today), which sits above every sensible scale-down
+   * target, so the fleet could never scale in no matter how idle it was.
+   *
+   * The subtraction is deliberately NOT `max(0, waiting + delayed - n)`,
+   * because a scheduler entry stops being a parked placeholder the moment it
+   * comes due. BullMQ's promoteDelayedJobs ZREMs the placeholder out of
+   * `delayed` and LPUSHes it onto `wait`, and the SUCCESSOR placeholder is
+   * not created until a worker actually moves that job to active
+   * (Worker.nextJobFromJobData -> upsertJobScheduler). So for the whole
+   * promotion window there are k due cron jobs sitting in `waiting` with
+   * delayed = n - k, while the repeat zset — and therefore the scheduler
+   * count — still reads n.
+   *
+   * Those k jobs are real, drainable demand: they are queued work waiting for
+   * a worker. Subtracting the full scheduler count off the combined sum would
+   * cancel them out exactly, so the metric would read 0. That is not a
+   * rounding error, it is the dangerous direction: at the top of a minute a
+   * large batch of EVERY_MINUTE crons is promoted at once, and an idle-looking
+   * zero would tell KEDA to scale in precisely when the work arrived.
+   * Discounting the placeholders only where they actually live — the delayed
+   * set — leaves `waiting` untouched and reports that burst at face value.
+   *
+   * When delayed >= schedulerCount (the steady state, every placeholder
+   * parked) the two forms agree exactly, so this costs nothing in the common
+   * case.
+   *
+   * The inner Math.max(0, ...) clamp still matters: the three counts are read
+   * concurrently and are not a consistent snapshot, so delayed can be read
+   * mid-promotion and come back below the scheduler count. Without the clamp
+   * that shortfall would be subtracted out of `waiting`, re-introducing the
+   * masking this form exists to avoid, and could drive the gauge negative —
+   * which KEDA reads as a garbage value.
+   */
+  @CaptureSpan()
+  public static async getQueueBacklogSize(
+    queueName: QueueName,
+  ): Promise<number> {
+    const queue: BullQueue = this.getQueue(queueName);
+    const [waitingCount, delayedCount, schedulerCount]: [
+      number,
+      number,
+      number,
+    ] = await Promise.all([
+      queue.getWaitingCount(),
+      queue.getDelayedCount(),
+      this.getJobSchedulerCount(queue),
+    ]);
+
+    return waitingCount + Math.max(0, delayedCount - schedulerCount);
+  }
+
+  @CaptureSpan()
+  public static async getQueueStats(queueName: QueueName): Promise<{
+    waiting: number;
+    active: number;
+    completed: number;
+    failed: number;
+    delayed: number;
+    total: number;
+  }> {
+    const queue: BullQueue = this.getQueue(queueName);
+    const waitingCount: number = await queue.getWaitingCount();
+    const activeCount: number = await queue.getActiveCount();
+    const completedCount: number = await queue.getCompletedCount();
+    const failedCount: number = await queue.getFailedCount();
+    const delayedCount: number = await queue.getDelayedCount();
+
+    return {
+      waiting: waitingCount,
+      active: activeCount,
+      completed: completedCount,
+      failed: failedCount,
+      delayed: delayedCount,
+      total:
+        waitingCount +
+        activeCount +
+        completedCount +
+        failedCount +
+        delayedCount,
+    };
+  }
+
+  @CaptureSpan()
+  public static async getFailedJobs(
+    queueName: QueueName,
+    options?: {
+      start?: number;
+      end?: number;
+    },
+  ): Promise<
+    Array<{
+      id: string;
+      name: string;
+      data: JSONObject;
+      failedReason: string;
+      stackTrace?: string;
+      processedOn: Date | null;
+      finishedOn: Date | null;
+      attemptsMade: number;
+    }>
+  > {
+    const queue: BullQueue = this.getQueue(queueName);
+    const start: number = options?.start || 0;
+    const end: number = options?.end || 100;
+    const failed: Job[] = await queue.getFailed(start, end);
+
+    return failed.map((job: Job) => {
+      const result: {
+        id: string;
+        name: string;
+        data: JSONObject;
+        failedReason: string;
+        stackTrace?: string;
+        processedOn: Date | null;
+        finishedOn: Date | null;
+        attemptsMade: number;
+      } = {
+        id: job.id || "unknown",
+        name: job.name || "unknown",
+        data: job.data as JSONObject,
+        failedReason: Queue.normalizeFailedReason(job.failedReason),
+        processedOn: job.processedOn ? new Date(job.processedOn) : null,
+        finishedOn: job.finishedOn ? new Date(job.finishedOn) : null,
+        attemptsMade: job.attemptsMade || 0,
+      };
+
+      if (job.stacktrace && job.stacktrace.length > 0) {
+        result.stackTrace = job.stacktrace.join("\n");
+      }
+
+      return result;
+    });
+  }
+
+  /**
+   * Like getFailedJobs, but returns the FULL job for deep debugging: the job
+   * body (data), its options, return value, progress, all the timing/attempt
+   * metadata, and the per-job log lines BullMQ keeps (job.log()/getJobLogs).
+   * Used by the master-admin health dashboard / support bundle. The caller is
+   * responsible for redacting / size-capping before exposing this, since the
+   * job body can contain customer data.
+   */
+  @CaptureSpan()
+  public static async getFailedJobsWithDetails(
+    queueName: QueueName,
+    options?: {
+      start?: number;
+      end?: number;
+    },
+  ): Promise<
+    Array<{
+      id: string;
+      name: string;
+      data: JSONObject;
+      opts: JSONObject;
+      returnValue: unknown;
+      progress: number | Record<string, unknown> | null;
+      failedReason: string;
+      stackTrace: Array<string>;
+      logs: Array<string>;
+      attemptsMade: number;
+      attemptsStarted: number | null;
+      stalledCounter: number | null;
+      priority: number | null;
+      delay: number | null;
+      createdAt: Date | null;
+      processedOn: Date | null;
+      finishedOn: Date | null;
+      queueQualifiedName: string | null;
+      repeatJobKey: string | null;
+      deduplicationId: string | null;
+      processedBy: string | null;
+      parentKey: string | null;
+    }>
+  > {
+    const queue: BullQueue = this.getQueue(queueName);
+    const start: number = options?.start || 0;
+    const end: number = options?.end ?? 100;
+    const failed: Job[] = await queue.getFailed(start, end);
+
+    const results: Array<{
+      id: string;
+      name: string;
+      data: JSONObject;
+      opts: JSONObject;
+      returnValue: unknown;
+      progress: number | Record<string, unknown> | null;
+      failedReason: string;
+      stackTrace: Array<string>;
+      logs: Array<string>;
+      attemptsMade: number;
+      attemptsStarted: number | null;
+      stalledCounter: number | null;
+      priority: number | null;
+      delay: number | null;
+      createdAt: Date | null;
+      processedOn: Date | null;
+      finishedOn: Date | null;
+      queueQualifiedName: string | null;
+      repeatJobKey: string | null;
+      deduplicationId: string | null;
+      processedBy: string | null;
+      parentKey: string | null;
+    }> = [];
+
+    for (const job of failed) {
+      // Per-job log lines are best-effort — older jobs may have none.
+      let logs: Array<string> = [];
+
+      try {
+        if (job.id) {
+          const jobLogs: { logs: string[]; count: number } =
+            await queue.getJobLogs(job.id, 0, -1);
+          logs = jobLogs?.logs || [];
+        }
+      } catch (err) {
+        logger.debug(`Failed to read logs for job ${job.id} on ${queueName}`);
+        logger.debug(err);
+      }
+
+      results.push({
+        id: job.id || "unknown",
+        name: job.name || "unknown",
+        data: (job.data as JSONObject) || {},
+        opts: (job.opts as unknown as JSONObject) || {},
+        returnValue: job.returnvalue ?? null,
+        progress: (job.progress as number | Record<string, unknown>) ?? null,
+        failedReason: Queue.normalizeFailedReason(job.failedReason),
+        stackTrace: job.stacktrace || [],
+        logs: logs,
+        attemptsMade: job.attemptsMade || 0,
+        attemptsStarted:
+          typeof job.attemptsStarted === "number" ? job.attemptsStarted : null,
+        stalledCounter:
+          typeof job.stalledCounter === "number" ? job.stalledCounter : null,
+        priority: typeof job.priority === "number" ? job.priority : null,
+        delay: typeof job.delay === "number" ? job.delay : null,
+        createdAt:
+          typeof job.timestamp === "number" ? new Date(job.timestamp) : null,
+        processedOn:
+          typeof job.processedOn === "number"
+            ? new Date(job.processedOn)
+            : null,
+        finishedOn:
+          typeof job.finishedOn === "number" ? new Date(job.finishedOn) : null,
+        queueQualifiedName: job.queueQualifiedName || null,
+        repeatJobKey: job.repeatJobKey || null,
+        deduplicationId: job.deduplicationId || null,
+        processedBy: job.processedBy || null,
+        parentKey: job.parentKey || null,
+      });
+    }
+
+    return results;
+  }
+}

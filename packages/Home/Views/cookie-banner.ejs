@@ -1,0 +1,126 @@
+
+
+<div id="cookie" class="pointer-events-none fixed inset-x-0 bottom-0 px-6 pb-6 cookie-banner" style="display:none;">
+    <div class="pointer-events-auto ml-auto max-w-xl rounded-xl bg-white p-6 shadow-lg ring-1 ring-gray-900/10">
+        <p class="text-sm leading-6 text-gray-900 my-3">We use cookies to enhance your browsing experience and provide
+            personalized content. By clicking "Accept," you consent to the use of cookies.</p>
+
+            <p class="text-sm leading-6 text-gray-900 my-3">Our product uses both first-party and third-party cookies for session storage and for various other purposes.</p>
+
+            <p class="text-sm leading-6 text-gray-900 my-3">Please note that disabling certain cookies may affect the functionality and performance of our product.</p>
+
+            <p class="text-sm leading-6 text-gray-900 my-3">For more information about how we handle your data and cookies, please read our Privacy Policy.</p>
+
+            <p class="text-sm leading-6 text-gray-900 my-3">By continuing to use our site without changing your cookie settings, you agree to our use of cookies as
+            described above. See our <a href="/legal/terms" class="font-semibold text-gray-600">terms</a> and our <a
+                href="/legal/privacy" class="font-semibold text-gray-600">privacy policy</a> </p>
+        <div class="mt-4 flex items-center gap-x-5">
+            <button onclick="acceptCookies()" type="button"
+                class="rounded-md bg-gray-900 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-gray-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-gray-900">Accept
+                all</button>
+            <button onclick="rejectCookies()" type="button" class="text-sm font-semibold leading-6 text-gray-900">Reject all</button>
+        </div>
+    </div>
+</div>
+
+<!--
+    The buttons here are the only thing that moves the consent state.
+
+    They used to write `cookiesAccepted` to localStorage and hide the banner,
+    and nothing anywhere read the value: Google Tag Manager, PostHog and the
+    attribution capture all ran identically whether the visitor pressed Accept,
+    pressed Reject, or never saw the banner. "Reject all" rejected nothing.
+
+    Both buttons go through window.oneUptimeConsent (defined in
+    Common/Server/Views/Partials/AnalyticsConsent.ejs, before the tags load),
+    which records the answer under 'cookiesAccepted'.
+
+    RECORDS IT, AND NOTHING MORE. Measurement is no longer gated on the answer:
+    Consent Mode defaults to granted and is not updated on either button,
+    attribution is stored on sight, and PostHog loads regardless. So these
+    buttons currently change nothing except which of them the banner remembers
+    you pressed. That is a deliberate decision documented at the top of
+    AnalyticsConsent.ejs and in Docs/analytics/enterprise-conversion-tracking.md
+    — but a banner offering a choice it does not honour is the thing to fix
+    next, either by re-gating or by removing the buttons.
+
+    That partial is shared with /accounts and /dashboard, so the answer given
+    here is the answer those origins honour too — they are the same origin and
+    read the same key.
+-->
+<script>
+    function setCookieConsent(granted) {
+        /*
+         * The AnalyticsConsent partial is included by every page that includes
+         * this banner, so the helper is always there. Falling back to the raw
+         * write keeps a page that somehow omits it from silently losing the
+         * visitor's answer.
+         */
+        if (window.oneUptimeConsent) {
+            if (granted) {
+                window.oneUptimeConsent.grant();
+            } else {
+                window.oneUptimeConsent.deny();
+            }
+        } else {
+            try {
+                localStorage.setItem('cookiesAccepted', granted ? 'true' : 'false');
+            } catch (e) {
+                // Storage unavailable; the banner still closes for this page.
+            }
+        }
+
+        hideBanner();
+    }
+
+    // Function to accept cookies
+    function acceptCookies() {
+        setCookieConsent(true);
+    }
+
+    // Function to reject cookies
+    function rejectCookies() {
+        setCookieConsent(false);
+    }
+
+    // Function to hide the banner
+    function hideBanner() {
+        document.getElementById('cookie').style.display = 'none';
+    }
+
+    // Function to show the banner
+    function showBanner() {
+        document.getElementById('cookie').style.display = 'block';
+    }
+
+    /*
+     * Withdrawing consent has to be as easy as giving it, and the Cookie
+     * Policy has always promised a settings link in the footer. Until this
+     * existed there was no way to reopen the banner at all: answer it once and
+     * the decision was final.
+     */
+    window.oneUptimeShowCookieSettings = function () {
+        showBanner();
+        return false;
+    };
+
+    function checkCookies () {
+        /*
+         * Shown only while the visitor has not answered. `granted` and
+         * `denied` are both answers — re-asking someone who declined is how a
+         * consent banner turns into a dark pattern.
+         */
+        var state = window.oneUptimeConsent ? window.oneUptimeConsent.state() : 'unset';
+
+        if (state === 'unset') {
+            showBanner();
+        } else {
+            hideBanner();
+        }
+    };
+
+    // Check the user's choice on page load
+    window.onload = checkCookies;
+
+
+</script>

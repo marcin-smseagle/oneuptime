@@ -1,0 +1,37 @@
+<style>
+  /* Critical layout, spacing and colors also live inline for email clients.
+     Do not reset a/span/div padding: buttons, badges and rich content need it.
+     Keep the body[override] prefix in mobile rules for Yahoo Mail. */
+  html, body { margin: 0; padding: 0; width: 100%; }
+  table { mso-table-lspace: 0pt; mso-table-rspace: 0pt; }
+  td { overflow-wrap: anywhere; word-break: break-word; }
+  img { border: 0; outline: none; max-width: 100%; }
+  a { color: #111111; text-decoration: underline; text-underline-offset: 3px; }
+  a:hover { text-decoration: none; }
+  a:focus-visible { outline: 2px solid #111111; outline-offset: 3px; }
+  a[x-apple-data-detectors] { color: inherit !important; font: inherit !important; }
+  div[style*="margin: 16px 0"] { margin: 0 !important; }
+  .st-Rich p { margin: 0 0 12px; }
+  .st-Rich p:last-child { margin-bottom: 0; }
+  .st-Rich h1, .st-Rich h2, .st-Rich h3 { color: #0f172a; line-height: 1.4; }
+  .st-Rich img { height: auto; }
+  .st-Rich table { width: 100%; max-width: 100%; table-layout: fixed; border-collapse: collapse; }
+  .st-Rich th, .st-Rich td { padding: 8px; border-bottom: 1px solid #e2e8f0; text-align: left; }
+  .st-Rich pre { white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; padding: 12px; background-color: #f1f5f9; border-radius: 6px; }
+  .st-Rich blockquote { margin: 12px 0; padding-left: 16px; border-left: 3px solid #cbd5e1; }
+  .st-DetailCard-field:last-child { border-bottom: 0 !important; }
+  @media only screen and (max-width: 600px) {
+    body[override] .st-Outer { padding: 12px 8px !important; }
+    body[override] .st-Gutter { padding-left: 24px !important; padding-right: 24px !important; }
+    body[override] td.st-Spacer--gutter { width: 24px !important; }
+    body[override] .st-Wrapper { border-radius: 12px !important; }
+    body[override] .st-EmailTitle { font-size: 26px !important; line-height: 34px !important; }
+    body[override] .st-DetailCard-content { padding: 4px 16px !important; }
+    body[override] .st-Transition-cell { display: block !important; width: auto !important; text-align: left !important; }
+    body[override] .st-Transition-arrow { padding: 4px 0 !important; }
+    body[override] .st-ReportIndent { margin-left: 0 !important; }
+    body[override] .st-ReportTable th, body[override] .st-ReportTable td { padding: 10px 6px !important; font-size: 12px !important; line-height: 18px !important; }
+    body[override] .st-ReportTable th { padding: 10px 4px !important; font-size: 11px !important; line-height: 16px !important; }
+    body[override] .st-Button-link { padding-left: 12px !important; padding-right: 12px !important; }
+  }
+</style>

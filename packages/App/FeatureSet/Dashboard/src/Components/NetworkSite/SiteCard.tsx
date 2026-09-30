@@ -1,0 +1,378 @@
+import React, { FunctionComponent, ReactElement } from "react";
+import { SiteChildView, SiteStatusInfo } from "./SiteHierarchyTypes";
+import {
+  HealthTone,
+  formatUptimePercent,
+  unitRollupTone,
+} from "./SiteMapViewModel";
+import {
+  DeviceHealthCounts,
+  deviceAttentionCount,
+  emptyDeviceHealthCounts,
+} from "Common/Utils/NetworkDevice/DeviceHealthStateUtil";
+
+/*
+ * Shared card body for one network site: name, site-type label, health
+ * chip, unit rollup, device count and uptime. Rendered in two skins — the
+ * plain SiteCard grid at the map page's root level, and the
+ * SiteContainerGraph's React Flow node (which wraps the same body so both
+ * levels speak one visual language).
+ *
+ * Free of router imports on purpose: navigation is injected via onClick by
+ * the page, so the body stays usable anywhere (including inside React
+ * Flow nodes).
+ *
+ * Hierarchy is deliberate: a franchise-ops user acts on HOW MANY UNITS ARE
+ * DOWN first and uptime second, so the down/up count is the one prominent
+ * figure, uptime is a right-aligned tabular column (percentages line up
+ * across the grid), and the site/device counts stay quiet at the bottom.
+ * Health is encoded in FORM as well as color — the lead figure switches
+ * from "N units operational" to "N of M units down", and the proportional
+ * meter shows the split — so the card never depends on the dot's hue
+ * alone.
+ */
+
+const NO_STATUS_COLOR: string = "#9ca3af"; // gray-400
+
+/*
+ * Derived from the unit rollup, NOT from the status row's color: the
+ * status color is arbitrary project-configured hex, while the tone drives
+ * Tailwind semantic classes that must stay legible in both themes.
+ *
+ * The rule itself lives in SiteMapViewModel because the MAP now colors its
+ * hierarchy markers by exactly the same rollup. A region whose card reads
+ * "63 of 63 units down" and whose marker is a calm dot is the disagreement
+ * between the two halves of this page that the shared function prevents.
+ */
+const TONE_TEXT_CLASS: Record<HealthTone, string> = {
+  ok: "text-emerald-600",
+  warn: "text-amber-600",
+  down: "text-red-600",
+  none: "text-gray-400",
+};
+
+const TONE_BAR_CLASS: Record<HealthTone, string> = {
+  ok: "bg-emerald-500",
+  warn: "bg-amber-500",
+  down: "bg-red-500",
+  none: "bg-gray-300",
+};
+
+const pluralUnits: (count: number) => string = (count: number): string => {
+  return count === 1 ? "unit" : "units";
+};
+
+/*
+ * "3 down, 1 degraded of 128 devices" — only ever rendered when at least
+ * one of the two is non-zero, so the healthy case never has to read a
+ * sentence built out of zeroes.
+ */
+const describeDeviceAttention: (counts: DeviceHealthCounts) => string = (
+  counts: DeviceHealthCounts,
+): string => {
+  const parts: Array<string> = [];
+  if (counts.down > 0) {
+    parts.push(`${counts.down} down`);
+  }
+  if (counts.degraded > 0) {
+    parts.push(`${counts.degraded} degraded`);
+  }
+  return `${parts.join(", ")} of ${counts.total} device${
+    counts.total === 1 ? "" : "s"
+  }`;
+};
+
+export interface SiteCardBodyProps {
+  site: SiteChildView;
+}
+
+export const SiteCardBody: FunctionComponent<SiteCardBodyProps> = (
+  props: SiteCardBodyProps,
+): ReactElement => {
+  const site: SiteChildView = props.site;
+  const status: SiteStatusInfo | undefined = site.currentMonitorStatus;
+
+  const totalUnits: number = Math.max(site.unitStats.totalUnits, 0);
+  const operationalUnits: number = Math.min(
+    Math.max(site.unitStats.operationalUnits, 0),
+    totalUnits,
+  );
+  const downUnits: number = totalUnits - operationalUnits;
+  const tone: HealthTone = unitRollupTone(site.unitStats);
+  const hasRollup: boolean = totalUnits > 0;
+  const operationalPercent: number = hasRollup
+    ? (operationalUnits / totalUnits) * 100
+    : 0;
+
+  /*
+   * The lead figure. Healthy sites count what is up, unhealthy sites count
+   * what is down — the shape of the sentence changes with the state, so a
+   * degraded card is distinguishable from a clean one without relying on
+   * the color of either the figure or the status dot.
+   */
+  let leadValue: string = "";
+  let leadCaption: string = "";
+  if (hasRollup) {
+    if (tone === "ok") {
+      leadValue = `${operationalUnits}`;
+      leadCaption = `${pluralUnits(operationalUnits)} operational`;
+    } else {
+      leadValue = `${downUnits}`;
+      leadCaption = `of ${totalUnits} ${pluralUnits(totalUnits)} down`;
+    }
+  }
+
+  const deviceStats: DeviceHealthCounts =
+    site.deviceStats || emptyDeviceHealthCounts();
+  const devicesNeedingAttention: number = deviceAttentionCount(deviceStats);
+
+  const hasCounts: boolean = site.childSiteCount > 0 || site.deviceCount > 0;
+  const hasUptime: boolean = site.uptimePercent !== null;
+  /*
+   * A site with no rollup, no uptime and nothing attached has genuinely
+   * nothing to report yet. It gets one calm line under the chip instead of
+   * an empty stat block, so the card reads as "waiting for data" rather
+   * than as a card with a hole punched in it.
+   */
+  const isAwaitingData: boolean = !hasRollup && !hasUptime && !hasCounts;
+
+  return (
+    <div className="flex h-full flex-col gap-2">
+      <div className="min-w-0">
+        <div
+          title={site.name}
+          className="truncate text-sm font-semibold leading-5 text-gray-900"
+        >
+          {site.name}
+        </div>
+        <div className="mt-1.5 flex items-center justify-between gap-2">
+          <span
+            className="inline-flex min-w-0 items-center gap-1.5 rounded-full bg-gray-50 px-2 py-0.5 text-[11px] font-medium text-gray-600"
+            title={status ? status.name : "Nothing reporting yet"}
+          >
+            {status ? (
+              <span
+                className="h-1.5 w-1.5 flex-shrink-0 rounded-full"
+                style={{ backgroundColor: status.color || NO_STATUS_COLOR }}
+              />
+            ) : (
+              /*
+               * Hollow ring, not a filled dot: "no data" is a different
+               * shape, not merely a grayer color.
+               */
+              <span className="h-1.5 w-1.5 flex-shrink-0 rounded-full border border-gray-400" />
+            )}
+            <span className="truncate">
+              {status ? status.name : "Not reporting"}
+            </span>
+          </span>
+          {/*
+           * Planned work is not suppressed in the status chip — the site
+           * still reads Offline, because it IS — so this badge is the only
+           * thing that tells a viewer the outage was on the calendar.
+           */}
+          {site.isUnderMaintenance && (
+            <span
+              className="flex-shrink-0 rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-semibold uppercase leading-4 tracking-wider text-amber-700"
+              title="A scheduled maintenance window covers this site right now. It is excluded from the uptime percentage."
+            >
+              Maintenance
+            </span>
+          )}
+          <span className="flex-shrink-0 text-[10px] font-semibold uppercase leading-4 tracking-wider text-gray-400">
+            {site.siteType}
+          </span>
+        </div>
+      </div>
+
+      {isAwaitingData ? (
+        /*
+         * Centered in the leftover space so an unreported site reads as a
+         * deliberately quiet card, not as one missing its bottom half.
+         */
+        <div className="flex flex-1 items-center">
+          <p className="text-[11px] leading-4 text-gray-400">
+            Nothing reporting yet — no units or devices attached.
+          </p>
+        </div>
+      ) : (
+        <div className="mt-auto space-y-1.5">
+          <div className="flex items-end justify-between gap-2">
+            <div className="min-w-0">
+              {hasRollup ? (
+                <React.Fragment>
+                  <div
+                    className={`text-lg font-semibold leading-6 tabular-nums ${TONE_TEXT_CLASS[tone]}`}
+                  >
+                    {leadValue}
+                  </div>
+                  <div className="truncate text-[11px] leading-4 text-gray-500">
+                    {leadCaption}
+                  </div>
+                </React.Fragment>
+              ) : (
+                <div className="truncate text-[11px] leading-4 text-gray-400">
+                  No unit rollup yet
+                </div>
+              )}
+            </div>
+            <div className="flex-shrink-0 text-right">
+              <div className="text-sm font-semibold leading-6 tabular-nums text-gray-900">
+                {formatUptimePercent(site.uptimePercent)}
+              </div>
+              <div className="text-[10px] leading-4 text-gray-400">
+                30d uptime
+              </div>
+              {/*
+               * The 24-hour figure sits under the 30-day one rather than
+               * replacing it: a bad day moves a 30-day average by at most
+               * 3.3 points, so a region can read 99% for the month while
+               * today is a disaster. Hidden when there is no rollup history
+               * to measure — an em dash under an em dash says nothing twice.
+               */}
+              {site.dailyUptimePercent !== null && (
+                <div
+                  className="text-[10px] leading-4 tabular-nums text-gray-500"
+                  title="Uptime over the last 24 hours"
+                >
+                  {formatUptimePercent(site.dailyUptimePercent)} today
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/*
+           * The meter appears only when units are actually down: a healthy
+           * grid stays calm, and the bar itself becomes a state signal
+           * rather than decoration on every card.
+           */}
+          {hasRollup && downUnits > 0 ? (
+            <div
+              className="flex h-1 w-full overflow-hidden rounded-full bg-gray-100"
+              role="img"
+              aria-label={`${operationalUnits} of ${totalUnits} ${pluralUnits(
+                totalUnits,
+              )} operational`}
+            >
+              <div
+                className="bg-emerald-500"
+                style={{ width: `${operationalPercent}%` }}
+              />
+              <div
+                className={TONE_BAR_CLASS[tone]}
+                style={{ width: `${100 - operationalPercent}%` }}
+              />
+            </div>
+          ) : (
+            <></>
+          )}
+
+          {hasCounts ? (
+            <div className="truncate text-[11px] leading-4 text-gray-400">
+              {site.childSiteCount > 0 ? (
+                <span>
+                  {site.childSiteCount} site
+                  {site.childSiteCount === 1 ? "" : "s"} &middot;{" "}
+                </span>
+              ) : (
+                <></>
+              )}
+              {/*
+               * Issue #3320: the device count says how MANY, and — when any
+               * of them are complaining — how many of them need a look. A
+               * card that prints "128 devices" over a subtree holding four
+               * dark switches is the exact failure the drill-down exists to
+               * fix: the number is true and useless.
+               */}
+              {devicesNeedingAttention > 0 ? (
+                <span
+                  data-testid={`site-card-device-health-${site.id}`}
+                  className="font-medium text-red-600"
+                >
+                  {describeDeviceAttention(deviceStats)}
+                </span>
+              ) : (
+                <span>
+                  {site.deviceCount} device{site.deviceCount === 1 ? "" : "s"}
+                </span>
+              )}
+            </div>
+          ) : (
+            <></>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+export interface ComponentProps {
+  site: SiteChildView;
+  /** Navigate deeper — injected by the page, keeps this component router-free. */
+  onClick?: ((siteId: string) => void) | undefined;
+  /*
+   * This is the card a filter landed the reader on (issue #3320's
+   * auto-zoom, at the hierarchy level). Drawn with a ring rather than a
+   * different colour: colour on this card already means health, and a
+   * second meaning for it would make a highlighted healthy site look
+   * broken.
+   */
+  isHighlighted?: boolean | undefined;
+}
+
+// The plain-div skin, used for the root-level site grid on the map page.
+const SiteCard: FunctionComponent<ComponentProps> = (
+  props: ComponentProps,
+): ReactElement => {
+  const isClickable: boolean = Boolean(props.onClick);
+  return (
+    <div
+      data-testid={`site-card-${props.site.id}`}
+      role={isClickable ? "button" : undefined}
+      tabIndex={isClickable ? 0 : undefined}
+      aria-label={
+        isClickable
+          ? `${props.site.name} — ${props.site.siteType}${
+              /*
+               * The ring says "the filter landed you here" in colour and
+               * shape only. Assistive tech gets the same fact in words, or
+               * the auto-jump simply does not happen for that reader.
+               */
+              props.isHighlighted ? ", first match for the current filter" : ""
+            }, open this site`
+          : undefined
+      }
+      data-highlighted={props.isHighlighted ? "true" : undefined}
+      className={`rounded-xl border bg-white p-4 shadow-sm ${
+        props.isHighlighted
+          ? "border-indigo-400 ring-2 ring-indigo-400 ring-offset-2"
+          : "border-gray-200"
+      } ${
+        isClickable
+          ? "cursor-pointer transition hover:border-indigo-300 hover:shadow focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:ring-offset-2"
+          : ""
+      }`}
+      onClick={
+        isClickable
+          ? () => {
+              props.onClick!(props.site.id);
+            }
+          : undefined
+      }
+      onKeyDown={
+        isClickable
+          ? (event: React.KeyboardEvent<HTMLDivElement>) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                props.onClick!(props.site.id);
+              }
+            }
+          : undefined
+      }
+    >
+      <SiteCardBody site={props.site} />
+    </div>
+  );
+};
+
+export default SiteCard;

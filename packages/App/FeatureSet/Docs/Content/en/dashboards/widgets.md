@@ -1,0 +1,247 @@
+# Widgets
+
+A widget is one tile on a dashboard. This page lists every widget you can add, what it shows, and when to reach for it.
+
+For how to drag widgets around the canvas, see [Authoring a Dashboard](/docs/dashboards/authoring).
+
+## Charts and numbers
+
+### Chart
+
+A line, bar, or area chart of one or more metric series over the dashboard's time range.
+
+**Settings**:
+
+- One or more metric queries.
+- An optional formula that combines two queries (for example, `errors / total * 100` to get an error rate).
+- A "show as rate" option for cumulative counters that grow without resetting.
+- Display options: stacked or overlaid, Y-axis unit, legend position, chart type.
+
+Use it when: trends matter. Latency over time, error count, queue depth, anything where the shape of the line tells the story.
+
+### Value
+
+A single big number with optional colored thresholds.
+
+**Settings**:
+
+- A metric query that gives back one number (last value, average, or max over the time range).
+- An optional **warning** threshold (yellow above).
+- An optional **critical** threshold (red above).
+- Number format and unit.
+
+Use it when: one number answers the question. Current error rate, P95 latency right now, count of open incidents.
+
+### Gauge
+
+A circular gauge with a minimum, maximum, warning band, and critical band.
+
+**Settings**: a metric query and the four boundaries.
+
+Use it when: the value fits inside a known range. CPU percentage (0–100%), disk usage, queue capacity.
+
+### Table
+
+A table of metric results, one row per group.
+
+**Settings**: a metric query (typically grouped by a label like host or service), the columns to show, and a row limit.
+
+Use it when: you want a breakdown instead of a trend. Top 10 noisiest hosts, error count per service, requests per endpoint.
+
+## Text
+
+A static block of Markdown.
+
+**Settings**: the Markdown body. Headings, lists, links, emphasis, and code blocks all render.
+
+Use it when: you want a section heading, a paragraph of context, a list of links to runbooks, or a temporary banner during an incident.
+
+## HTML
+
+Your own HTML, CSS, and JavaScript, rendered as a widget.
+
+**Settings**: the HTML body, an optional stylesheet, an optional script, and three permission toggles.
+
+Use it when: you need something no built-in widget covers — an embedded third-party badge, a table pulled from an internal API, a custom legend, a set of styled links into your own tools.
+
+### What it can and cannot do
+
+The widget renders in a sandboxed frame on its own isolated origin. Inside that frame your code can do more or less anything: build DOM, run timers, fetch from any URL, draw on a canvas.
+
+What it cannot do is reach the OneUptime page around it. It has no access to the dashboard's DOM, cookies, local storage, or API session, and it cannot navigate the browser tab away. That holds whether the dashboard is private or shared publicly.
+
+Two consequences worth knowing before you paste something in:
+
+- A `fetch` from the widget is a cross-origin request from an opaque origin, so the server you call has to allow it with CORS. Calling the OneUptime API from here is not supported.
+- The widget starts transparent. Set a background on `body` in your CSS if you want it to fill the card.
+
+### Using dashboard variables
+
+Write `{{variableName}}` anywhere in the HTML, CSS, or JavaScript and it is replaced with that variable's current value before the widget renders. Picking a new value re-renders the widget. A placeholder naming a variable that does not exist is left as-is.
+
+Scripts get the same values, plus the dashboard's time range, on `window.ONEUPTIME`:
+
+```javascript
+window.ONEUPTIME.variables.environment; // current value, or "" if unset
+window.ONEUPTIME.startDate; // ISO 8601 string, start of the dashboard's time range
+window.ONEUPTIME.endDate; // ISO 8601 string, end of it
+```
+
+The widget reloads whenever the dashboard refreshes, so a widget that fetches its own data keeps up with the refresh interval.
+
+### Permissions
+
+**Run JavaScript** (on by default) runs your script. Turn it off to render markup and styles only — the script is then left out of the widget entirely rather than merely blocked.
+
+**Open links in a new tab** (on by default) lets links and `window.open` open a browser tab. Links always open in a new tab; the widget can never navigate the dashboard itself.
+
+**Allow forms to submit** (off by default) lets a `<form>` inside the widget submit.
+
+Anyone who can edit the dashboard decides what this widget runs, and everyone who views the dashboard runs it — on a public dashboard, that includes anonymous visitors. Treat edit access to a dashboard carrying an HTML widget the way you would treat access to any other code you ship.
+
+## Logs and traces
+
+### Log Chart
+
+A time-series chart of log volume over the dashboard's time range. Each series represents a severity, so error spikes stand out from normal traffic.
+
+**Settings**:
+
+- Bar, line, or area chart visualization. Bar and area charts stack severity series.
+- Optional severity filters.
+- Optional log-body text search.
+- Exact OpenTelemetry attribute filters using searchable key/value rows. Attribute names and known values are suggested as you type, while custom values remain supported.
+- An optional title.
+
+The dashboard time-range and refresh controls automatically re-query the chart. Dashboard telemetry-attribute variables also apply to it, including multi-select variables.
+
+Log Chart currently requires an authenticated dashboard. Public dashboards show the widget as unavailable rather than exposing project log aggregates anonymously.
+
+Use it when: you want to spot changes in log volume or compare errors, warnings, and informational logs without leaving the dashboard.
+
+### Log Stream
+
+A live tail of log lines matching a filter.
+
+**Settings**: log filters (service, severity, attributes) and the columns to show.
+
+Use it when: you want to see what the application is saying right now, without leaving the dashboard.
+
+### Trace List
+
+A list of recent traces matching a filter, with duration, status, and service.
+
+**Settings**: trace filters (service, status, attributes).
+
+Use it when: you want a list of recent activity rather than a chart. A common pattern is a latency chart at the top with a list of slow traces below.
+
+## Live lists
+
+### Incident List
+
+A live list of incidents matching a filter.
+
+**Settings**: filters by state, severity, labels, monitor, or team.
+
+Use it when: the dashboard answers "what's broken right now?"
+
+### Alert List
+
+A live list of alerts matching a filter.
+
+**Settings**: filters by state, severity, labels.
+
+Use it when: a team dashboard tracks alerts on its services.
+
+### Monitor List
+
+A live list of monitors and their current status.
+
+**Settings**: filters by monitor type, labels, or current state.
+
+Use it when: you want a fleet view — "are all the sites up?"
+
+## Service Level Objectives
+
+### SLO
+
+One Service Level Objective, drawn either as a single number or as a line over time.
+
+**Settings**: which SLO, which of its three numbers (SLI, Error Budget Remaining, or Burn Rate), Tile or Chart display, and an optional title.
+
+- **Tile** prints the current number, plus a second line where there is one — the target under the SLI, minutes remaining under the error budget. A status pill colors the whole thing.
+- **Chart** draws the same number over the dashboard's time range, with the target marked as a dashed line on the SLI series. History is written every few minutes by the evaluation worker, so a brand-new SLO charts as empty until it has been evaluated for the first time.
+
+Use it when: the dashboard is answering "are we meeting what we promised?" rather than "what is happening right now".
+
+The SLO widget works on [public dashboards](/docs/dashboards/sharing). What gets published is the SLO's headline numbers — its name, target, current SLI, error budget remaining, burn rate, and status — regardless of which one of them the widget happens to draw. Its definition stays private: the monitors it watches, its labels, its description, its query, and its evaluation schedule are never sent to a public viewer. A Tile widget publishes only those current numbers; a Chart widget also publishes the history of the one series it charts, and nothing else.
+
+## Kubernetes resource lists
+
+For projects with a [Kubernetes Agent](/docs/monitor/kubernetes-agent) installed. Each one takes optional filters for cluster, namespace, and labels.
+
+- **Kubernetes Pod List** — pods with their phase, restarts, and node.
+- **Kubernetes Node List** — nodes with their conditions and capacity.
+- **Kubernetes Namespace List** — namespaces and workload counts.
+- **Kubernetes Deployment List** — deployments with desired vs. ready replicas.
+- **Kubernetes StatefulSet List** — stateful sets with ready replicas.
+- **Kubernetes DaemonSet List** — daemon sets with desired vs. ready.
+- **Kubernetes Job List** — jobs and their completion status.
+- **Kubernetes CronJob List** — cron jobs with schedule and last run.
+
+Use these when: you want a single dashboard mixing Kubernetes state with telemetry from those workloads.
+
+## Docker resource lists
+
+For projects with Docker monitoring set up.
+
+- **Docker Host List** — hosts running Docker, with container counts.
+- **Docker Container List** — containers with state, image, host, uptime.
+- **Docker Image List** — images and their sizes.
+- **Docker Network List** — Docker networks and connected containers.
+- **Docker Volume List** — Docker volumes and their usage.
+
+## Infrastructure
+
+### Host List
+
+Hosts monitored by OneUptime's server monitor, with status, CPU, memory, and uptime.
+
+**Settings**: filters by labels or current state.
+
+## Network
+
+### Network Map
+
+Your network sites drawn on the world map, each pinned at its own latitude and longitude and colored by the monitor status rolled up onto it. Sites close together share a marker with the count printed inside it; a marker that stands for exactly one site opens that site when you click it.
+
+The map frames itself to the sites it drew — an estate inside one country fills the frame with that country, one spread across continents opens on the world. There are no zoom or pan controls: a dashboard tile is a picture, and the Network Map page under Network is where you walk the hierarchy.
+
+Above the map it prints how many sites are down, because a two-pixel red dot among two hundred green ones is not something anyone reads at dashboard distance. Below it, a coverage line says what the map is _not_ showing — sites with no coordinates, and whether the row cap was hit.
+
+**Settings**: title, map or list view, maximum sites drawn, whether to print site names, and filters by site type and by status. Site names come off automatically when the map gets too busy for them to be readable; the tooltip still names every marker.
+
+A site only appears if it has coordinates. Add latitude and longitude on the site (or import them from CSV) to pin it.
+
+## Which widget should I use?
+
+A few quick rules:
+
+- **Metric trend over time?** Chart.
+- **Log volume or error spikes over time?** Log Chart.
+- **One number that matters right now?** Value (or Gauge if it has a clear min/max).
+- **Breakdown across many things?** Table.
+- **What's happening in the system right now?** Log Stream, Trace List, Incident List.
+- **The state of a specific group of resources?** The matching list widget.
+- **Are we meeting the reliability we promised?** SLO.
+- **Where in the world your network is, and what's red?** Network Map.
+- **A heading, a paragraph, or a link?** Text.
+- **Something none of the above covers?** HTML — but only after checking that a built-in widget really can't do it.
+
+Most dashboards mix a few — a chart at the top, a value or two beside it, a text divider, and a list or two below.
+
+## Where to read next
+
+- [Variables & Filters](/docs/dashboards/variables) — making widgets reusable for many services or customers.
+- [Authoring a Dashboard](/docs/dashboards/authoring) — the canvas mechanics.
+- [Sharing & Public Dashboards](/docs/dashboards/sharing) — sharing outside your team.

@@ -1,0 +1,29 @@
+{{> Start this}}
+
+
+{{> Logo this}}
+{{> EmailTitle title=(concat "Probe: " probeName) }}
+
+{{> InfoBlock info="You have been added as the owner of this probe."}}
+
+{{> InfoBlock info="Here are the details: "}}
+
+{{> DetailBoxStart this }}
+{{> DetailBoxField title="Probe Name:" text=probeName }}
+{{> DetailBoxField title="Probe Description: " text=probeDescription  }}
+{{> DetailBoxEnd this }}
+
+
+{{> InfoBlock info="You can view this probe by clicking on the button below - "}}
+
+{{> ButtonBlock buttonUrl=viewProbeLink buttonText="View on Dashboard"}}
+
+{{> LinkBlock linkUrl=viewProbeLink linkLabel="You can also copy and paste this link:"}}
+
+{{> InfoBlock info="You will be notified when the status of this probe changes."}}
+
+{{> UnsubscribeOwnerEmail this }}
+
+{{> Footer this }}
+
+{{> End this}}

@@ -1,0 +1,125 @@
+import List, { ComponentProps } from "../../../UI/Components/List/List";
+import FieldType from "../../../UI/Components/Types/FieldType";
+import { describe, expect, it } from "@jest/globals";
+import "@testing-library/jest-dom";
+import { fireEvent, render, screen } from "@testing-library/react";
+import React from "react";
+
+describe("List", () => {
+  interface ListData {
+    id: string;
+    name: string;
+    description: string;
+  }
+
+  const defaultProps: ComponentProps<ListData> = {
+    data: [
+      {
+        id: "1",
+        name: "Item 1",
+        description: "Description 1",
+      },
+      {
+        id: "2",
+        name: "Item 2",
+        description: "Description 2",
+      },
+    ],
+    id: "test-list",
+    fields: [
+      {
+        title: "ID",
+        key: "id",
+        fieldType: FieldType.Text,
+        colSpan: 1,
+      },
+      {
+        title: "Name",
+        key: "name",
+        fieldType: FieldType.Text,
+        colSpan: 2,
+      },
+      {
+        title: "Description",
+        key: "description",
+        fieldType: FieldType.Text,
+        colSpan: 2,
+      },
+    ],
+    onNavigateToPage: jest.fn(),
+    currentPageNumber: 1,
+    totalItemsCount: 10,
+    itemsOnPage: 5,
+    error: "",
+    isLoading: false,
+    singularLabel: "Item",
+    pluralLabel: "Items",
+  };
+
+  it("renders List component with data", () => {
+    render(<List {...defaultProps} />);
+
+    expect(screen.getByTestId("list-container")).toBeInTheDocument();
+    expect(screen.getByTestId("list-pagination")).toBeInTheDocument();
+  });
+
+  it("renders skeleton cards while loading with nothing to show yet", () => {
+    render(<List {...defaultProps} isLoading={true} data={[]} />);
+
+    expect(screen.getByTestId("list-skeleton-loader")).toBeInTheDocument();
+  });
+
+  it("keeps existing cards visible, dimmed, while refetching", () => {
+    render(<List {...defaultProps} isLoading={true} />);
+
+    expect(screen.queryByTestId("list-skeleton-loader")).toBeNull();
+    expect(screen.getByTestId("list-content")).toHaveClass("opacity-60");
+  });
+
+  it("renders error state", () => {
+    const messageError: string = "Test error";
+    render(<List {...defaultProps} error={messageError} />);
+
+    expect(screen.getByText(messageError)).toBeInTheDocument();
+  });
+
+  it("renders error state when data is empty", () => {
+    const messageError: string = "There are no items";
+    render(<List {...defaultProps} data={[]} noItemsMessage={messageError} />);
+
+    expect(screen.getByText(messageError)).toBeInTheDocument();
+  });
+
+  it("renders error state default message when data is empty ", () => {
+    const messageError: string = "No item";
+    render(<List {...defaultProps} data={[]} />);
+
+    expect(screen.getByText(messageError)).toBeInTheDocument();
+  });
+
+  it("handles onNavigateToPage callback", () => {
+    render(<List {...defaultProps} />);
+
+    fireEvent.click(screen.getByTestId("pagination-next-button"));
+
+    expect(defaultProps.onNavigateToPage).toHaveBeenCalledWith(2, 5);
+  });
+
+  it("jumps straight to a page from the list footer", () => {
+    render(<List {...defaultProps} />);
+
+    fireEvent.click(screen.getByTestId("pagination-page-2"));
+
+    expect(defaultProps.onNavigateToPage).toHaveBeenCalledWith(2, 5);
+  });
+
+  it("changes the page size from the list footer", () => {
+    render(<List {...defaultProps} />);
+
+    fireEvent.change(screen.getByTestId("pagination-items-on-page-select"), {
+      target: { value: "25" },
+    });
+
+    expect(defaultProps.onNavigateToPage).toHaveBeenCalledWith(1, 25);
+  });
+});

@@ -45,16 +45,219 @@ oneuptime:
   # Labels added in the OneUptime UI are never removed by the agent.
   labels: {}
 
-# Required: Unique name for this cluster (used as k8s.cluster.name attribute)
+# Required: Unique name for this cluster (used as k8s.cluster.name attribute).
+#
+# Enforced at render time — the chart refuses to install without it. This is not
+# just a label: OneUptime folds k8s.cluster.name into the identity of every
+# Kubernetes entity it derives, so it is the only thing separating this
+# cluster's `worker-1` and `default` namespace from another cluster's. Two
+# clusters installed without it are silently merged into one estate.
 clusterName: ""
 
-# Namespace filters — limit which namespaces are monitored
+# Namespace filters — scoped rules for deciding which namespaces are observed.
+#
+# Each rule has an action (`include` or `exclude`), one or more namespace
+# patterns, and the scopes it applies to. Patterns are full-name matches with
+# `*` as the only wildcard: `team-*` matches `team-a` but not `my-team-a`.
+# If a scope has any include rules, only matching namespaces are kept. Exclude
+# rules are applied afterward and always win.
+#
+# Scopes map to where filtering can happen efficiently:
+#
+#   podLogs       — pod stdout/stderr only, at the filelog/API source. This does
+#                   not affect Kubernetes events or audit logs.
+#   ebpfDiscovery — OBI process discovery, before instrumentation. Excluding a
+#                   namespace here stops both its eBPF traces and eBPF metrics.
+#   metrics       — collector-side filter after Kubernetes metadata enrichment.
+#                   Node/cluster metrics without a namespace are always kept.
+#   traces        — collector-side filter after Kubernetes metadata enrichment.
+#                   Applies to both eBPF and application-pushed OTLP spans.
+#
+# The default preserves the low-cost system-namespace behavior: kube-system
+# pod logs are not opened and its workloads are not auto-instrumented, while
+# ordinary pod/container metrics remain available.
 namespaceFilters:
-  # If set, only these namespaces are monitored (empty = all namespaces)
-  include: []
-  # Namespaces to exclude from monitoring
-  exclude:
-    - kube-system
+  rules:
+    - action: exclude
+      namespaces:
+        - kube-system
+      scopes:
+        - podLogs
+        - ebpfDiscovery
+
+  # Example: stop duplicate pod logs from teams that ship logs directly while
+  # retaining their eBPF traces, service-map metrics and pod metrics.
+  # rules:
+  #   - action: exclude
+  #     namespaces: [kube-system]
+  #     scopes: [podLogs, ebpfDiscovery]
+  #   - action: exclude
+  #     namespaces: [team-a, "team-b-*"]
+  #     scopes: [podLogs]
+
+# Telemetry filters — drop records at the agent, before export.
+#
+# These render into a `filter` processor placed after the metadata
+# processors (so it can see k8s.namespace.name) and before `batch` (so a
+# dropped record never occupies a batch slot or leaves the node). That
+# makes this the cheapest place to cut volume: it saves egress, collector
+# memory, and OneUptime ingest cost at once.
+#
+# It is also the least reversible place. A record dropped here is gone —
+# there is no server-side copy to recover, and any monitor or dashboard
+# that depends on it goes quiet. OneUptime's server-side Drop Filters
+# (Logs → Settings → Drop Filters) and Metric Pipeline Rules
+# (Metrics → Settings → Pipeline Rules) are the reversible alternative:
+# they cost egress but can be changed after the fact without a redeploy.
+#
+# Cheaper still is not collecting at all — see `cadvisor.metricsAllowlist`
+# and `kubeStateMetrics.metricsAllowlist`, which drop metrics at the
+# receiver so they are never even parsed. Reach for those first when they
+# cover your case; use this block for everything that spans receivers.
+filters:
+  logs:
+    # Drop POD LOG records below this severity. "" (default) keeps
+    # everything. One of: TRACE, DEBUG, INFO, WARN, ERROR, FATAL.
+    #
+    # `minSeverity: WARN` keeps WARN, ERROR and FATAL and drops INFO,
+    # DEBUG and TRACE.
+    #
+    # Scope: pod logs only. Kubernetes events and resource specs are NOT
+    # filtered by this — they are a low-volume, high-value signal that
+    # arrives with no severity of its own, so a threshold would delete the
+    # whole feed rather than trim it. Use the OneUptime dashboard's
+    # server-side Drop Filters if you need to thin those out.
+    #
+    # Severity comes from the log line itself: the agent parses a level out
+    # of the text ("[ERROR]", "WARN:", "level=info", ...). What happens to a
+    # line with no recognisable level differs by log mode, because the two
+    # modes have different information available:
+    #
+    #   daemonset — the container runtime records which stream each line came
+    #     from, so an unlabelled line falls back to stderr→ERROR /
+    #     stdout→INFO. An unlabelled stdout line is therefore treated as INFO
+    #     and IS dropped by a WARN threshold.
+    #
+    #   api — the Kubernetes pods/log API merges stdout and stderr into one
+    #     stream with no per-line marker, so that fallback is not available.
+    #     Rather than guess, unlabelled lines are KEPT. This mode drops
+    #     strictly less; it will never silently delete a stack trace it could
+    #     not classify.
+    minSeverity: ""
+  metrics:
+    # Allowlist. When non-empty, ONLY metrics whose name matches are sent;
+    # everything else is dropped.
+    #
+    # This is a big hammer: it spans every receiver in the pipeline, so an
+    # allowlist that forgets a metric silently removes the monitors built
+    # on it. Prefer `exclude` unless you genuinely want a closed set.
+    include: []
+    # Denylist. Metrics whose name matches are dropped.
+    # Applied on top of `include`, so exclude always wins.
+    exclude: []
+    # How `include` / `exclude` entries are matched:
+    #   strict — the exact metric name.
+    #   regexp — an RE2 regular expression, UNANCHORED: `system.cpu`
+    #            matches `system.cpu.time` and anything containing it.
+    #            Anchor it yourself (`^system\.cpu$`) when you mean exact.
+    #            RE2 has no lookahead, so `^(?!x)` will not compile — use
+    #            `include` to express "everything except".
+    #
+    # A pattern is compiled by the collector at STARTUP, not per record, so
+    # an invalid one is not a filter that quietly misbehaves: the collector
+    # refuses to start and CrashLoopBackOffs, taking that collector's LOGS
+    # down with the metrics. Helm cannot compile RE2, so `helm upgrade` will
+    # accept a bad pattern happily. Test a pattern before you roll it out.
+    matchType: strict
+
+# Trace sampling — keep a fraction of traces and drop the rest at the agent,
+# before export.
+#
+# This is the one volume lever here that does not blind you. `filters` and
+# `namespaceFilters` remove a CATEGORY of telemetry, so whatever they drop is
+# gone from every trace forever. Sampling keeps every category and thins the
+# population instead: the traces you do get are whole and representative,
+# which is usually what you want from traces, where the hundredth identical
+# /healthz span teaches you nothing the first one didn't.
+#
+# The decision is a hash of the trace ID, not a coin flip, so it is
+# CONSISTENT: every span of a trace is kept or dropped together, by every
+# collector that sees it. You get whole traces, not fragments — which is the
+# thing that makes this safe to turn on. (OneUptime's server-side Trace Drop
+# Filters sample per-span instead, so they thin spans rather than traces.
+# Prefer this knob when you want traces you can actually read.)
+#
+# What sampling does NOT touch, and this is the point: the eBPF RED metrics —
+# request rate, error rate, duration — are a METRICS family. OBI computes them
+# from every request and they ride the metrics pipeline, which this sampler is
+# not in. `percentage: 10` gives you a tenth of the traces and 100% accurate
+# rate/error/latency, so the dashboards and monitors built on those metrics do
+# not move.
+#
+# What it DOES touch, and you have to know this before you turn it on: anything
+# OneUptime derives from the spans themselves scales down with the rate.
+# Traces monitors on Span Count, and Exceptions monitors on Exception Count,
+# count ingested spans — at `percentage: 10` they see a tenth of what they saw
+# yesterday and a threshold tuned on the old volume simply stops firing, with
+# no error anywhere. Retune those thresholds by the same factor when you set
+# this. Error GROUPING degrades worse than linearly: a common exception still
+# shows up, a rare one-off is more likely to vanish entirely than to appear a
+# tenth as often.
+sampling:
+  traces:
+    # Percentage of traces to KEEP, 0-100. 100 (default) keeps everything and
+    # leaves the sampler out of the pipeline entirely, so an install that
+    # never sets this renders exactly the config it renders today.
+    #
+    # 10 keeps a tenth. 0 keeps NONE — it is a real rate, not an off switch,
+    # and it deletes every trace while the eBPF DaemonSet keeps running and
+    # costing you. If you want no traces at all, `ebpf.enabled: false` is what
+    # you actually want; if you want no traces but still want RED metrics and
+    # the service map, keep eBPF on and set this to 0.
+    #
+    # Only applies when `ebpf.enabled` — the traces pipeline does not exist
+    # otherwise, and spans reach the agent only through it.
+    #
+    # Fractions are allowed (0.5 keeps one trace in two hundred), but `--set`
+    # cannot express them: Helm parses `--set ...percentage=0.5` as the STRING
+    # "0.5" and the schema rejects it. Whole numbers are fine with `--set`;
+    # for a fraction use `--set-json ...percentage=0.5` or a values file.
+    #
+    # Fractions have a FLOOR of about 0.0061. The sampler quantises the rate
+    # into 16384 buckets (`uint32(percentage * 163.84)`), so anything smaller
+    # rounds down to zero buckets and behaves exactly like `percentage: 0` —
+    # every trace dropped, no error, collector healthy, RED metrics still
+    # flowing to hide it. 0.01 (one in ten thousand) is the smallest value
+    # that does what it says.
+    #
+    # Traces only, deliberately. The OTel sampler cannot sample metrics at
+    # all. It can sample logs, but it draws its randomness from the trace ID,
+    # and pod logs do not have one: on this collector version every
+    # trace-ID-less record hashes to the same bucket, so a log rate would not
+    # thin the feed — it would keep all of it or delete all of it, flipping on
+    # the seed. That is a data-loss trap, so there is no `sampling.logs` here.
+    # Thin logs with `filters.logs.minSeverity` and `namespaceFilters`, which
+    # are precise about what they remove.
+    #
+    # One consequence of logs NOT being sampled: with
+    # `ebpf.logToTraceCorrelation: true`, pod logs are stamped with the trace
+    # ID of 100% of requests but only `percentage`% of the traces they point at
+    # are kept. So roughly (100 - percentage)% of log records will show a trace
+    # link that dead-ends. Trace → logs navigation is unaffected; it is only
+    # logs → trace that can miss.
+    percentage: 100
+    # Seed for the trace-ID hash. Collectors that need to agree on which
+    # traces to keep must share this value AND `percentage` — that is what
+    # keeps a trace whole across two clusters, or across this agent and a
+    # downstream gateway. Both default to the same everywhere, so multi-cluster
+    # traces survive without touching this.
+    #
+    # Change it only to deliberately DECORRELATE two sampling tiers. Because
+    # the decision is a threshold on the same hash, the same seed at different
+    # rates NESTS: every trace that survives 10% also survives 50%, so a second
+    # tier just re-picks the first tier's traces instead of drawing
+    # independently. Different seeds make the draws independent.
+    hashSeed: 22
 
 # OTel Collector image configuration
 image:
@@ -170,6 +373,30 @@ logs:
   # "gke-autopilot" / "eks-fargate" -> api. Override explicitly if you know
   # what you want: "daemonset" | "api" | "disabled".
   mode: ""
+  # Hybrid mode for clusters with Windows node pools. The DaemonSet collector
+  # only runs on Linux nodes (its images are linux-only), so in daemonset log
+  # mode pods on Windows nodes get no log collection. Enabling this runs the
+  # API log tailer (configured under `api` below) ALONGSIDE the DaemonSet,
+  # restricted to pods on Windows nodes — Linux pods keep the cheap node-local
+  # file tailing, and the two collectors never ship the same line twice. No
+  # effect in api mode (the tailer already covers every pod) or when logs are
+  # disabled.
+  #
+  # Two caveats:
+  #   - The restriction lives in the tailer image (NODE_OS_INCLUDE), which
+  #     ships with the same OneUptime release as this chart. An OLDER tailer
+  #     image ignores it and tails EVERY pod — silently shipping every Linux
+  #     pod's logs twice. If `api.image.tag` pins a version, make sure it is
+  #     no older than this chart's release; if a node may have cached a stale
+  #     `release` tag, set `api.image.pullPolicy: Always` for the upgrade.
+  #   - `filters.logs.minSeverity` drops lines with NO recognizable severity
+  #     differently on the two paths: the DaemonSet sees the stdout/stderr
+  #     marker on disk and assigns INFO/ERROR fallbacks (then filters), while
+  #     the log API strips that marker, so the tailer errs toward KEEPING
+  #     unrecognizable lines. Under a severity filter, Windows pods can ship
+  #     more keyword-less lines than Linux pods.
+  windowsPods:
+    enabled: false
   # The OTel memory_limiter (templates/configmap-daemonset.yaml) and the
   # container's GOMEMLIMIT are derived from limits.memory — limit_mib is ≈80%
   # of it — so the limiter and Go GC always engage *before* the kernel
@@ -189,9 +416,13 @@ logs:
   api:
     image:
       repository: oneuptime/kubernetes-log-tailer
-      # Leave empty to track the chart's appVersion — set at release time to
-      # the OneUptime product version (the release pipeline publishes
-      # oneuptime/kubernetes-log-tailer with the same tag). Override to pin.
+      # Leave empty to track `release` — the moving tag the release pipeline
+      # republishes for every OneUptime version. Set this to a version
+      # (e.g. "11.6.1") to pin. The chart's appVersion is not used as the
+      # tag: the release pipeline does stamp the published chart with the
+      # OneUptime version, but a render from a git checkout carries the
+      # placeholder 1.0.0, and the chart is published before that version's
+      # images are.
       tag: ""
       pullPolicy: IfNotPresent
     replicas: 1
@@ -224,6 +455,13 @@ collectionInterval: 30s
 # OTel `kubeletstats` receiver. Both groups run inside the existing
 # DaemonSet collector — no new pods, no new scrapes — they just expand
 # what kubeletstats reports.
+#
+# Separately, and with no flag, the chart always enables node and pod CPU
+# usage in cores (`k8s.node.cpu.usage`, `k8s.pod.cpu.usage`), which
+# kubeletstats also leaves off by default. The "High Node CPU Utilization"
+# monitor divides `k8s.node.cpu.usage` by the node's allocatable CPU and
+# never fires without it, so switching these groups off never removes it.
+# To drop the series anyway, list them in `filters.metrics.exclude`.
 kubeletstats:
   # Saturation metrics — container & pod CPU/memory expressed as a
   # percentage of request and limit. Enables the "Container CPU vs
@@ -256,8 +494,8 @@ kubeletstats:
 # Scrape the kubelet's cAdvisor endpoint (`/metrics/cadvisor`) for the
 # container-level metrics that the kubeletstats receiver doesn't
 # translate: CFS throttling counters and OOM kill events. Runs as a
-# Prometheus scrape in the Deployment collector (RBAC for
-# `/metrics/cadvisor` is already granted at templates/rbac.yaml).
+# Prometheus scrape in every DaemonSet collector, against its own node's
+# kubelet (authorized by the nodes/metrics grant in templates/rbac.yaml).
 #
 # Enables: OOM Kills, High CPU Throttling, CPU Throttle Ratio monitors.
 #
@@ -298,9 +536,34 @@ kubeStateMetrics:
   # Example: http://kube-state-metrics.kube-system.svc.cluster.local:8080/metrics
   endpoint: ""
   scrapeInterval: 30s
+  # Which Kubernetes objects the bundled KSM watches. This is a hard
+  # ceiling on `metricsAllowlist` below: KSM cannot emit a metric for an
+  # object it never watched, so an allowlist entry outside this list
+  # yields nothing — no error, no series. Broaden the two together.
+  #
+  # Adding a resource costs memory and CPU proportional to how many of
+  # those objects your cluster has, which is why this is narrow by
+  # default rather than KSM's "watch everything".
+  #
+  # Ignored when `mode: external` — there the allowlist alone applies,
+  # since you own that KSM's own flags.
+  #
+  # Example — also chart deployment rollout health:
+  #   --set-json 'kubeStateMetrics.collectResources=["pods","resourcequotas","deployments"]' \
+  #   --set-json 'kubeStateMetrics.metricsAllowlist=["kube_pod_status_phase","kube_deployment_status_replicas_unavailable"]'
+  collectResources:
+    - pods
+    - resourcequotas
   # Allowlist that gates which KSM metrics are forwarded to OneUptime.
   # KSM exports ~100 metric families by default; only keep the ones
-  # that power monitors. Each entry matches by exact `__name__`.
+  # that power monitors.
+  #
+  # Each entry is used as a prefix: `.*` is appended to it, so
+  # `kube_pod_status` also keeps `kube_pod_status_phase`. Anchor by
+  # writing the full name when you want just the one metric.
+  #
+  # In `bundled` mode an entry only produces series if its object is in
+  # `collectResources` above.
   metricsAllowlist:
     - kube_pod_status_phase
     - kube_pod_status_scheduled
@@ -319,6 +582,186 @@ kubeStateMetrics:
     limits:
       cpu: 200m
       memory: 256Mi
+
+# Kubernetes cost observability. Ships pre-priced workload cost
+# allocations to OneUptime, where they power the cluster "Costs" pages
+# and the Kubernetes Cost dashboard template.
+#
+# **One command**: `--set cost.enabled=true` is a complete install. The
+# chart bundles the open-source OpenCost engine (Apache-2.0, CNCF) plus
+# a minimal, dedicated Prometheus it needs for usage history — two small
+# pods, invisible plumbing. OpenCost prices nodes/volumes from your
+# cloud provider's public list prices automatically (no credentials);
+# on-prem clusters can set `cost.opencost.customPricing` rates instead.
+#
+# Already running Kubecost or OpenCost? Set `cost.engine.url` to its
+# Service and nothing is bundled — the chart just reads from it:
+#
+#   OpenCost:  http://opencost.opencost.svc.cluster.local:9003
+#   Kubecost:  http://kubecost-cost-analyzer.kubecost.svc.cluster.local:9090
+#
+# Two collection paths, both driven by the same engine:
+#
+#   1. `cost.agent`   — a small Deployment that polls the engine's
+#      Allocation API once per closed window (hourly by default) and
+#      POSTs per-workload cost rows (cpu/ram/gpu/pv/network/idle,
+#      efficiency) to OneUptime's /kubernetes-cost/ingest endpoint.
+#      This is the source of record for the Costs UI.
+#   2. `cost.metrics` — a Prometheus-receiver scrape of the engine's
+#      /metrics (node_total_hourly_cost, container_cpu_allocation, ...)
+#      through the existing OTLP pipeline, for charting raw cost
+#      metrics in Metric Explorer and dashboards.
+cost:
+  enabled: false
+  engine:
+    # Base URL of an EXISTING cost engine. Empty (the default) bundles
+    # OpenCost + a minimal Prometheus instead; setting it disables the
+    # bundle and reads from your engine.
+    url: ""
+    # Allocation API path. Empty auto-detects by probing, in order:
+    # /model/allocation (Kubecost), /allocation/compute (OpenCost),
+    # /allocation (older OpenCost).
+    allocationPath: ""
+    # Prometheus the cost agent reads per-container memory PEAKS from,
+    # which right-sizing needs and the Allocation API cannot give: engines
+    # report averages, and an hourly mean hides the burst that OOMKills a
+    # container.
+    #
+    # Empty (the default) resolves to the bundled Prometheus when the
+    # engine is bundled, and to NOTHING when you point at an external
+    # engine — set it explicitly in that case if you want memory
+    # recommendations. Without it, CPU recommendations still work (they
+    # come from stored hourly averages) and memory ones are unavailable.
+    prometheusUrl: ""
+    # Prometheus job label of the cAdvisor scrape. The bundled config uses
+    # kubernetes-nodes-cadvisor; override when reusing your own Prometheus,
+    # whose job will be named differently.
+    prometheusCadvisorJob: ""
+  # Bundled OpenCost engine. Deployed only when `cost.enabled` is true
+  # and `cost.engine.url` is empty.
+  opencost:
+    image:
+      repository: ghcr.io/opencost/opencost
+      tag: "1.121.0"
+      pullPolicy: IfNotPresent
+    logLevel: info
+    resources:
+      requests:
+        cpu: 50m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+    # Rate card for clusters whose nodes have no public cloud list
+    # price (on-prem, bare metal, air-gapped). When enabled, OpenCost
+    # prices every resource from these figures instead of a provider
+    # API. All values are USD per resource-HOUR (the defaults are the
+    # cost-model's GCP-us-central1-derived defaults: $0.031611/core-hr
+    # ~= $23/core-month).
+    customPricing:
+      enabled: false
+      cpuPerCoreHour: "0.031611"
+      spotCpuPerCoreHour: "0.006655"
+      ramPerGiBHour: "0.004237"
+      spotRamPerGiBHour: "0.000892"
+      gpuPerHour: "0.95"
+      storagePerGBHour: "0.00005479452"
+      zoneNetworkEgressPerGB: "0.01"
+      regionNetworkEgressPerGB: "0.01"
+      internetNetworkEgressPerGB: "0.12"
+  # Minimal Prometheus for the bundled engine — OpenCost hard-requires a
+  # PromQL endpoint for usage/price history; this one exists solely for
+  # that. Single replica, short retention, scrapes exactly two targets
+  # (cAdvisor via the API-server node proxy, and OpenCost itself — which
+  # emits its own KSM-style request metrics, so no kube-state-metrics is
+  # needed). Deployed only alongside the bundled engine; never scraped
+  # into OneUptime and never reachable outside the cluster.
+  prometheus:
+    image:
+      repository: quay.io/prometheus/prometheus
+      tag: "v2.55.1"
+      pullPolicy: IfNotPresent
+    # The cost poller only queries recently-closed hourly windows, so a
+    # few days is all this TSDB needs for spend alone. It is set to 7d
+    # because right-sizing reads memory peaks back over a multi-day
+    # lookback, and a window older than retention returns no peak at all —
+    # the recommendation silently loses that day's evidence.
+    retention: 7d
+    scrapeInterval: 60s
+    resources:
+      requests:
+        cpu: 50m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 1Gi
+    # Off by default: data sits in an emptyDir, so a pod restart loses a
+    # few hours of usage/price history (the poller then ships smaller
+    # allocations for those windows). Enable for a small PVC if that
+    # matters to you.
+    persistence:
+      enabled: false
+      size: 10Gi
+      storageClass: ""
+  # Allocation poller Deployment (oneuptime/kubernetes-cost-agent).
+  agent:
+    enabled: true
+    image:
+      repository: oneuptime/kubernetes-cost-agent
+      # Leave empty to track `release` — the moving tag the release pipeline
+      # republishes for every OneUptime version. Set this to a version
+      # (e.g. "11.6.1") to pin.
+      tag: ""
+      pullPolicy: IfNotPresent
+    # Allocation window length. Hourly is the engines' native ETL
+    # resolution; a longer window loses granularity, a shorter one is
+    # interpolated by the engine anyway.
+    windowSeconds: 3600
+    # How often to check whether a new closed window is ready.
+    pollIntervalSeconds: 300
+    # Wait after a window closes before querying it, so the engine has
+    # finished pricing/reconciling it.
+    engineSettleSeconds: 120
+    # Closed windows to (re-)ship on startup. The server skips windows
+    # that already have rows, so restarts cannot double-count.
+    lookbackWindows: 2
+    # Ship the engine's __idle__ allocation so idle spend is queryable.
+    includeIdle: true
+    # Currency code forwarded with every payload (informational).
+    currency: USD
+    logLevel: info
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 256Mi
+  # Prometheus scrape of the engine's cost metrics through the
+  # deployment collector's existing OTLP export.
+  metrics:
+    enabled: true
+    # Metrics endpoint. Empty defaults to <cost.engine.url>/metrics.
+    endpoint: ""
+    scrapeInterval: 60s
+    # Exact-match allowlist — the engine exports many more series, and
+    # per-container allocation metrics multiply cardinality by the
+    # cluster's container count. Keep it tight.
+    metricsAllowlist:
+      - node_cpu_hourly_cost
+      - node_gpu_hourly_cost
+      - node_ram_hourly_cost
+      - node_total_hourly_cost
+      - container_cpu_allocation
+      - container_gpu_allocation
+      - container_memory_allocation_bytes
+      - pod_pvc_allocation
+      - pv_hourly_cost
+      - kubecost_cluster_management_cost
+      - kubecost_load_balancer_cost
+      - kubecost_network_zone_egress_cost
+      - kubecost_network_region_egress_cost
+      - kubecost_network_internet_egress_cost
 
 # Application traces & HTTP request metrics via OpenTelemetry eBPF
 # Instrumentation (OBI — the upstream OpenTelemetry project that took over
@@ -370,6 +813,9 @@ ebpf:
   # Exists) so the DaemonSet covers all nodes. To keep it OFF a tainted DB-only
   # pool — so it doesn't compete with or instrument the database tier — override
   # `tolerations` with a narrower list and/or set `nodeSelector` / `affinity`.
+  # `kubernetes.io/os: linux` is always merged into the nodeSelector (keys set
+  # here win on conflict) — eBPF needs a Linux kernel and the image is
+  # linux-only, so Windows nodes (e.g. AKS Windows pools) are never scheduled.
   nodeSelector: {}
   tolerations:
     - operator: Exists
@@ -452,34 +898,71 @@ ebpf:
     # node, not per-service. Maps to feature: `stats`.
     tcpStats: true
 
-  # Distributed trace context propagation. OBI injects W3C `traceparent`
-  # so a request crossing pod A → pod B shows up as ONE trace in the
-  # dashboard, no SDK changes in either app. Requires the privileged
-  # security context that the DaemonSet already runs with.
-  contextPropagation: true
+  # Distributed trace context propagation. OBI injects a W3C `traceparent`
+  # into outbound requests so a call crossing pod A → pod B shows up as ONE
+  # trace in the dashboard, with no SDK changes in either app.
+  #
+  # **OFF by default — opt in.** This matches OBI's own default
+  # (`OTEL_EBPF_BPF_CONTEXT_PROPAGATION` is disabled upstream), and it is off
+  # here because EVERY mode mutates traffic that is already in flight:
+  #
+  #   - For plaintext HTTP, OBI grows the outbound request buffer in place
+  #     (`bpf_probe_write_user`) to fit the extra header.
+  #   - For TLS and for raw TCP it appends a TCP option from a Linux Traffic
+  #     Control hook, which means rewriting the packet and its checksum.
+  #
+  # Either way the kernel's byte accounting for that connection has to be
+  # fixed up, and getting it wrong desynchronizes the stream rather than
+  # dropping a span. Reported symptom when it goes wrong: transfers through
+  # an L7 proxy (nginx) hang mid-body once the response exceeds the point
+  # where the rewrite has to span segments (~64KB), holding the connection
+  # open until it times out. Because the failure is per-connection and
+  # size-dependent, it looks like an application or proxy bug, not like an
+  # agent bug — it cost one user a three-week hunt.
+  #
+  # Turn it on deliberately, on a non-production cluster first, and leave it
+  # off on any node whose traffic you cannot afford to have stall. Traces,
+  # RED metrics, and the service map all still work without it; what you
+  # lose is only the automatic stitching of spans across a service boundary
+  # for apps that don't propagate `traceparent` themselves.
+  #
+  # There is NO kernel version at which turning this on is inert, so do not
+  # rule the agent out as a suspect because a node is "too old". Kernel 5.17
+  # buys `bpf_loop` for network-level header parsing; below it OBI silently
+  # falls back to bounded-scan program variants and keeps rewriting traffic
+  # exactly the same way. The gate that actually decides whether injection
+  # happens is CAP_SYS_ADMIN plus the absence of kernel lockdown — and this
+  # DaemonSet runs privileged, so that gate is always open. `tcp`/`all`
+  # additionally load Traffic Control programs (CAP_NET_ADMIN); `headers`
+  # loads none.
+  contextPropagation: false
   # How OBI injects the `traceparent`. Maps directly to OBI's
-  # `OTEL_EBPF_BPF_CONTEXT_PROPAGATION`:
+  # `OTEL_EBPF_BPF_CONTEXT_PROPAGATION`. Only read when
+  # `contextPropagation: true`.
   #
-  #   headers — (default, safe) Inject only into HTTP/1.1 request headers.
-  #     Works for the common HTTP/gRPC case and does NOT touch the
-  #     network packets themselves, so it composes cleanly with service
-  #     meshes (Linkerd, Istio), mTLS, and eBPF-based CNIs (Cilium,
-  #     Calico). This is what you want unless you specifically need
-  #     propagation across raw TCP.
+  #   headers — Write the `traceparent` into outgoing HTTP/1.1 request
+  #     headers. Narrowest blast radius of the three, and the right starting
+  #     point — but note it is NOT packet-free: for plaintext HTTP this is an
+  #     in-place widening of the request buffer, and for HTTPS OBI cannot see
+  #     the headers so it falls back to the TCP-option path anyway. HTTPS
+  #     propagation only reaches other OBI-instrumented services and is
+  #     broken by proxies and L7 load balancers in between.
   #
-  #   ip — Inject via an IPv4/IPv6 option on outbound packets. Lets
-  #     propagation work for non-HTTP TCP (custom protocols, encrypted
-  #     traffic OBI can't read). May be dropped by middleboxes/NATs and
-  #     can confuse CNI plugins that inspect every packet.
+  #   tcp — Carry the context in a TCP option, injected via Linux Traffic
+  #     Control. Covers non-HTTP and encrypted traffic OBI can't parse, but
+  #     the option is connection-scoped, is frequently stripped by
+  #     middleboxes and NATs, and has to chain correctly with any other TC
+  #     program on the node (Cilium, Calico). Not used for gRPC.
   #
-  #   all — Both `headers` AND `ip`. Most propagation coverage but the
-  #     IP-option half is the one that tends to break service-mesh
-  #     proxies (linkerd2-proxy, envoy) by corrupting the bytes those
-  #     proxies validate, which can make application pods fail or
-  #     restart. Avoid in clusters running a service mesh.
+  #   all — Both `headers` and `tcp`. Most coverage, most traffic rewriting.
+  #     Avoid in clusters running a service mesh: the TCP-option half
+  #     corrupts bytes that linkerd2-proxy / envoy validate, which can make
+  #     application pods fail or restart.
   #
-  # If you don't have a service mesh and want propagation across raw
-  # TCP too, set this to `all`.
+  # (OBI also accepts `disabled`; use `contextPropagation: false` for that
+  # instead. The legacy `ip` value was removed upstream and now does nothing
+  # — this chart rejects it so a stale override fails loudly at install time
+  # rather than silently disabling propagation.)
   contextPropagationMode: "headers"
   # Track HTTP request headers in kernel for traceparent extraction on
   # the receiving side via kprobes. Needed for propagation to work across
@@ -658,8 +1141,16 @@ profiling:
 #
 # Runs inside the existing log-collector DaemonSet (which already has
 # hostPath access to /var/log/pods on every node), so no extra pods.
+# Every `system.*` series is stamped with the collecting node's
+# `k8s.node.name`, so it groups and alerts per node exactly like the
+# `kubeletstats` node metrics do.
 hostMetrics:
   enabled: true
+  # How often each node is scraped. Every scraper runs on this interval,
+  # and every enabled scraper emits several series per node — so this is
+  # the main lever on how many rows host metrics cost. Raise it (60s,
+  # 120s) on large clusters where per-node OS metrics don't need 30s
+  # resolution.
   collectionInterval: 30s
 
 # Kubernetes API server audit logs. Captures every API request — who
@@ -723,3 +1214,142 @@ serviceAccount:
   create: true
   name: ""
   annotations: {}
+
+# Kubernetes AI agent — lets OneUptime AI run kubectl on this cluster.
+#
+# On by default, read-only. When an incident or alert is raised on this
+# cluster, OneUptime AI investigates it. With the agent it also runs
+# read-only kubectl the way an on-call engineer would (describe the failing
+# pod, read its events, tail the crashing container's logs) and shows every
+# command it ran. Fixes are a separate opt-in (aiAgent.remediation below).
+#
+# It is one small pod (oneuptime/kubernetes-ai-agent) that connects with this
+# chart's oneuptime.apiKey and clusterName, so there is nothing to set up in
+# the dashboard: the cluster's AI → Agent page shows it as Connected within a
+# minute. An API key with a Pinned Service Name cannot register it. If it does
+# not connect, its log says whether a refusal clears on its own or what to
+# change:  kubectl logs -n <namespace> -l component=ai-agent --tail=100
+# Self-hosted OneUptime: the agent needs a OneUptime server of this chart's
+# version or newer, so upgrade the server first. It is not a OneUptime Runner,
+# and not related to the "AI Agent" retired in OneUptime 12.
+#
+# Turn it off with --set aiAgent.enabled=false.
+#
+# What it may do is decided in two places:
+#   * RBAC, here. Read-only by default: get/list/watch and pod logs,
+#     cluster-wide. aiAgent.remediation.enabled adds the write verbs fixes
+#     use: patch/update on Deployments, StatefulSets, DaemonSets, ReplicaSets
+#     (and their scale subresource), Jobs, CronJobs, Pods and HPAs; create on
+#     Jobs (`create job --from=cronjob/...`) and HPAs; delete on Pods and Jobs
+#     only; and, with remediation.nodeOperations, cordon/uncordon/taint/drain
+#     on nodes. Never secrets, exec, attach, port-forward, CRDs or RBAC writes.
+#     Be clear about what write access is: patch/update on workloads, pods and
+#     CronJobs (and create on Jobs) in a namespace is equivalent to running
+#     any image as any ServiceAccount in that namespace and reading its
+#     Secrets. So RBAC bounds WHERE the agent may write
+#     (remediation.namespaces), not what a write may do.
+#   * Policy, in OneUptime, re-checked by the agent before it runs kubectl.
+#     It refuses changing which ServiceAccount, security settings, volumes,
+#     command or Secret wiring a pod runs with (patches of host ports,
+#     hostUsers or runtimeClassName, and patches that replace the pod spec or
+#     a whole containers list, included), `expose --overrides`, Secret
+#     objects, RBAC writes, exec, attach, apply and edit, in every mode. It
+#     does not refuse changing an image: `set image` is a riskier change a
+#     human approves unless the cluster bypasses approvals or its allowlist
+#     names the command.
+#     In every mode, a write in kube-system, kube-public or kube-node-lease (a
+#     custom resource is judged by its namespace), a drain, a taint and a
+#     patch of a node always wait for a human, and the agent never changes its
+#     own namespace, anything outside remediation.namespaces, or a node when
+#     remediation.nodeOperations is false. OneUptime refuses such a fix
+#     already when it is proposed or approved.
+#     How fixes run is picked on the cluster's AI → Agent page: off; "ask for
+#     approval" (a human approves the exact kubectl plan); "automatic" (safe
+#     changes run on their own; a round that could only find riskier fixes
+#     ends by proposing exactly those for one-click approval, and otherwise a
+#     riskier fix waits for the follow-up round, which asks); or "bypass
+#     approval" (AI does not ask, except when the hourly circuit breaker
+#     trips, when another unattended OneUptime AI round is still changing or
+#     verifying the same cluster, or after a fix whose rollback did not
+#     complete). The chart README has the details.
+#
+# Let AI fix things too (list the namespaces it may change; each must
+# already exist):
+#   helm repo update
+#   helm upgrade <release> oneuptime/kubernetes-agent -n <namespace> \
+#     --reuse-values --set aiAgent.remediation.enabled=true \
+#     --set "aiAgent.remediation.namespaces={web,api}"
+aiAgent:
+  enabled: true
+  image:
+    repository: oneuptime/kubernetes-ai-agent
+    # Leave empty to track `release` — the moving tag the release pipeline
+    # re-points at every OneUptime version, like this chart's other OneUptime
+    # images. Pin a OneUptime version (e.g. "14.1.0") to hold it. To use a
+    # mirror, set repository (e.g. registry.example.com/oneuptime/kubernetes-ai-agent).
+    tag: ""
+    # Leave empty for Always while the tag is the moving `release` (so a node
+    # that cached an older agent, and its policy re-check, never keeps running
+    # it after an upgrade) and IfNotPresent for a pinned tag.
+    pullPolicy: ""
+  # Pull secrets for a private registry or mirror, e.g.
+  #   imagePullSecrets:
+  #     - name: my-registry-secret
+  imagePullSecrets: []
+  # The agent idles between commands; a kubectl call is a short burst.
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+  # The keys below are left unset on purpose. A release that used the
+  # previous aiAccess block keeps its aiAccess.remediation.* and
+  # aiAccess.extraEnv until the matching aiAgent key is set; a default here
+  # would silently replace them. Set them with --set as usual.
+  #
+  # remediation:
+  #   # Grant write RBAC so OneUptime AI can apply fixes. A cluster whose agent
+  #   # connects for the first time with this on starts in "ask for approval",
+  #   # unless AI settings were already picked on its AI → Agent page (they are
+  #   # kept as chosen). Otherwise pick the mode on that page.
+  #   enabled: false
+  #   # Where the write role applies. List namespaces to bind it with one
+  #   # RoleBinding in each and nowhere else; the agent refuses a write
+  #   # outside the list before it runs kubectl, and OneUptime refuses it
+  #   # already when it is proposed or approved. Every listed namespace must
+  #   # already exist: the chart never creates one, so a missing one fails the
+  #   # whole install or upgrade with `namespaces "<name>" not found`. This
+  #   # release's own namespace may not be listed.
+  #   # Empty binds it cluster-wide with a ClusterRoleBinding, which RBAC
+  #   # cannot keep out of kube-system, kube-public, kube-node-lease or this
+  #   # release's namespace: there the policy and the agent hold the line.
+  #   # Under --reuse-values, leaving the flag out keeps a stored list; go back
+  #   # to cluster-wide with --set-json 'aiAgent.remediation.namespaces=[]'
+  #   # (not `={}`, which Helm reads as one empty name).
+  #   namespaces: []
+  #   # Node operations: cordon/uncordon/taint (patch on nodes) and drain
+  #   # (create on pods/eviction), cluster-wide in a role of their own. A
+  #   # drain, a taint or a patch of a node always waits for a human. Set
+  #   # false to keep fixes off nodes: no node RBAC, and
+  #   # ONEUPTIME_KUBECTL_ALLOW_NODE_OPERATIONS=false tells the agent to refuse
+  #   # them before it runs kubectl.
+  #   nodeOperations: true
+  #
+  # # Extra environment for the agent container, e.g. HTTPS_PROXY and
+  # # NO_PROXY when the cluster reaches OneUptime through an egress proxy.
+  # # Names the chart sets itself (ONEUPTIME_URL, ONEUPTIME_API_KEY,
+  # # ONEUPTIME_KUBERNETES_CLUSTER_NAME, ONEUPTIME_KUBERNETES_AGENT_CHART_VERSION,
+  # # ONEUPTIME_KUBECTL_ALLOW_WRITES, ONEUPTIME_KUBECTL_WRITE_NAMESPACES,
+  # # ONEUPTIME_KUBECTL_ALLOW_NODE_OPERATIONS, ONEUPTIME_AI_AGENT_POD_NAMESPACE,
+  # # HOME, KUBECACHEDIR, PORT) fail the render instead of silently replacing
+  # # the chart's value. Unset, a stored aiAccess.extraEnv carries over; clear
+  # # it with --set-json 'aiAgent.extraEnv=[]'.
+  # extraEnv: []
+
+# aiAccess (charts 14.0.2 to 14.0.8) is deprecated: use aiAgent. It stays in
+# values.schema.json so releases that stored it still upgrade. The chart
+# carries aiAccess.remediation.* and aiAccess.extraEnv over while the
+# matching aiAgent key is unset, and ignores aiAccess.enabled, aiAccess.image
+# and aiAccess.resources.

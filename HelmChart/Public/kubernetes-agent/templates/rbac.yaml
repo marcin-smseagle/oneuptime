@@ -37,10 +37,10 @@ rules:
       - persistentvolumeclaims
       - persistentvolumes
     verbs: ["get", "list", "watch"]
-{{- if and .Values.logs.enabled (eq (include "kubernetes-agent.logMode" .) "api") }}
+{{- if eq (include "kubernetes-agent.logTailerEnabled" .) "true" }}
   # For API-mode log collection — stream pod logs via the Kubernetes API
   # (same permission `kubectl logs` needs). Only granted when the log tailer
-  # Deployment is enabled.
+  # Deployment is enabled (full api mode, or the Windows-only hybrid).
   - apiGroups: [""]
     resources:
       - pods/log
@@ -93,7 +93,30 @@ rules:
       - authorizationpolicies
     verbs: ["get", "list", "watch"]
 {{- end }}
-  # For kubeletstats receiver
+{{- if eq (include "kubernetes-agent.costEngineBundled" .) "true" }}
+  # For the bundled OpenCost engine — it reads workload topology the
+  # rules above already grant, plus these two: storage classes (PV
+  # pricing) and pod disruption budgets (its cluster inventory).
+  - apiGroups: ["storage.k8s.io"]
+    resources:
+      - storageclasses
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["policy"]
+    resources:
+      - poddisruptionbudgets
+    verbs: ["get", "list", "watch"]
+{{- end }}
+  # For the cAdvisor scrape in the DaemonSet collector: it reads
+  # /metrics/cadvisor off the local kubelet on NODE_IP:10250, and the
+  # kubelet authorizes that path as the nodes/metrics subresource.
+  - apiGroups: [""]
+    resources:
+      - nodes/metrics
+    verbs: ["get"]
+  # For endpoints the API server itself serves. The bundled cost
+  # Prometheus reaches cAdvisor through the API-server node proxy, which
+  # the nodes/proxy grant above covers; nonResourceURLs never apply to
+  # the kubelet, which authorizes by resource + subresource instead.
   - nonResourceURLs:
       - /metrics
       - /metrics/cadvisor

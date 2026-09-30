@@ -1,0 +1,2495 @@
+import { WorkflowHostname } from "../EnvironmentConfig";
+import ClickhouseDatabase, {
+  ClickhouseAppInstance,
+  ClickhouseClient,
+  ClickhouseIngestInstance,
+  ClickhouseMigrationInstance,
+} from "../Infrastructure/ClickhouseDatabase";
+import ClusterKeyAuthorization from "../Middleware/ClusterKeyAuthorization";
+import CountBy from "../Types/AnalyticsDatabase/CountBy";
+import ExistsBy from "../Types/AnalyticsDatabase/ExistsBy";
+import CreateBy from "../Types/AnalyticsDatabase/CreateBy";
+import CreateManyBy from "../Types/AnalyticsDatabase/CreateManyBy";
+import DeleteBy from "../Types/AnalyticsDatabase/DeleteBy";
+import FindBy from "../Types/AnalyticsDatabase/FindBy";
+import FindOneBy from "../Types/AnalyticsDatabase/FindOneBy";
+import FindOneByID from "../Types/AnalyticsDatabase/FindOneByID";
+import CaptureSpan from "../Utils/Telemetry/CaptureSpan";
+import {
+  DatabaseTriggerType,
+  OnCreate,
+  OnDelete,
+  OnFind,
+  OnUpdate,
+} from "../Types/AnalyticsDatabase/Hooks";
+import ModelPermission, {
+  CheckReadPermissionType,
+} from "../Types/AnalyticsDatabase/ModelPermission";
+import Select from "../Types/AnalyticsDatabase/Select";
+import UpdateBy from "../Types/AnalyticsDatabase/UpdateBy";
+import { SQL, Statement } from "../Utils/AnalyticsDatabase/Statement";
+import StatementGenerator from "../Utils/AnalyticsDatabase/StatementGenerator";
+import {
+  getQuerySettings,
+  TimeoutOverflowMode,
+} from "../Utils/AnalyticsDatabase/QuerySettingsHelper";
+import {
+  getDistributedDdlTaskTimeoutSeconds,
+  getStorageTableName,
+  onClusterClause,
+} from "../Utils/AnalyticsDatabase/ClusterConfig";
+import logger, { LogAttributes } from "../Utils/Logger";
+import Realtime from "../Utils/Realtime";
+import StreamUtil from "../Utils/Stream";
+import BaseService from "./BaseService";
+import {
+  ClickHouseSettings,
+  ExecResult,
+  ResponseJSON,
+  ResultSet,
+} from "@clickhouse/client";
+import { nextInsertDedupToken } from "../Utils/AnalyticsDatabase/InsertDedupContext";
+import AnalyticsBaseModel from "../../Models/AnalyticsModels/AnalyticsBaseModel/AnalyticsBaseModel";
+import { WorkflowRoute } from "../../ServiceRoute";
+import Protocol from "../../Types/API/Protocol";
+import Route from "../../Types/API/Route";
+import URL from "../../Types/API/URL";
+import AnalyticsTableColumn from "../../Types/AnalyticsDatabase/TableColumn";
+import TableColumnType from "../../Types/AnalyticsDatabase/TableColumnType";
+import SortOrder from "../../Types/BaseDatabase/SortOrder";
+import OneUptimeDate from "../../Types/Date";
+import BadDataException from "../../Types/Exception/BadDataException";
+import Exception from "../../Types/Exception/Exception";
+import ExceptionCode from "../../Types/Exception/ExceptionCode";
+import { JSONObject } from "../../Types/JSON";
+import ObjectID from "../../Types/ObjectID";
+import PositiveNumber from "../../Types/PositiveNumber";
+import Text from "../../Types/Text";
+import Typeof from "../../Types/Typeof";
+import API from "../../Utils/API";
+import { Stream } from "node:stream";
+import AggregateBy, {
+  AggregateUtil,
+} from "../Types/AnalyticsDatabase/AggregateBy";
+import AggregationInterval from "../../Types/BaseDatabase/AggregationInterval";
+import AggregatedResult from "../../Types/BaseDatabase/AggregatedResult";
+import AggregationType from "../../Types/BaseDatabase/AggregationType";
+import Sort from "../Types/AnalyticsDatabase/Sort";
+import AggregatedModel from "../../Types/BaseDatabase/AggregatedModel";
+import ModelEventType from "../../Types/Realtime/ModelEventType";
+
+export type Results = ResultSet<"JSON">;
+export type DbJSONResponse = ResponseJSON<{
+  data?: Array<JSONObject>;
+}>;
+
+/*
+ * Re-exported so callers outside Common (e.g. App data migrations) can type
+ * per-call settings without depending on @clickhouse/client directly.
+ */
+export type { ClickHouseSettings } from "@clickhouse/client";
+
+/**
+ * Optional per-call knobs for `execute` / `executeQuery`, threaded into
+ * `client.exec` / `client.query`. Long-running statements (e.g. the
+ * telemetry V3 backfill's INSERT...SELECT chunks) need per-call
+ * `clickhouse_settings` — notably `send_progress_in_http_headers`, which
+ * keeps the HTTP socket non-idle so the client's `request_timeout`
+ * (enforced as a socket *idle* timer, see ClickhouseConfig.ts) never
+ * destroys a healthy request — and a deterministic `query_id` so a retry
+ * can find a still-running or already-finished predecessor in
+ * `system.processes` / `system.query_log`. Additive: callers that pass
+ * nothing get the exact pre-existing behavior.
+ */
+export interface ClickhouseExecuteOptions {
+  clickhouseSettings?: ClickHouseSettings | undefined;
+  queryId?: string | undefined;
+  /**
+   * Route this statement through the dedicated migration pool
+   * (ClickhouseMigrationInstance) instead of the App pool. The migration pool
+   * has a much higher `request_timeout` (socket-idle ceiling) so a long DDL /
+   * mutation / INSERT...SELECT is not destroyed at the App pool's 58s. Schema
+   * sync and data migrations set this (via MigrationExecuteOptions); the read /
+   * write hot path leaves it unset and keeps the 58s App pool.
+   */
+  useMigrationConnection?: boolean | undefined;
+}
+
+/**
+ * Standard options for every schema-sync / data-migration statement. Two
+ * layers of protection against the socket-idle `request_timeout` killing a
+ * long migration:
+ *   1. `useMigrationConnection` routes through ClickhouseMigrationInstance
+ *      (30-minute idle ceiling) — reliable even for pure-DDL / ON CLUSTER
+ *      coordination that streams no bytes at all.
+ *   2. `send_progress_in_http_headers` makes the server emit periodic
+ *      X-ClickHouse-Progress header lines for data-rewriting statements
+ *      (MODIFY COLUMN rewrites, MATERIALIZE, INSERT...SELECT), keeping the
+ *      socket non-idle so the request completes instead of timing out.
+ * Pass this as the second arg to `execute` / `executeQuery` from migration
+ * code. The schema-mutating helpers on this service default to it already.
+ */
+export const MigrationExecuteOptions: ClickhouseExecuteOptions = {
+  useMigrationConnection: true,
+  clickhouseSettings: {
+    send_progress_in_http_headers: 1,
+    /*
+     * Emit a progress header every 10s — well under the App pool's 58s and the
+     * migration pool's 30-minute idle ceiling.
+     */
+    http_headers_progress_interval_ms: "10000",
+    /*
+     * ON CLUSTER DDL is queued in Keeper and executed by each host's DDLWorker
+     * sequentially, so on a busy or backlogged cluster a host can be healthy
+     * yet not reach the task within the wait window. The server default output
+     * mode (`throw`) turns that into TIMEOUT_EXCEEDED (code 159) and aborts
+     * the whole migrate run — even though the task stays queued and the hosts
+     * execute it in the background (until the DDL queue evicts it:
+     * task_max_lifetime, one week, or falling more than max_tasks_in_queue
+     * entries behind). `null_status_on_timeout` returns NULL for the hosts
+     * that haven't finished yet instead of throwing, while a real DDL failure
+     * on any host that did run it within the window still throws. Safe because
+     * every schema statement here is idempotent (IF NOT EXISTS / OR REPLACE)
+     * and, with the default `distributed_ddl.pool_size = 1`, later DDL queues
+     * strictly behind earlier DDL on each host. Migrate.ts additionally warns
+     * at end of run when the DDL queue still has unfinished tasks. Note these
+     * options are also reused by runtime ALTER ... DELETE mutations (session
+     * erasure / pin materialization); timeout-as-success is acceptable there
+     * too since a mutation is durable once enqueued. Requires ClickHouse >=
+     * 21.4 (older servers reject the setting as unknown).
+     */
+    distributed_ddl_output_mode: "null_status_on_timeout",
+    /*
+     * Int64 settings are typed as strings by @clickhouse/client. Read at
+     * module load; env is static for the life of the process. The migration
+     * pool's socket-idle ceiling scales with this value (ClickhouseConfig.ts)
+     * so a raised wait isn't killed client-side.
+     */
+    distributed_ddl_task_timeout: String(getDistributedDdlTaskTimeoutSeconds()),
+  },
+};
+
+/*
+ * The insert-dedup ambient context lives in
+ * Utils/AnalyticsDatabase/InsertDedupContext so that both this service and
+ * TelemetryFanInWriter can consume deterministic tokens without an import
+ * cycle. Re-exported here for existing callers.
+ *
+ * The ack mode is independent of tokening: TELEMETRY_WAIT_FOR_ASYNC_INSERT
+ * (shouldWaitForAsyncInsert below) is applied to EVERY insertJsonRows call,
+ * with or without a dedup token. Whether a telemetry queue job's writes
+ * carry per-job tokens from this context is a separate policy decided in
+ * the worker: the high-volume signals (traces/logs/metrics) run untokened
+ * so the fan-in writer can merge them into cross-job INSERTs under minted
+ * per-batch tokens — see shouldUseInsertDedup in
+ * App/FeatureSet/Telemetry/Jobs/TelemetryIngest/ProcessTelemetry.ts.
+ */
+export {
+  runWithInsertDedup,
+  nextInsertDedupToken,
+  type InsertDedupContextStore,
+} from "../Utils/AnalyticsDatabase/InsertDedupContext";
+
+/*
+ * Ack mode for telemetry ClickHouse inserts.
+ *
+ * Default (false): wait_for_async_insert=0 — fire-and-forget. ClickHouse
+ * acks as soon as the batch is accepted into its async-insert buffer and
+ * owns flushing from there; inserts release their query slot almost
+ * immediately. The trade: flush-time errors surface only in server logs
+ * (system.asynchronous_inserts / part log), and a ClickHouse crash between
+ * buffer-accept and flush loses that buffer even though callers were acked.
+ *
+ * Set TELEMETRY_WAIT_FOR_ASYNC_INSERT=true to make every tokened insert
+ * wait for the durable flush before acking (ack-after-flush end to end
+ * through the fan-in writer and writer tier) — at the cost of each waiting
+ * insert holding a ClickHouse query slot until its buffer flushes.
+ */
+export function shouldWaitForAsyncInsert(): boolean {
+  const raw: string | undefined =
+    process.env["TELEMETRY_WAIT_FOR_ASYNC_INSERT"];
+  return raw === "true" || raw === "1";
+}
+
+export default class AnalyticsDatabaseService<
+  TBaseModel extends AnalyticsBaseModel,
+> extends BaseService {
+  public modelType!: { new (): TBaseModel };
+  public database!: ClickhouseDatabase;
+  public ingestDatabase!: ClickhouseDatabase;
+  public migrationDatabase!: ClickhouseDatabase;
+  public model!: TBaseModel;
+  public databaseClient!: ClickhouseClient | null;
+  public ingestDatabaseClient!: ClickhouseClient | null;
+  public migrationDatabaseClient!: ClickhouseClient | null;
+  public statementGenerator!: StatementGenerator<TBaseModel>;
+
+  public constructor(data: {
+    modelType: { new (): TBaseModel };
+    database?: ClickhouseDatabase | undefined;
+    ingestDatabase?: ClickhouseDatabase | undefined;
+  }) {
+    super();
+    this.modelType = data.modelType;
+    this.model = new this.modelType();
+    if (data.database) {
+      this.database = data.database; // used for testing.
+    } else {
+      this.database = ClickhouseAppInstance; // default database
+    }
+
+    if (data.ingestDatabase) {
+      this.ingestDatabase = data.ingestDatabase;
+    } else {
+      this.ingestDatabase = ClickhouseIngestInstance;
+    }
+
+    /*
+     * Migrations route through their own pool (higher socket-idle timeout) via
+     * MigrationExecuteOptions. In tests `data.database` is the in-test instance,
+     * so reuse it there to keep tests on a single mocked client.
+     */
+    this.migrationDatabase = data.database || ClickhouseMigrationInstance;
+
+    this.databaseClient = this.database.getDataSource();
+    this.ingestDatabaseClient = this.ingestDatabase.getDataSource();
+    this.migrationDatabaseClient = this.migrationDatabase.getDataSource();
+
+    this.statementGenerator = new StatementGenerator<TBaseModel>({
+      modelType: this.modelType,
+      database: this.database,
+    });
+  }
+
+  @CaptureSpan()
+  public async insertJsonRows(
+    rows: Array<JSONObject>,
+    options?: {
+      /**
+       * Explicit deduplication token for this insert. Overrides the
+       * ambient runWithInsertDedup context. Callers must guarantee the
+       * token is stable across retries of the same logical insert and
+       * unique otherwise.
+       */
+      dedupToken?: string | undefined;
+      /** Extra per-insert ClickHouse settings, merged last. */
+      clickhouseSettings?: ClickHouseSettings | undefined;
+    },
+  ): Promise<void> {
+    if (!rows || rows.length === 0) {
+      return;
+    }
+
+    const client: ClickhouseClient = this.getIngestClient();
+
+    const tableName: string = this.model.tableName;
+
+    if (!tableName) {
+      throw new Exception(
+        ExceptionCode.BadDataException,
+        "Analytics model table name not configured",
+      );
+    }
+
+    let dedupToken: string | undefined = options?.dedupToken;
+
+    if (!dedupToken) {
+      dedupToken = nextInsertDedupToken(tableName);
+    }
+
+    const waitForAsyncInsert: 0 | 1 = shouldWaitForAsyncInsert() ? 1 : 0;
+
+    let clickhouseSettings: ClickHouseSettings = {
+      async_insert: 1,
+      wait_for_async_insert: waitForAsyncInsert,
+    };
+
+    if (dedupToken) {
+      /*
+       * Dedup settings ride along in both ack modes. For async inserts
+       * ClickHouse dedups by content hash of the insert body when
+       * async_insert_deduplicate=1 (the explicit token is not yet honored
+       * for async inserts — ClickHouse #52018), so byte-identical queue
+       * retries are still dropped. The ack mode is a separate, deliberate
+       * trade (see shouldWaitForAsyncInsert): by default ClickHouse owns
+       * flushing and an ack means "accepted into the async-insert buffer";
+       * with TELEMETRY_WAIT_FOR_ASYNC_INSERT=true the ack waits for the
+       * durable flush instead.
+       */
+      clickhouseSettings = {
+        async_insert: 1,
+        wait_for_async_insert: waitForAsyncInsert,
+        async_insert_deduplicate: 1,
+        insert_deduplication_token: dedupToken,
+      };
+    }
+
+    if (options?.clickhouseSettings) {
+      clickhouseSettings = {
+        ...clickhouseSettings,
+        ...options.clickhouseSettings,
+      };
+    }
+
+    try {
+      await client.insert({
+        table: tableName,
+        values: rows,
+        format: "JSONEachRow",
+        clickhouse_settings: clickhouseSettings,
+      });
+
+      logger.debug(
+        `ClickHouse insert succeeded for table ${tableName} at ${OneUptimeDate.toString(OneUptimeDate.getCurrentDate())}`,
+        { tableName } as LogAttributes,
+      );
+    } catch (error) {
+      logger.error(
+        `ClickHouse insert failed for table ${tableName} at ${OneUptimeDate.toString(OneUptimeDate.getCurrentDate())}`,
+        { tableName } as LogAttributes,
+      );
+      logger.error(error, { tableName } as LogAttributes);
+      throw error;
+    }
+  }
+
+  @CaptureSpan()
+  public async doesColumnExistInDatabase(columnName: string): Promise<boolean> {
+    const statement: string =
+      this.statementGenerator.toDoesColumnExistStatement(columnName);
+
+    const dbResult: ExecResult<Stream> = await this.execute(statement);
+
+    const strResult: string = await StreamUtil.convertStreamToText(
+      dbResult.stream,
+    );
+
+    return strResult.trim().length > 0;
+  }
+
+  @CaptureSpan()
+  public async getColumnTypeInDatabase(
+    column: AnalyticsTableColumn,
+  ): Promise<TableColumnType | null> {
+    if (!column) {
+      return null;
+    }
+
+    const columnName: string = column.key;
+
+    if (!(await this.doesColumnExistInDatabase(columnName))) {
+      return null;
+    }
+
+    const statement: string =
+      this.statementGenerator.getColumnTypesStatement(columnName);
+
+    const dbResult: ExecResult<Stream> = await this.execute(statement);
+
+    let strResult: string = await StreamUtil.convertStreamToText(
+      dbResult.stream,
+    );
+
+    /*
+     * Unwrap LowCardinality(...) first so dictionary-encoded columns
+     * (e.g. LowCardinality(String), LowCardinality(Nullable(String)))
+     * map back to their logical type instead of falling through to null.
+     */
+    if (strResult.includes("LowCardinality(")) {
+      const inner: string = strResult.split("LowCardinality(")[1] as string;
+      strResult = inner.substring(0, inner.lastIndexOf(")"));
+    }
+
+    // if strResult includes Nullable(type) then extract type.
+
+    if (strResult.includes("Nullable")) {
+      let type: string = strResult.split("Nullable(")[1] as string;
+      type = type.split(")")[0] as string;
+      strResult = type;
+    }
+
+    return (
+      (this.statementGenerator.toTableColumnType(
+        strResult.trim(),
+      ) as TableColumnType) || null
+    );
+  }
+
+  @CaptureSpan()
+  public async countBy(countBy: CountBy<TBaseModel>): Promise<PositiveNumber> {
+    try {
+      const checkReadPermissionType: CheckReadPermissionType<TBaseModel> =
+        await ModelPermission.checkReadPermission(
+          this.modelType,
+          countBy.query,
+          null,
+          countBy.props,
+        );
+
+      countBy.query = checkReadPermissionType.query;
+
+      const countStatement: Statement = this.toCountStatement(countBy);
+
+      const dbResult: ResultSet<"JSON"> =
+        await this.executeQuery(countStatement);
+
+      logger.debug(`${this.model.tableName} Count Statement executed`, {
+        tableName: this.model.tableName,
+      } as LogAttributes);
+      logger.debug(countStatement, {
+        tableName: this.model.tableName,
+      } as LogAttributes);
+
+      let countPositive: PositiveNumber = new PositiveNumber(0);
+
+      try {
+        const resultInJSON: ResponseJSON<JSONObject> =
+          await dbResult.json<JSONObject>();
+
+        /*
+         * count() is a UInt64, and whether it arrives as a JSON string or a
+         * JSON number depends on the server's
+         * output_format_json_quote_64bit_integers setting: ClickHouse
+         * quoted 64-bit integers by default until 25.x flipped the default
+         * to 0 (numbers). Accept both — a string-only check silently read
+         * every count as 0 on modern servers, which (among other things)
+         * meant telemetry monitors' Log/Span/Exception counts never crossed
+         * their criteria thresholds.
+         */
+        const rawCount: unknown =
+          resultInJSON.data && resultInJSON.data[0]
+            ? resultInJSON.data[0]["count"]
+            : undefined;
+
+        if (typeof rawCount === "string" || typeof rawCount === "number") {
+          countPositive = new PositiveNumber(rawCount);
+        }
+      } catch {
+        /*
+         * When max_execution_time fires with timeout_overflow_mode='break',
+         * ClickHouse may return a truncated response for count() queries
+         * (the aggregation has no partial row to emit). Treat this as
+         * "count unavailable" rather than a fatal error — the list query
+         * itself still succeeds.
+         */
+        logger.warn(
+          `${this.model.tableName} count query returned unparseable response, defaulting to 0`,
+          { tableName: this.model.tableName } as LogAttributes,
+        );
+      }
+
+      logger.debug(`Result: `, {
+        tableName: this.model.tableName,
+      } as LogAttributes);
+      logger.debug(countPositive.toNumber(), {
+        tableName: this.model.tableName,
+      } as LogAttributes);
+
+      countPositive = await this.onCountSuccess(countPositive);
+      return countPositive;
+    } catch (error) {
+      await this.onCountError(error as Exception);
+      throw this.getException(error as Exception);
+    }
+  }
+
+  /**
+   * Returns whether at least one row matches the query, without counting
+   * every match. Prefer this over `countBy(...).toNumber() === 0` for
+   * existence checks: `count()` scans every matching row, whereas this
+   * issues `SELECT 1 ... LIMIT 1`, which lets ClickHouse short-circuit at
+   * the first matching granule — dramatically cheaper on large tables
+   * (Metric / Span / Log).
+   */
+  @CaptureSpan()
+  public async existsBy(existsBy: ExistsBy<TBaseModel>): Promise<boolean> {
+    try {
+      const checkReadPermissionType: CheckReadPermissionType<TBaseModel> =
+        await ModelPermission.checkReadPermission(
+          this.modelType,
+          existsBy.query,
+          null,
+          existsBy.props,
+        );
+
+      existsBy.query = checkReadPermissionType.query;
+
+      const existsStatement: Statement = this.toExistsStatement(existsBy);
+
+      const dbResult: ResultSet<"JSON"> =
+        await this.executeQuery(existsStatement);
+
+      const resultInJSON: ResponseJSON<JSONObject> =
+        await dbResult.json<JSONObject>();
+
+      return Boolean(
+        resultInJSON.data &&
+          Array.isArray(resultInJSON.data) &&
+          resultInJSON.data.length > 0,
+      );
+    } catch (error) {
+      await this.onFindError(error as Exception);
+      throw this.getException(error as Exception);
+    }
+  }
+
+  @CaptureSpan()
+  public async addColumnInDatabase(
+    column: AnalyticsTableColumn,
+  ): Promise<void> {
+    const statement: Statement =
+      this.statementGenerator.toAddColumnStatement(column);
+    /*
+     * Schema-sync / migration-only path: route through the migration pool so a
+     * column add that backfills a DEFAULT/MATERIALIZED expression on a large
+     * table is not destroyed at the App pool's 58s socket-idle timeout.
+     */
+    await this.execute(statement, MigrationExecuteOptions);
+
+    // Add skip index separately (ClickHouse requires ADD INDEX as a separate ALTER statement)
+    const indexStatement: Statement | null =
+      this.statementGenerator.toAddSkipIndexStatement(column);
+    if (indexStatement) {
+      await this.execute(indexStatement, MigrationExecuteOptions);
+    }
+  }
+
+  @CaptureSpan()
+  public async dropColumnInDatabase(columnName: string): Promise<void> {
+    /*
+     * Drop any skip index associated with this column before dropping the column itself.
+     * ClickHouse will reject a column drop if a skip index depends on it.
+     */
+    const column: AnalyticsTableColumn | undefined =
+      this.model.tableColumns.find((col: AnalyticsTableColumn) => {
+        return col.key === columnName;
+      });
+
+    if (column?.skipIndex) {
+      await this.execute(
+        this.statementGenerator.toDropSkipIndexStatement(column.skipIndex.name),
+        MigrationExecuteOptions,
+      );
+    }
+
+    await this.execute(
+      this.statementGenerator.toDropColumnStatement(columnName),
+      MigrationExecuteOptions,
+    );
+  }
+
+  public async doesColumnExist(columnName: string): Promise<boolean> {
+    // Columns live on the physical (local) storage table in cluster mode.
+    const tableName: string = getStorageTableName(this.model.tableName);
+    const result: { data: Array<JSONObject> } = await (
+      await this.executeQuery(
+        `SELECT count() as cnt FROM system.columns WHERE database = currentDatabase() AND table = '${tableName}' AND name = '${columnName}'`,
+      )
+    ).json();
+
+    const rows: Array<JSONObject> = result.data || [];
+
+    return rows.length > 0 && Number(rows[0]!["cnt"]) > 0;
+  }
+
+  public async getColumnCodec(columnName: string): Promise<string> {
+    const tableName: string = getStorageTableName(this.model.tableName);
+    const result: { data: Array<JSONObject> } = await (
+      await this.executeQuery(
+        `SELECT compression_codec FROM system.columns WHERE database = currentDatabase() AND table = '${tableName}' AND name = '${columnName}'`,
+      )
+    ).json();
+
+    const rows: Array<JSONObject> = result.data || [];
+
+    if (rows.length === 0) {
+      return "";
+    }
+
+    return (rows[0]!["compression_codec"] as string) || "";
+  }
+
+  /**
+   * The exact ClickHouse type string for a column as stored in the DB
+   * (e.g. "String", "Nullable(Int32)", "LowCardinality(Nullable(String))").
+   * Returns "" if the column does not exist. Used by migrations that need to
+   * re-state a column's type in a MODIFY COLUMN without guessing it.
+   */
+  public async getColumnDatabaseType(columnName: string): Promise<string> {
+    const tableName: string = getStorageTableName(this.model.tableName);
+    const result: { data: Array<JSONObject> } = await (
+      await this.executeQuery(
+        `SELECT type FROM system.columns WHERE database = currentDatabase() AND table = '${tableName}' AND name = '${columnName}'`,
+      )
+    ).json();
+
+    const rows: Array<JSONObject> = result.data || [];
+
+    if (rows.length === 0) {
+      return "";
+    }
+
+    return (rows[0]!["type"] as string) || "";
+  }
+
+  public async setColumnCodecIfNotSet(data: {
+    columnName: string;
+    columnType: string;
+    codec: string;
+    expectedCodecValue: string;
+  }): Promise<void> {
+    /*
+     * MODIFY COLUMN on the local table; ReplicatedMergeTree fans the codec
+     * change out to the other replicas through Keeper.
+     */
+    const tableName: string = getStorageTableName(this.model.tableName);
+    const currentCodec: string = await this.getColumnCodec(data.columnName);
+
+    if (currentCodec === data.expectedCodecValue) {
+      logger.info(
+        `${tableName}.${data.columnName} already has ${data.expectedCodecValue}, skipping`,
+        { tableName } as LogAttributes,
+      );
+      return;
+    }
+
+    await this.execute(
+      `ALTER TABLE ${tableName} MODIFY COLUMN ${data.columnName} ${data.columnType} CODEC(${data.codec}) SETTINGS mutations_sync=0`,
+      MigrationExecuteOptions,
+    );
+    logger.info(
+      `Applied ${data.codec} codec to ${tableName}.${data.columnName} (async)`,
+      { tableName } as LogAttributes,
+    );
+  }
+
+  @CaptureSpan()
+  public async findBy(findBy: FindBy<TBaseModel>): Promise<Array<TBaseModel>> {
+    return await this._findBy(findBy);
+  }
+
+  /**
+   * Group telemetry rows by (primaryEntityId, primaryEntityType) for a project over a
+   * time window, returning the row count and an estimate of the ingested
+   * byte size (ClickHouse `byteSize(*)`, the uncompressed in-memory size of
+   * each row's columns). This is the enumeration source for usage billing:
+   * a single aggregation scan surfaces EVERY resource that emitted
+   * telemetry — real Services, Hosts, Docker hosts, Kubernetes clusters,
+   * Monitors and unattributed (primaryEntityId = projectId) — without needing a
+   * Postgres row per resource. The caller decides which serviceTypes to
+   * bill and how to attribute retention.
+   */
+  @CaptureSpan()
+  public async groupTelemetryUsageByService(data: {
+    projectId: ObjectID;
+    timestampColumnName: keyof TBaseModel | string;
+    startDate: Date;
+    endDate: Date;
+    /*
+     * Row names left out of the scan entirely, for a table where OneUptime
+     * writes its own rows under the same (primaryEntityId, primaryEntityType)
+     * as the customer's, so the grouping cannot tell them apart and the
+     * caller's entity-type exclusion cannot either - the session replay
+     * budget series sit next to a RUM application's web vitals (see
+     * TELEMETRY_BILLING_EXCLUDED_METRIC_NAMES). Empty or absent leaves the
+     * statement exactly as it was.
+     */
+    excludeNames?: Array<string> | undefined;
+  }): Promise<
+    Array<{
+      primaryEntityId: string;
+      primaryEntityType: string | null;
+      rowCount: number;
+      estimatedBytes: number;
+    }>
+  > {
+    const timestampColumnName: string = data.timestampColumnName.toString();
+
+    if (!this.model.getTableColumn(timestampColumnName)) {
+      throw new BadDataException(
+        `Invalid timestampColumnName: ${timestampColumnName}`,
+      );
+    }
+
+    const excludeNames: Array<string> = data.excludeNames || [];
+
+    /*
+     * Names can only be excluded from a table whose `name` is a required
+     * column. Without one ClickHouse fails on the unknown column mid-billing
+     * run; with a Nullable one (Span's), `NULL NOT IN (...)` is not true, so
+     * every unnamed row would silently drop out of the bill. Either way the
+     * caller has a bug, so refuse before the scan.
+     */
+    if (
+      excludeNames.length > 0 &&
+      !this.model.getTableColumn("name")?.required
+    ) {
+      throw new BadDataException(
+        `excludeNames needs a required name column, and ${this.model.tableName} has none`,
+      );
+    }
+
+    if (!this.database) {
+      this.useDefaultDatabase();
+    }
+    const databaseName: string =
+      this.database!.getDatasourceOptions().database!;
+
+    const statement: Statement = SQL`SELECT primaryEntityId AS primaryEntityId, primaryEntityType AS primaryEntityType, count() AS rowCount, sum(byteSize(*)) AS estimatedBytes FROM ${databaseName}.${this.model.tableName} WHERE projectId = ${{
+      type: TableColumnType.ObjectID,
+      value: data.projectId,
+    }} AND ${timestampColumnName} >= ${{
+      type: TableColumnType.DateTime64,
+      value: data.startDate,
+    }} AND ${timestampColumnName} <= ${{
+      type: TableColumnType.DateTime64,
+      value: data.endDate,
+    }}`;
+
+    /*
+     * Inside the WHERE, before the grouping, so an excluded row is never
+     * counted or sized. The names travel as one Array(String) parameter,
+     * never as SQL text.
+     */
+    if (excludeNames.length > 0) {
+      statement.append(
+        SQL` AND name NOT IN ${{
+          type: TableColumnType.ArrayText,
+          value: excludeNames,
+        }}`,
+      );
+    }
+
+    statement.append(SQL` GROUP BY primaryEntityId, primaryEntityType`);
+
+    /*
+     * Billing scan: deliberately NO timeout_overflow_mode='break'. A
+     * partial aggregation here silently undercounts usage (rows that
+     * weren't scanned before the cap simply never get billed). Failing
+     * loudly lets the staging cron retry instead; the cap is raised to
+     * compensate for the full-day scan on large projects.
+     */
+    statement.append(getQuerySettings({ maxExecutionTimeInSeconds: 120 }));
+
+    const dbResult: ResultSet<"JSON"> = await this.executeQuery(statement);
+    const responseJSON: ResponseJSON<JSONObject> =
+      await dbResult.json<JSONObject>();
+    const items: Array<JSONObject> = responseJSON.data ? responseJSON.data : [];
+
+    const results: Array<{
+      primaryEntityId: string;
+      primaryEntityType: string | null;
+      rowCount: number;
+      estimatedBytes: number;
+    }> = [];
+
+    for (const item of items) {
+      const primaryEntityId: string = (item["primaryEntityId"] as string) || "";
+      if (!primaryEntityId) {
+        continue;
+      }
+      const serviceTypeRaw: unknown = item["primaryEntityType"];
+      const primaryEntityType: string | null =
+        typeof serviceTypeRaw === "string" && serviceTypeRaw.trim()
+          ? serviceTypeRaw
+          : null;
+      results.push({
+        primaryEntityId,
+        primaryEntityType,
+        rowCount: Number(item["rowCount"]) || 0,
+        estimatedBytes: Number(item["estimatedBytes"]) || 0,
+      });
+    }
+
+    return results;
+  }
+
+  @CaptureSpan()
+  public async aggregateBy(
+    aggregateBy: AggregateBy<TBaseModel>,
+  ): Promise<AggregatedResult> {
+    return await this._aggregateBy(aggregateBy);
+  }
+
+  private async _aggregateBy(
+    aggregateBy: AggregateBy<TBaseModel>,
+  ): Promise<AggregatedResult> {
+    try {
+      if (!aggregateBy.sort || Object.keys(aggregateBy.sort).length === 0) {
+        aggregateBy.sort = {
+          [aggregateBy.aggregationTimestampColumnName as keyof TBaseModel]:
+            SortOrder.Descending,
+        } as Sort<TBaseModel>;
+      }
+
+      if (!aggregateBy.limit) {
+        aggregateBy.limit = 10;
+      }
+
+      if (!aggregateBy.aggregationType) {
+        throw new BadDataException("aggregationType is required");
+      }
+
+      const allowedAggregationTypes: Array<string> =
+        Object.values(AggregationType);
+      if (!allowedAggregationTypes.includes(aggregateBy.aggregationType)) {
+        throw new BadDataException(
+          `Invalid aggregationType: ${aggregateBy.aggregationType}. Allowed values: ${allowedAggregationTypes.join(", ")}`,
+        );
+      }
+
+      if (
+        aggregateBy.aggregationInterval !== undefined &&
+        !Object.values(AggregationInterval).includes(
+          aggregateBy.aggregationInterval,
+        )
+      ) {
+        throw new BadDataException(
+          `Invalid aggregationInterval: ${aggregateBy.aggregationInterval}. Allowed values: ${Object.values(AggregationInterval).join(", ")}`,
+        );
+      }
+
+      if (!aggregateBy.aggregationTimestampColumnName) {
+        throw new BadDataException(
+          "aggregationTimestampColumnName is required",
+        );
+      }
+
+      if (!aggregateBy.aggregateColumnName) {
+        throw new BadDataException("aggregateColumnName is required");
+      }
+
+      if (
+        !this.model.getTableColumn(aggregateBy.aggregateColumnName.toString())
+      ) {
+        throw new BadDataException(
+          `Invalid aggregateColumnName: ${aggregateBy.aggregateColumnName.toString()}`,
+        );
+      }
+
+      if (
+        !this.model.getTableColumn(
+          aggregateBy.aggregationTimestampColumnName.toString(),
+        )
+      ) {
+        throw new BadDataException(
+          `Invalid aggregationTimestampColumnName: ${aggregateBy.aggregationTimestampColumnName.toString()}`,
+        );
+      }
+
+      const result: CheckReadPermissionType<TBaseModel> =
+        await ModelPermission.checkReadPermission(
+          this.modelType,
+          aggregateBy.query,
+          {
+            [aggregateBy.aggregateColumnName]: true,
+            [aggregateBy.aggregationTimestampColumnName]: true,
+          } as Select<TBaseModel>,
+          aggregateBy.props,
+        );
+
+      aggregateBy.query = result.query;
+
+      const findStatement: {
+        statement: Statement;
+        columns: Array<string>;
+      } = this.toAggregateStatement(aggregateBy);
+
+      const dbResult: ResultSet<"JSON"> = await this.executeQuery(
+        findStatement.statement,
+      );
+
+      logger.debug(`${this.model.tableName} Aggregate Statement executed`, {
+        tableName: this.model.tableName,
+      } as LogAttributes);
+
+      const responseJSON: ResponseJSON<JSONObject> =
+        await dbResult.json<JSONObject>();
+
+      const items: Array<JSONObject> = responseJSON.data
+        ? responseJSON.data
+        : [];
+
+      const aggregatedItems: Array<AggregatedModel> = [];
+
+      // convert date column from string to date.
+
+      const groupByColumnNames: Array<string> = aggregateBy.groupBy
+        ? Object.keys(aggregateBy.groupBy)
+        : [];
+
+      /*
+       * Attribute-key grouping returns the selected keys folded into a
+       * single `attributes` map column (see MetricService); carry it
+       * onto the aggregated rows so series splitters can read labels.
+       */
+      if (
+        aggregateBy.groupByAttributeKeys &&
+        aggregateBy.groupByAttributeKeys.length > 0 &&
+        !groupByColumnNames.includes("attributes")
+      ) {
+        groupByColumnNames.push("attributes");
+      }
+
+      for (const item of items) {
+        if (
+          !(item as JSONObject)[
+            aggregateBy.aggregationTimestampColumnName as string
+          ]
+        ) {
+          continue;
+        }
+
+        // if value is of type string then convert it to number.
+
+        if (
+          typeof (item as JSONObject)[
+            aggregateBy.aggregateColumnName as string
+          ] === Typeof.String
+        ) {
+          (item as JSONObject)[aggregateBy.aggregateColumnName as string] =
+            Number.parseFloat(
+              (item as JSONObject)[
+                aggregateBy.aggregateColumnName as string
+              ] as string,
+            );
+        }
+
+        /*
+         * Preserve every group-by column on the aggregated row. The
+         * previous implementation only copied the first column, which
+         * silently dropped the rest when callers grouped by more than
+         * one dimension (e.g. attributes + name). `AggregatedModel`'s
+         * index signature already accepts arbitrary keys, so existing
+         * single-column consumers still work.
+         */
+        const aggregatedModel: AggregatedModel = {
+          timestamp: OneUptimeDate.fromString(
+            (item as JSONObject)[
+              aggregateBy.aggregationTimestampColumnName as string
+            ] as string,
+          ),
+          value: (item as JSONObject)[
+            aggregateBy.aggregateColumnName as string
+          ] as number,
+        };
+
+        for (const groupByColumnName of groupByColumnNames) {
+          aggregatedModel[groupByColumnName] = (item as JSONObject)[
+            groupByColumnName
+          ] as AggregatedModel[string];
+        }
+
+        aggregatedItems.push(aggregatedModel);
+      }
+
+      /*
+       * Top-K statements (see MetricService) carry the pre-trim group
+       * count as a constant `__total_groups` column on every row; lift
+       * it off the first row into result metadata. The per-row copy
+       * loop above only projects timestamp/value/group-by columns, so
+       * the helper column never reaches the rows themselves.
+       */
+      let totalGroups: number | undefined = undefined;
+      const firstItem: JSONObject | undefined = items[0];
+      if (firstItem && firstItem["__total_groups"] !== undefined) {
+        const parsedTotalGroups: number = Number(firstItem["__total_groups"]);
+        if (Number.isFinite(parsedTotalGroups)) {
+          totalGroups = parsedTotalGroups;
+        }
+      }
+
+      /*
+       * Truncation detection. Row-count == LIMIT is a heuristic (an
+       * exactly-full window reads as truncated), but a false positive
+       * only over-warns; the silent-data-loss case it exists to catch
+       * (groups × buckets > limit dropping the oldest buckets) is
+       * always flagged. Top-K truncation is exact: the ranking phase
+       * counted every matching group.
+       */
+      const appliedLimit: number = Number(aggregateBy.limit);
+      let truncated: boolean =
+        Number.isFinite(appliedLimit) &&
+        appliedLimit > 0 &&
+        items.length >= appliedLimit;
+      if (
+        aggregateBy.topK &&
+        totalGroups !== undefined &&
+        totalGroups > aggregateBy.topK.count
+      ) {
+        truncated = true;
+      }
+
+      return {
+        data: aggregatedItems,
+        ...(totalGroups !== undefined ? { totalGroups } : {}),
+        truncated,
+      };
+    } catch (error) {
+      await this.onFindError(error as Exception);
+      throw this.getException(error as Exception);
+    }
+  }
+
+  private async _findBy(
+    findBy: FindBy<TBaseModel>,
+  ): Promise<Array<TBaseModel>> {
+    try {
+      if (!findBy.sort || Object.keys(findBy.sort).length === 0) {
+        /*
+         * Default sort uses the model's declared `defaultSortColumn`
+         * (e.g. `time` for Log, `startTime` for Span) so the query
+         * streams from the ClickHouse sort key. The historical
+         * fallback of `createdAt` is not in the sort key on most
+         * analytics tables, which triggered a full sort even on
+         * small LIMITed queries.
+         */
+        const defaultSortColumn: string =
+          this.model.defaultSortColumn || "createdAt";
+        findBy.sort = {
+          [defaultSortColumn]: SortOrder.Descending,
+        } as any;
+
+        if (!findBy.select) {
+          findBy.select = {} as any;
+        }
+      }
+
+      const onFind: OnFind<TBaseModel> = findBy.props.ignoreHooks
+        ? { findBy, carryForward: [] }
+        : await this.onBeforeFind(findBy);
+      const onBeforeFind: FindBy<TBaseModel> = { ...onFind.findBy };
+      const carryForward: any = onFind.carryForward;
+
+      if (
+        !onBeforeFind.select ||
+        Object.keys(onBeforeFind.select).length === 0
+      ) {
+        onBeforeFind.select = {} as any;
+      }
+
+      /*
+       * Derived aggregate targets deliberately omit AnalyticsBaseModel's
+       * synthetic `_id`: the aggregation key is the row identity. Only force
+       * `_id` into generic reads when the model actually declares it.
+       */
+      if (
+        this.model.tableColumns.some(
+          (column: AnalyticsTableColumn): boolean => {
+            return column.key === "_id";
+          },
+        ) &&
+        !(onBeforeFind.select as any)["_id"]
+      ) {
+        (onBeforeFind.select as any)["_id"] = true;
+      }
+
+      const result: CheckReadPermissionType<TBaseModel> =
+        await ModelPermission.checkReadPermission(
+          this.modelType,
+          onBeforeFind.query,
+          onBeforeFind.select || null,
+          onBeforeFind.props,
+        );
+
+      onBeforeFind.query = result.query;
+      onBeforeFind.select = result.select || undefined;
+
+      if (!(onBeforeFind.skip instanceof PositiveNumber)) {
+        onBeforeFind.skip = new PositiveNumber(onBeforeFind.skip);
+      }
+
+      if (!(onBeforeFind.limit instanceof PositiveNumber)) {
+        onBeforeFind.limit = new PositiveNumber(onBeforeFind.limit);
+      }
+
+      const findStatement: {
+        statement: Statement;
+        columns: Array<string>;
+      } = this.toFindStatement(onBeforeFind);
+
+      const dbResult: ResultSet<"JSON"> = await this.executeQuery(
+        findStatement.statement,
+      );
+
+      logger.debug(`${this.model.tableName} Find Statement executed`, {
+        tableName: this.model.tableName,
+      } as LogAttributes);
+      logger.debug(findStatement.statement, {
+        tableName: this.model.tableName,
+      } as LogAttributes);
+
+      const responseJSON: ResponseJSON<JSONObject> =
+        await dbResult.json<JSONObject>();
+
+      const jsonItems: Array<JSONObject> = responseJSON.data;
+
+      let items: Array<TBaseModel> =
+        AnalyticsBaseModel.fromJSONArray<TBaseModel>(jsonItems, this.modelType);
+
+      if (!findBy.props.ignoreHooks) {
+        items = await (
+          await this.onFindSuccess({ findBy, carryForward }, items)
+        ).carryForward;
+      }
+
+      return items;
+    } catch (error) {
+      await this.onFindError(error as Exception);
+      throw this.getException(error as Exception);
+    }
+  }
+
+  public convertSelectReturnedDataToJson(
+    strResult: string,
+    columns: string[],
+  ): JSONObject[] {
+    if (!strResult || !strResult.trim()) {
+      return [];
+    }
+
+    const jsonItems: Array<JSONObject> = [];
+
+    const rows: Array<string> = strResult.split("\n");
+
+    for (const row of rows) {
+      if (!row) {
+        continue;
+      }
+
+      const jsonItem: JSONObject = {};
+      const values: Array<string> = row.split("\t");
+
+      for (let i: number = 0; i < columns.length; i++) {
+        jsonItem[columns[i]!] = values[i];
+
+        if (values[i] === "NULL") {
+          jsonItem[columns[i]!] = null;
+        }
+
+        if (values[i] === "\\N") {
+          jsonItem[columns[i]!] = null;
+        }
+      }
+
+      jsonItems.push(jsonItem);
+    }
+
+    return jsonItems;
+  }
+
+  protected async onBeforeDelete(
+    deleteBy: DeleteBy<TBaseModel>,
+  ): Promise<OnDelete<TBaseModel>> {
+    // A place holder method used for overriding.
+    return Promise.resolve({ deleteBy, carryForward: null });
+  }
+
+  protected async onBeforeUpdate(
+    updateBy: UpdateBy<TBaseModel>,
+  ): Promise<OnUpdate<TBaseModel>> {
+    // A place holder method used for overriding.
+    return Promise.resolve({ updateBy, carryForward: null });
+  }
+
+  protected async onBeforeFind(
+    findBy: FindBy<TBaseModel>,
+  ): Promise<OnFind<TBaseModel>> {
+    // A place holder method used for overriding.
+    return Promise.resolve({ findBy, carryForward: null });
+  }
+
+  /**
+   * Read-side retention filter. TTL is `retentionDate DELETE` with
+   * ttl_only_drop_parts=1, so a part survives until EVERY row in it has
+   * expired — rows past their per-service retention stay on disk (and
+   * were queryable) for up to a partition's worth of extra time. For
+   * models that carry a retentionDate column, every centrally generated
+   * read appends this predicate so expired rows become invisible the
+   * moment they expire rather than when their part finally drops.
+   *
+   * Returns the raw SQL fragment (server-evaluated now(), no parameter)
+   * or "" when the model has no retentionDate column.
+   */
+  protected getRetentionReadFilter(): string {
+    if (!this.model.getTableColumn("retentionDate")) {
+      return "";
+    }
+    return " AND retentionDate >= now()";
+  }
+
+  public toCountStatement(countBy: CountBy<TBaseModel>): Statement {
+    if (!this.database) {
+      this.useDefaultDatabase();
+    }
+
+    const databaseName: string = this.database.getDatasourceOptions().database!;
+
+    const whereStatement: Statement = this.statementGenerator.toWhereStatement(
+      countBy.query,
+    );
+
+    /* eslint-disable prettier/prettier */
+    const statement: Statement = SQL`
+            SELECT
+                count(`;
+
+    if (countBy.groupBy && Object.keys(countBy.groupBy).length > 0) {
+      const groupByKey: string = Object.keys(countBy.groupBy)[0] as string;
+
+      statement.append(SQL`DISTINCT ${groupByKey}`);
+    }
+
+    statement
+      .append(
+        SQL`) as count
+            FROM ${databaseName}.${this.model.tableName}
+            WHERE TRUE `,
+      )
+      .append(whereStatement)
+      .append(this.getRetentionReadFilter());
+
+    if (countBy.limit) {
+      statement.append(SQL`
+            LIMIT ${{
+              value: Number(countBy.limit),
+              type: TableColumnType.Number,
+            }}
+            `);
+    }
+
+    if (countBy.skip) {
+      statement.append(SQL`
+            OFFSET ${{
+              value: Number(countBy.skip),
+              type: TableColumnType.Number,
+            }}
+            `);
+    }
+
+    /*
+     * Cap count query runtime below the ClickHouse client's 58s
+     * request_timeout. Wide time-range queries on large tables (e.g. Span)
+     * can scan billions of rows; without a cap the query runs until the
+     * HTTP client disconnects, wasting ClickHouse resources. With 'break'
+     * mode ClickHouse returns a partial (lower-bound) count rather than
+     * throwing, which is acceptable for pagination display.
+     */
+    statement.append(
+      getQuerySettings({
+        maxExecutionTimeInSeconds: 45,
+        timeoutOverflowMode: "break",
+      }),
+    );
+
+    logger.debug(`${this.model.tableName} Count Statement`, {
+      tableName: this.model.tableName,
+    } as LogAttributes);
+    logger.debug(statement, {
+      tableName: this.model.tableName,
+    } as LogAttributes);
+
+    return statement;
+  }
+
+  public toExistsStatement(existsBy: ExistsBy<TBaseModel>): Statement {
+    if (!this.database) {
+      this.useDefaultDatabase();
+    }
+
+    const databaseName: string = this.database.getDatasourceOptions().database!;
+
+    const whereStatement: Statement = this.statementGenerator.toWhereStatement(
+      existsBy.query,
+    );
+
+    /*
+     * `SELECT 1 ... LIMIT 1` so ClickHouse stops at the first matching
+     * row instead of scanning every match like count() does. The
+     * max_execution_time cap is defense in depth; unlike the count and
+     * find statements we deliberately do NOT set timeout_overflow_mode
+     * = 'break' here, because a partial (empty) result would be read as
+     * "does not exist" — a false negative that could, for example, let a
+     * caller insert a duplicate. A LIMIT 1 over the sort key never gets
+     * near this cap in practice; if it ever did, throwing is the safe
+     * outcome.
+     */
+    /* eslint-disable prettier/prettier */
+    const statement: Statement = SQL`
+            SELECT 1 as existsFlag
+            FROM ${databaseName}.${this.model.tableName}
+            WHERE TRUE `
+      .append(whereStatement)
+      .append(this.getRetentionReadFilter());
+
+    statement.append(SQL` LIMIT 1`);
+
+    statement.append(getQuerySettings({ maxExecutionTimeInSeconds: 45 }));
+
+    logger.debug(`${this.model.tableName} Exists Statement`, {
+      tableName: this.model.tableName,
+    } as LogAttributes);
+    logger.debug(statement, {
+      tableName: this.model.tableName,
+    } as LogAttributes);
+
+    return statement;
+  }
+
+  /**
+   * The timeout_overflow_mode an aggregate statement should carry.
+   * Callers that render charts keep the 'break' default (partial
+   * buckets are acceptable there); callers that ALERT on the result —
+   * the metric-monitor worker — pass 'throw' so a timed-out evaluation
+   * fails loudly instead of silently scoring partial data.
+   *
+   * Allow-listed, never passed through: aggregateBy is deserialized
+   * wholesale from API clients and this setting is emitted into SQL as
+   * a trusted literal (see QuerySettingsHelper), so anything other than
+   * the exact string "throw" degrades to the 'break' default.
+   */
+  protected getTimeoutOverflowMode(
+    aggregateBy: AggregateBy<TBaseModel>,
+  ): TimeoutOverflowMode {
+    return aggregateBy.timeoutOverflowMode === "throw" ? "throw" : "break";
+  }
+
+  public toAggregateStatement(aggregateBy: AggregateBy<TBaseModel>): {
+    statement: Statement;
+    columns: Array<string>;
+  } {
+    /*
+     * Attribute-key grouping needs model-specific SQL over a map column
+     * (MetricService builds it); reaching this generic path with keys
+     * set would silently return ungrouped results.
+     */
+    if (
+      aggregateBy.groupByAttributeKeys &&
+      aggregateBy.groupByAttributeKeys.length > 0
+    ) {
+      throw new BadDataException(
+        `groupByAttributeKeys is not supported for ${this.model.tableName}.`,
+      );
+    }
+
+    if (!this.database) {
+      this.useDefaultDatabase();
+    }
+
+    const databaseName: string = this.database.getDatasourceOptions().database!;
+
+    const select: { statement: Statement; columns: Array<string> } =
+      this.statementGenerator.toAggregateSelectStatement(aggregateBy);
+
+    /*
+     * The aggregate SELECT aliases expressions to real column names
+     * (`sum(col) as col`, and `min(ts) as ts` under Total), so the WHERE
+     * must table-qualify its column references — unqualified ones would
+     * resolve to those aliases (ILLEGAL_AGGREGATION under Total; bucket-
+     * snapped time filters otherwise). See toWhereStatement.
+     */
+    const whereStatement: Statement = this.statementGenerator.toWhereStatement(
+      aggregateBy.query,
+      { tableAlias: this.model.tableName },
+    );
+
+    const sortStatement: Statement = this.statementGenerator.toSortStatement(
+      aggregateBy.sort!,
+    );
+
+    const statement: Statement = SQL``;
+
+    statement.append(SQL`SELECT `.append(select.statement));
+    statement.append(SQL` FROM ${databaseName}.${this.model.tableName}`);
+    statement
+      .append(SQL` WHERE TRUE `)
+      .append(whereStatement)
+      .append(this.getRetentionReadFilter());
+
+    /*
+     * The time bucket is a grouping key only when we ARE bucketing by
+     * time. For a `Total` (whole-window) aggregation the timestamp is
+     * emitted as `min(...)` — an aggregate, not a group key — so it must
+     * be left out of GROUP BY. When there is no group-by column either,
+     * the GROUP BY clause is omitted entirely (a single global row).
+     */
+    const resolvedInterval: AggregationInterval =
+      AggregateUtil.getAggregationInterval({
+        startDate: aggregateBy.startTimestamp!,
+        endDate: aggregateBy.endTimestamp!,
+        aggregationInterval: aggregateBy.aggregationInterval,
+      });
+    const bucketByTime: boolean =
+      !AggregateUtil.isTotalAggregation(resolvedInterval);
+    const hasGroupBy: boolean = Boolean(
+      aggregateBy.groupBy && Object.keys(aggregateBy.groupBy).length > 0,
+    );
+
+    if (bucketByTime) {
+      statement
+        .append(SQL` GROUP BY `)
+        .append(`${aggregateBy.aggregationTimestampColumnName.toString()}`);
+      if (hasGroupBy) {
+        statement
+          .append(SQL` , `)
+          .append(
+            this.statementGenerator.toGroupByStatement(aggregateBy.groupBy!),
+          );
+      }
+    } else if (hasGroupBy) {
+      statement
+        .append(SQL` GROUP BY `)
+        .append(
+          this.statementGenerator.toGroupByStatement(aggregateBy.groupBy!),
+        );
+    }
+
+    /*
+     * A group-less Total aggregation (`SELECT agg(...), min(ts) ...` with no
+     * GROUP BY) returns exactly one row even over an empty window —
+     * ClickHouse fills the aggregates with type defaults, so min(ts)
+     * surfaces as a 1970 epoch point. Suppress that phantom row. This is a
+     * no-op for every bucketed/grouped query (they only ever emit rows for
+     * groups that actually have data).
+     */
+    if (!bucketByTime && !hasGroupBy) {
+      statement.append(SQL` HAVING count() > 0`);
+    }
+
+    statement.append(SQL` ORDER BY `).append(sortStatement);
+
+    statement.append(
+      SQL` LIMIT ${{
+        value: Number(aggregateBy.limit),
+        type: TableColumnType.Number,
+      }}`,
+    );
+
+    statement.append(SQL` OFFSET ${{
+      value: Number(aggregateBy.skip),
+      type: TableColumnType.Number,
+    }}
+        `);
+
+    /*
+     * Aggregation read-path settings.
+     *
+     * - max_execution_time=45: cap aggregate runtime below the
+     *   ClickHouse client's 58s request_timeout, same as the count/find
+     *   statements — a wide-window aggregate over a large table would
+     *   otherwise run until the HTTP client disconnects. The overflow
+     *   mode defaults to 'break' (partial buckets are acceptable for
+     *   chart rendering) but alerting callers opt into 'throw' via
+     *   aggregateBy.timeoutOverflowMode — see getTimeoutOverflowMode.
+     * - optimize_aggregation_in_order: when GROUP BY is a prefix of the
+     *   sort key (we always group by a time bucket and the time column
+     *   is at the tail of every analytics primary key), ClickHouse can
+     *   stream rows in order and emit aggregates without an in-memory
+     *   sort, which is a large speedup on wide time ranges.
+     * - optimize_move_to_prewhere: PREWHERE is a default-on optimizer
+     *   pass; we set it explicitly so the behavior is independent of
+     *   server-side defaults.
+     * - max_threads=4: caps per-query parallelism so a single dashboard
+     *   load (which fans out to many aggregate calls) does not starve
+     *   other tenants on the cluster. Per-query latency is essentially
+     *   unchanged at 4 threads for the usual dashboard widget time
+     *   ranges, but cluster headroom is preserved under burst.
+     */
+    statement.append(
+      getQuerySettings({
+        maxExecutionTimeInSeconds: 45,
+        timeoutOverflowMode: this.getTimeoutOverflowMode(aggregateBy),
+        additionalSettings: {
+          optimize_aggregation_in_order: 1,
+          optimize_move_to_prewhere: 1,
+          max_threads: 4,
+        },
+      }),
+    );
+
+    logger.debug(`${this.model.tableName} Aggregate Statement`, {
+      tableName: this.model.tableName,
+    } as LogAttributes);
+    logger.debug(statement, {
+      tableName: this.model.tableName,
+    } as LogAttributes);
+
+    return { statement, columns: select.columns };
+  }
+
+  /**
+   * Append the unique `_id` as a final sort key so the ORDER BY is a TOTAL
+   * order.
+   *
+   * `ORDER BY time DESC` alone is not: rows tying on `time` may come back
+   * in any order, and ClickHouse is free to order them differently between
+   * two executions of the same query (part order, thread scheduling and
+   * `optimize_read_in_order` all feed into it). Paging with LIMIT/OFFSET on
+   * top of a non-total order silently drops rows at page boundaries and
+   * repeats others: a row that sat at offset 49 on page 1 can shift to
+   * offset 50 before page 2 is fetched, so nobody ever sees it.
+   *
+   * Ties are the normal case, not an edge case — a service emitting a burst
+   * of logs writes many rows with an identical timestamp.
+   *
+   * `_id` is stamped per row with `ObjectID.generateTimeOrdered()`, so it is
+   * unique and its ordering agrees with time order.
+   *
+   * Two cases must NOT get the tiebreaker:
+   * - GROUP BY queries, where `_id` is neither a grouping key nor an
+   *   aggregate, so referencing it is an error.
+   * - Models with no `_id` column: derived aggregate targets deliberately
+   *   omit it because the aggregation key is the row identity (see _findBy).
+   */
+  private toPaginationStableSort(
+    sort: Sort<TBaseModel>,
+    options: { hasGroupBy: boolean },
+  ): Sort<TBaseModel> {
+    if (options.hasGroupBy) {
+      return sort;
+    }
+
+    const sortKeys: Array<string> = Object.keys(sort || {});
+
+    // Already a total order; adding `_id` again would be a no-op term.
+    if (sortKeys.includes("_id")) {
+      return sort;
+    }
+
+    const hasIdColumn: boolean = this.model.tableColumns.some(
+      (column: AnalyticsTableColumn): boolean => {
+        return column.key === "_id";
+      },
+    );
+
+    if (!hasIdColumn) {
+      return sort;
+    }
+
+    /*
+     * Tie-break in the same direction as the last declared sort key, so a
+     * newest-first list stays newest-first within a single timestamp.
+     */
+    const lastSortKey: string | undefined = sortKeys[sortKeys.length - 1];
+
+    const direction: SortOrder =
+      (lastSortKey
+        ? ((sort as Record<string, SortOrder | undefined>)[lastSortKey] as
+            | SortOrder
+            | undefined)
+        : undefined) ?? SortOrder.Descending;
+
+    /*
+     * `_id` is absent from `sort` (checked above), so spreading appends it
+     * last and the caller's own keys keep their relative order.
+     */
+    return { ...sort, _id: direction } as Sort<TBaseModel>;
+  }
+
+  /**
+   * Bounds the rows an `ORDER BY ... , _id` find has to sort, without
+   * changing which rows it returns.
+   *
+   * ClickHouse can read in sorting-key order — and stop early — only when the
+   * ORDER BY lines up with the table's physical key. The `_id` tiebreaker
+   * appended by `toPaginationStableSort` is deliberately NOT a sorting-key
+   * column, so it denies that plan: the engine reads every row matching the
+   * WHERE, sorts the lot in memory, then discards all but one page. On the
+   * Logs viewer that turned a 100-row page into a full-window scan and tripped
+   * the 3 GiB `max_memory_usage` ceiling (Code 241, surfacing as
+   * "Server Error").
+   *
+   * Weakening the tiebreaker would reintroduce the skip/repeat paging bug it
+   * was added to fix, so bound the input instead. `min(k)` over the top
+   * `skip + limit` values of the leading sort key `k` is a rank statistic of
+   * k's MULTISET: it does not depend on which of several tied rows the inner
+   * LIMIT happened to keep. Every row that could reach position `skip + limit`
+   * satisfies `k >= min(k)`, and every row tied at the boundary value is
+   * admitted — so the page is exactly the page the unbounded query returns.
+   * That is what makes this a pure cost change: every gate below is a
+   * performance gate, and getting one wrong can only make a query slower,
+   * never lose or repeat a row.
+   *
+   * The inner pass reads one narrow key column in physical order and stops at
+   * `skip + limit` rows, so it costs far less than the wide outer read it
+   * saves.
+   *
+   * `min()` is nested over a subquery rather than taken as the N-th value via
+   * `ORDER BY k DESC LIMIT 1 OFFSET n - 1` on purpose: on a final page with
+   * fewer than `skip + limit` matching rows the latter returns no row, the
+   * scalar is NULL, `k >= NULL` is NULL, and the page comes back empty.
+   * `min()` over the available rows degrades to the smallest matching value.
+   */
+  private toSortKeyBoundaryFilter(
+    findBy: FindBy<TBaseModel>,
+    sort: Sort<TBaseModel>,
+    options: { hasGroupBy: boolean; databaseName: string },
+  ): Statement | null {
+    /*
+     * Under GROUP BY the predicate would restrict the aggregation INPUT
+     * rather than the page, so it would change results. Mirrors the
+     * tiebreaker's own exemption, leaving grouped finds byte-identical.
+     */
+    if (options.hasGroupBy) {
+      return null;
+    }
+
+    /*
+     * Without an `_id` column there is no off-key tiebreaker — the six
+     * `includeBaseColumns: false` aggregate targets — so the ORDER BY is
+     * already key-aligned and the bound would be pure overhead. Same
+     * condition toPaginationStableSort bails on.
+     */
+    const hasIdColumn: boolean = this.model.tableColumns.some(
+      (column: AnalyticsTableColumn): boolean => {
+        return column.key === "_id";
+      },
+    );
+
+    if (!hasIdColumn) {
+      return null;
+    }
+
+    const leadingSortKey: string | undefined = Object.keys(sort || {})[0];
+
+    if (!leadingSortKey) {
+      return null;
+    }
+
+    /*
+     * Only a column in the physical sorting key can be read in order, so
+     * only there can the off-key `_id` term have cost anything. Off-key
+     * leads (e.g. Log by `severityText`) already plan a bounded top-N and
+     * an extra pass would be pure waste.
+     */
+    if (!this.model.sortKeys.includes(leadingSortKey)) {
+      return null;
+    }
+
+    /*
+     * A non-required column is `Nullable(...)` in the DDL, and `k >= NULL`
+     * is NULL — the predicate would DROP those rows rather than just
+     * narrowing the scan. Fail safe to today's behavior.
+     */
+    const leadingSortColumn: AnalyticsTableColumn | null =
+      this.model.getTableColumn(leadingSortKey);
+
+    if (!leadingSortColumn || !leadingSortColumn.required) {
+      return null;
+    }
+
+    /*
+     * `findOneById` funnels a point lookup through `findOneBy` carrying the
+     * model's default sort. At most one row can match, so bounding it would
+     * double a query that has no ordering problem to begin with.
+     */
+    if ((findBy.query as Record<string, unknown> | undefined)?.["_id"]) {
+      return null;
+    }
+
+    /*
+     * The predicate is valid only BECAUSE of LIMIT/OFFSET: it admits the
+     * rows that can reach position `skip + limit` and no more. Guards the
+     * `new PositiveNumber(undefined)` -> NaN path that exists upstream.
+     */
+    const limit: number = Number(findBy.limit);
+    const skip: number = Number(findBy.skip);
+
+    if (!Number.isFinite(limit) || !Number.isFinite(skip)) {
+      return null;
+    }
+
+    const boundaryRowCount: number = skip + limit;
+
+    if (boundaryRowCount <= 0) {
+      return null;
+    }
+
+    const isDescending: boolean =
+      (sort as Record<string, SortOrder | undefined>)[leadingSortKey] !==
+      SortOrder.Ascending;
+
+    /*
+     * The bound must be computed over the same row set the outer query
+     * filters on, so the WHERE is regenerated rather than shared: appending
+     * one Statement into two places would bind its parameters twice.
+     */
+    const boundaryWhereStatement: Statement =
+      this.statementGenerator.toWhereStatement(findBy.query);
+
+    const boundaryStatement: Statement = SQL` AND ${leadingSortKey} `;
+
+    boundaryStatement.append(isDescending ? SQL`>=` : SQL`<=`);
+    boundaryStatement.append(
+      isDescending
+        ? SQL` (SELECT min(${leadingSortKey}) FROM (SELECT ${leadingSortKey} FROM ${options.databaseName}.${this.model.tableName} WHERE TRUE `
+        : SQL` (SELECT max(${leadingSortKey}) FROM (SELECT ${leadingSortKey} FROM ${options.databaseName}.${this.model.tableName} WHERE TRUE `,
+    );
+    boundaryStatement.append(boundaryWhereStatement);
+    boundaryStatement.append(this.getRetentionReadFilter());
+    boundaryStatement.append(SQL` ORDER BY ${leadingSortKey} `);
+    boundaryStatement.append(isDescending ? SQL`DESC` : SQL`ASC`);
+    boundaryStatement.append(
+      SQL` LIMIT ${{
+        value: boundaryRowCount,
+        type: TableColumnType.Number,
+      }}))`,
+    );
+
+    return boundaryStatement;
+  }
+
+  public toFindStatement(findBy: FindBy<TBaseModel>): {
+    statement: Statement;
+    columns: Array<string>;
+  } {
+    if (!this.database) {
+      this.useDefaultDatabase();
+    }
+
+    const databaseName: string = this.database.getDatasourceOptions().database!;
+    let groupByStatement: Statement | null = null;
+
+    if (findBy.groupBy && Object.keys(findBy.groupBy).length > 0) {
+      // overwrite select object
+      findBy.select = {
+        ...findBy.groupBy,
+      };
+
+      groupByStatement = this.statementGenerator.toGroupByStatement(
+        findBy.groupBy,
+      );
+    }
+
+    const select: { statement: Statement; columns: Array<string> } =
+      this.statementGenerator.toSelectStatement(findBy.select!);
+
+    const whereStatement: Statement = this.statementGenerator.toWhereStatement(
+      findBy.query,
+    );
+
+    const sortStatement: Statement = this.statementGenerator.toSortStatement(
+      this.toPaginationStableSort(findBy.sort!, {
+        hasGroupBy: Boolean(groupByStatement),
+      }),
+    );
+
+    /*
+     * Keeps the `_id` tiebreaker affordable. Result-preserving by
+     * construction, so it is appended to the WHERE without touching the
+     * ORDER BY above. Null whenever the bound cannot help or cannot be
+     * proven safe.
+     */
+    const sortKeyBoundaryStatement: Statement | null =
+      this.toSortKeyBoundaryFilter(findBy, findBy.sort!, {
+        hasGroupBy: Boolean(groupByStatement),
+        databaseName: databaseName,
+      });
+
+    const statement: Statement = SQL``;
+
+    statement.append(SQL`SELECT `.append(select.statement));
+    statement.append(SQL` FROM ${databaseName}.${this.model.tableName}`);
+    statement
+      .append(SQL` WHERE TRUE `)
+      .append(whereStatement)
+      .append(this.getRetentionReadFilter());
+
+    if (sortKeyBoundaryStatement) {
+      statement.append(sortKeyBoundaryStatement);
+    }
+
+    if (groupByStatement) {
+      statement.append(SQL` GROUP BY `).append(groupByStatement);
+    }
+
+    statement.append(SQL` ORDER BY `).append(sortStatement);
+
+    statement.append(
+      SQL` LIMIT ${{
+        value: Number(findBy.limit),
+        type: TableColumnType.Number,
+      }}`,
+    );
+
+    statement.append(SQL` OFFSET ${{
+      value: Number(findBy.skip),
+      type: TableColumnType.Number,
+    }}
+        `);
+
+    /*
+     * Defense in depth: cap find-query runtime below the ClickHouse
+     * client's 58s request_timeout. The LIMIT clause keeps most queries
+     * fast, but complex WHERE filters (e.g. parentSpanId IS NULL) on
+     * wide time ranges can still cause long scans. 'break' mode returns
+     * partial results rather than throwing.
+     */
+    statement.append(
+      getQuerySettings({
+        maxExecutionTimeInSeconds: 45,
+        timeoutOverflowMode: "break",
+      }),
+    );
+
+    logger.debug(`${this.model.tableName} Find Statement`, {
+      tableName: this.model.tableName,
+    } as LogAttributes);
+    logger.debug(statement, {
+      tableName: this.model.tableName,
+    } as LogAttributes);
+
+    return { statement, columns: select.columns };
+  }
+
+  public toDeleteStatement(deleteBy: DeleteBy<TBaseModel>): Statement {
+    if (!this.database) {
+      this.useDefaultDatabase();
+    }
+
+    const databaseName: string = this.database.getDatasourceOptions().database!;
+    const whereStatement: Statement = this.statementGenerator.toWhereStatement(
+      deleteBy.query,
+    );
+
+    /*
+     * Lightweight `DELETE FROM` cannot target a Distributed table and does not
+     * accept `ON CLUSTER`, so deletes are an `ALTER TABLE <local> ON CLUSTER …
+     * DELETE` mutation dispatched to every shard (and replicated within each
+     * shard via Keeper). ALTER ... DELETE mutations are bounded by
+     * `number_of_mutations_to_throw` (default 1000) — but deletes are rare here
+     * (retention is handled by TTL), so the queue does not accumulate.
+     */
+    /* eslint-disable prettier/prettier */
+    const localTableName: string = getStorageTableName(this.model.tableName);
+    const statement: Statement = SQL`
+            ALTER TABLE ${databaseName}.${localTableName}`
+      .append(onClusterClause())
+      .append(
+        SQL`
+            DELETE WHERE TRUE `,
+      )
+      .append(whereStatement);
+
+    logger.debug(`${this.model.tableName} Delete Statement`, {
+      tableName: this.model.tableName,
+    } as LogAttributes);
+    logger.debug(statement, {
+      tableName: this.model.tableName,
+    } as LogAttributes);
+
+    return statement;
+  }
+
+  @CaptureSpan()
+  public async findOneBy(
+    findOneBy: FindOneBy<TBaseModel>,
+  ): Promise<TBaseModel | null> {
+    const findBy: FindBy<TBaseModel> = findOneBy as FindBy<TBaseModel>;
+    findBy.limit = new PositiveNumber(1);
+    findBy.skip = new PositiveNumber(0);
+
+    const documents: Array<TBaseModel> = await this._findBy(findBy);
+
+    if (documents && documents[0]) {
+      return documents[0];
+    }
+    return null;
+  }
+
+  @CaptureSpan()
+  public async deleteBy(deleteBy: DeleteBy<TBaseModel>): Promise<void> {
+    return await this._deleteBy(deleteBy);
+  }
+
+  private async _deleteBy(deleteBy: DeleteBy<TBaseModel>): Promise<void> {
+    try {
+      const onDelete: OnDelete<TBaseModel> = deleteBy.props.ignoreHooks
+        ? { deleteBy, carryForward: [] }
+        : await this.onBeforeDelete(deleteBy);
+
+      const beforeDeleteBy: DeleteBy<TBaseModel> = onDelete.deleteBy;
+
+      beforeDeleteBy.query = await ModelPermission.checkDeletePermission(
+        this.modelType,
+        beforeDeleteBy.query,
+        deleteBy.props,
+      );
+
+      const select: Select<TBaseModel> = {};
+
+      const tenantColumnName: string | null =
+        this.getModel().getTenantColumn()?.key || null;
+
+      if (tenantColumnName) {
+        (select as any)[tenantColumnName] = true;
+      }
+
+      const deleteStatement: Statement = this.toDeleteStatement(beforeDeleteBy);
+
+      await this.execute(deleteStatement);
+
+      logger.debug(`${this.model.tableName} Delete Statement executed`, {
+        tableName: this.model.tableName,
+      } as LogAttributes);
+      logger.debug(deleteStatement, {
+        tableName: this.model.tableName,
+      } as LogAttributes);
+    } catch (error) {
+      await this.onDeleteError(error as Exception);
+      throw this.getException(error as Exception);
+    }
+  }
+
+  @CaptureSpan()
+  public async findOneById(
+    findOneById: FindOneByID<TBaseModel>,
+  ): Promise<TBaseModel | null> {
+    if (!findOneById.id) {
+      throw new BadDataException("findOneById.id is required");
+    }
+
+    return await this.findOneBy({
+      query: {
+        _id: findOneById.id,
+      },
+      select: findOneById.select || {},
+      props: findOneById.props,
+    });
+  }
+
+  @CaptureSpan()
+  public async updateBy(updateBy: UpdateBy<TBaseModel>): Promise<void> {
+    await this._updateBy(updateBy);
+  }
+
+  private async _updateBy(updateBy: UpdateBy<TBaseModel>): Promise<void> {
+    try {
+      const onUpdate: OnUpdate<TBaseModel> = updateBy.props.ignoreHooks
+        ? { updateBy, carryForward: [] }
+        : await this.onBeforeUpdate(updateBy);
+
+      const beforeUpdateBy: UpdateBy<TBaseModel> = onUpdate.updateBy;
+
+      beforeUpdateBy.query = await ModelPermission.checkUpdatePermissions(
+        this.modelType,
+        beforeUpdateBy.query,
+        beforeUpdateBy.data,
+        beforeUpdateBy.props,
+      );
+
+      const select: Select<TBaseModel> = {};
+
+      const tenantColumnName: string | null =
+        this.getModel().getTenantColumn()?.key || null;
+
+      if (tenantColumnName) {
+        (select as any)[tenantColumnName] = true;
+      }
+
+      const statement: Statement =
+        this.statementGenerator.toUpdateStatement(beforeUpdateBy);
+
+      await this.execute(statement);
+
+      logger.debug(`${this.model.tableName} Update Statement executed`, {
+        tableName: this.model.tableName,
+      } as LogAttributes);
+      logger.debug(statement, {
+        tableName: this.model.tableName,
+      } as LogAttributes);
+    } catch (error) {
+      await this.onUpdateError(error as Exception);
+      throw this.getException(error as Exception);
+    }
+  }
+
+  protected generateDefaultValues(data: TBaseModel): TBaseModel {
+    const tableColumns: Array<AnalyticsTableColumn> = data.getTableColumns();
+
+    for (const column of tableColumns) {
+      if (column.forceGetDefaultValueOnCreate) {
+        data.setColumnValue(column.key, column.forceGetDefaultValueOnCreate());
+      }
+    }
+
+    return data;
+  }
+
+  public useDefaultDatabase(): void {
+    this.database = ClickhouseAppInstance;
+    this.databaseClient = this.database.getDataSource();
+    this.ingestDatabase = ClickhouseIngestInstance;
+    this.ingestDatabaseClient = this.ingestDatabase.getDataSource();
+    this.migrationDatabase = ClickhouseMigrationInstance;
+    this.migrationDatabaseClient = this.migrationDatabase.getDataSource();
+  }
+
+  @CaptureSpan()
+  public async execute(
+    statement: Statement | string,
+    options?: ClickhouseExecuteOptions,
+  ): Promise<ExecResult<Stream>> {
+    const client: ClickhouseClient = options?.useMigrationConnection
+      ? this.getMigrationClient()
+      : this.getDatabaseClient();
+
+    const query: string =
+      statement instanceof Statement ? statement.query : statement;
+    const queryParams: Record<string, unknown> | undefined =
+      statement instanceof Statement ? statement.query_params : undefined;
+
+    return (await client.exec({
+      query: query,
+      query_params: queryParams || (undefined as any), // undefined is not specified in the type for query_params, but its ok to pass undefined.
+      ...(options?.clickhouseSettings
+        ? { clickhouse_settings: options.clickhouseSettings }
+        : {}),
+      ...(options?.queryId ? { query_id: options.queryId } : {}),
+    })) as ExecResult<Stream>;
+  }
+
+  @CaptureSpan()
+  public async executeQuery(
+    statement: Statement | string,
+    options?: ClickhouseExecuteOptions,
+  ): Promise<ResultSet<"JSON">> {
+    const client: ClickhouseClient = options?.useMigrationConnection
+      ? this.getMigrationClient()
+      : this.getDatabaseClient();
+
+    const query: string =
+      statement instanceof Statement ? statement.query : statement;
+    const queryParams: Record<string, unknown> | undefined =
+      statement instanceof Statement ? statement.query_params : undefined;
+
+    return await client.query({
+      query: query,
+      format: "JSON",
+      query_params: queryParams || (undefined as any), // undefined is not specified in the type for query_params, but its ok to pass undefined.
+      ...(options?.clickhouseSettings
+        ? { clickhouse_settings: options.clickhouseSettings }
+        : {}),
+      ...(options?.queryId ? { query_id: options.queryId } : {}),
+    });
+  }
+
+  private getDatabaseClient(): ClickhouseClient {
+    /*
+     * Refresh the ClickHouse client lazily so services created before the
+     * ClickHouse connection was established pick up the live client.
+     */
+    if (!this.database) {
+      this.useDefaultDatabase();
+    }
+
+    if (!this.databaseClient && this.database) {
+      this.databaseClient = this.database.getDataSource();
+    }
+
+    if (!this.databaseClient) {
+      throw new Exception(
+        ExceptionCode.DatabaseNotConnectedException,
+        "ClickHouse client is not connected",
+      );
+    }
+
+    return this.databaseClient;
+  }
+
+  private getIngestClient(): ClickhouseClient {
+    if (!this.ingestDatabase) {
+      this.useDefaultDatabase();
+    }
+
+    if (!this.ingestDatabaseClient && this.ingestDatabase) {
+      this.ingestDatabaseClient = this.ingestDatabase.getDataSource();
+    }
+
+    if (!this.ingestDatabaseClient) {
+      throw new Exception(
+        ExceptionCode.DatabaseNotConnectedException,
+        "ClickHouse ingest client is not connected",
+      );
+    }
+
+    return this.ingestDatabaseClient;
+  }
+
+  private getMigrationClient(): ClickhouseClient {
+    if (!this.migrationDatabase) {
+      this.useDefaultDatabase();
+    }
+
+    if (!this.migrationDatabaseClient && this.migrationDatabase) {
+      this.migrationDatabaseClient = this.migrationDatabase.getDataSource();
+    }
+
+    if (!this.migrationDatabaseClient) {
+      throw new Exception(
+        ExceptionCode.DatabaseNotConnectedException,
+        "ClickHouse migration client is not connected",
+      );
+    }
+
+    return this.migrationDatabaseClient;
+  }
+
+  protected async onUpdateSuccess(
+    onUpdate: OnUpdate<TBaseModel>,
+    _updatedItemIds: Array<ObjectID>,
+  ): Promise<OnUpdate<TBaseModel>> {
+    // A place holder method used for overriding.
+    return Promise.resolve(onUpdate);
+  }
+
+  protected async onUpdateError(error: Exception): Promise<Exception> {
+    // A place holder method used for overriding.
+    return Promise.resolve(error);
+  }
+
+  protected async onDeleteSuccess(
+    onDelete: OnDelete<TBaseModel>,
+    _itemIdsBeforeDelete: Array<ObjectID>,
+  ): Promise<OnDelete<TBaseModel>> {
+    // A place holder method used for overriding.
+    return Promise.resolve(onDelete);
+  }
+
+  protected async onDeleteError(error: Exception): Promise<Exception> {
+    // A place holder method used for overriding.
+    return Promise.resolve(error);
+  }
+
+  protected async onFindSuccess(
+    onFind: OnFind<TBaseModel>,
+    items: Array<TBaseModel>,
+  ): Promise<OnFind<TBaseModel>> {
+    // A place holder method used for overriding.
+    return Promise.resolve({ ...onFind, carryForward: items });
+  }
+
+  protected async onFindError(error: Exception): Promise<Exception> {
+    // A place holder method used for overriding.
+    return Promise.resolve(error);
+  }
+
+  protected async onCountSuccess(
+    count: PositiveNumber,
+  ): Promise<PositiveNumber> {
+    // A place holder method used for overriding.
+    return Promise.resolve(count);
+  }
+
+  protected async onCountError(error: Exception): Promise<Exception> {
+    // A place holder method used for overriding.
+    return Promise.resolve(error);
+  }
+
+  protected async onCreateSuccess(
+    _onCreate: OnCreate<TBaseModel>,
+    createdItem: TBaseModel,
+  ): Promise<TBaseModel> {
+    // A place holder method used for overriding.
+    return Promise.resolve(createdItem);
+  }
+
+  protected async onBeforeCreate(
+    createBy: CreateBy<TBaseModel>,
+  ): Promise<OnCreate<TBaseModel>> {
+    // A place holder method used for overriding.
+    return Promise.resolve({
+      createBy: createBy as CreateBy<TBaseModel>,
+      carryForward: undefined,
+    });
+  }
+
+  private async _onBeforeCreate(
+    createBy: CreateBy<TBaseModel>,
+  ): Promise<OnCreate<TBaseModel>> {
+    // Private method that runs before create.
+    const projectIdColumn: string | null =
+      this.model.getTenantColumn()?.key || null;
+
+    if (projectIdColumn && createBy.props.tenantId) {
+      (createBy.data as any)[projectIdColumn] = createBy.props.tenantId;
+    }
+
+    return await this.onBeforeCreate(createBy);
+  }
+
+  @CaptureSpan()
+  public async createMany(
+    createBy: CreateManyBy<TBaseModel>,
+  ): Promise<Array<TBaseModel>> {
+    // add tenantId if present.
+    const tenantColumnName: string | null =
+      this.model.getTenantColumn()?.key || null;
+
+    const items: Array<TBaseModel> = [];
+    const carryForwards: Array<any> = [];
+
+    for (const item of createBy.items) {
+      let data: TBaseModel = item;
+
+      const onCreate: OnCreate<TBaseModel> = createBy.props.ignoreHooks
+        ? {
+            createBy: {
+              data: data,
+              props: createBy.props,
+            },
+            carryForward: [],
+          }
+        : await this._onBeforeCreate({
+            data: data,
+            props: createBy.props,
+          });
+
+      data = onCreate.createBy.data;
+
+      const carryForward: any = onCreate.carryForward;
+
+      carryForwards.push(carryForward);
+
+      if (tenantColumnName && createBy.props.tenantId) {
+        data.setColumnValue(tenantColumnName, createBy.props.tenantId);
+      }
+
+      data = this.sanitizeCreate(data);
+      data = this.generateDefaultValues(data);
+      data = this.checkRequiredFields(data);
+
+      if (!this.isValid(data)) {
+        throw new BadDataException("Data is not valid");
+      }
+
+      // check total items by
+
+      ModelPermission.checkCreatePermissions(
+        this.modelType,
+        data,
+        createBy.props,
+      );
+
+      items.push(data);
+    }
+
+    try {
+      const insertStatement: string = this.statementGenerator.toCreateStatement(
+        { item: items },
+      );
+
+      await this.execute(insertStatement);
+
+      logger.debug(`${this.model.tableName} Create Statement executed`, {
+        tableName: this.model.tableName,
+      } as LogAttributes);
+      logger.debug(insertStatement, {
+        tableName: this.model.tableName,
+      } as LogAttributes);
+
+      if (!createBy.props.ignoreHooks) {
+        for (let i: number = 0; i < items.length; i++) {
+          if (!items[i]) {
+            continue;
+          }
+
+          items[i] = await this.onCreateSuccess(
+            {
+              createBy: {
+                data: items[i]!,
+                props: createBy.props,
+              },
+              carryForward: carryForwards[i],
+            },
+            items[i]!,
+          );
+        }
+      }
+
+      // hit workflow.;
+      if (this.getModel().enableWorkflowOn?.create) {
+        let tenantId: ObjectID | undefined = createBy.props.tenantId;
+
+        for (const item of items) {
+          if (!tenantId && this.getModel().getTenantColumn()) {
+            tenantId = item.getColumnValue<ObjectID>(
+              this.getModel().getTenantColumn()!.key,
+            );
+          }
+
+          if (tenantId) {
+            await this.onTrigger(item.id!, tenantId, "on-create");
+          }
+        }
+      }
+
+      // emit realtime events to the client.
+      if (
+        this.getModel().enableRealtimeEventsOn?.create &&
+        this.model.getTenantColumn()
+      ) {
+        if (Realtime.isInitialized()) {
+          const promises: Array<Promise<void>> = [];
+
+          for (const item of items) {
+            const tenantId: ObjectID | null = item.getTenantColumnValue();
+
+            if (!tenantId) {
+              continue;
+            }
+
+            promises.push(
+              Realtime.emitModelEvent({
+                modelId: item.id!,
+                tenantId: tenantId,
+                eventType: ModelEventType.Create,
+                modelType: this.modelType,
+              }),
+            );
+          }
+
+          await Promise.allSettled(promises);
+        } else {
+          logger.warn(
+            `Realtime is not initialized. Skipping emitModelEvent for ${
+              this.getModel().tableName
+            }`,
+            { tableName: this.getModel().tableName } as LogAttributes,
+          );
+        }
+      }
+
+      return createBy.items;
+    } catch (error) {
+      await this.onCreateError(error as Exception);
+      throw this.getException(error as Exception);
+    }
+  }
+
+  @CaptureSpan()
+  public async create(createBy: CreateBy<TBaseModel>): Promise<TBaseModel> {
+    const items: Array<TBaseModel> = await this.createMany({
+      props: createBy.props,
+      items: [createBy.data],
+    });
+
+    const item: TBaseModel | undefined = items[0];
+
+    if (!item) {
+      throw new BadDataException("Item not created");
+    }
+
+    return item;
+  }
+
+  private sanitizeCreate<TBaseModel extends AnalyticsBaseModel>(
+    data: TBaseModel,
+  ): TBaseModel {
+    if (!data.id) {
+      data.id = ObjectID.generateTimeOrdered();
+    }
+
+    data.createdAt = OneUptimeDate.getCurrentDate();
+
+    return data;
+  }
+
+  /*
+   * Rethrow hook for the catch blocks below. MUST stay synchronous and
+   * `never`-returning: the call sites use `throw this.getException(error)`,
+   * so if this were `async` it would return a Promise that `throw` then
+   * throws verbatim (never awaited) — the real exception is lost, callers up
+   * the stack catch a bare Promise (surfacing as "[object Promise]"), and the
+   * un-awaited rejection becomes an unhandled rejection. Throwing directly
+   * propagates the original exception on the synchronous throw path.
+   */
+  protected getException(error: Exception): never {
+    throw error;
+  }
+
+  protected async onCreateError(error: Exception): Promise<Exception> {
+    // A place holder method used for overriding.
+    return Promise.resolve(error);
+  }
+
+  protected isValid(data: TBaseModel): boolean {
+    if (!data) {
+      throw new BadDataException("Data cannot be null");
+    }
+
+    return true;
+  }
+
+  @CaptureSpan()
+  public async onTrigger(
+    id: ObjectID,
+    projectId: ObjectID,
+    triggerType: DatabaseTriggerType,
+  ): Promise<void> {
+    if (this.getModel().enableWorkflowOn) {
+      API.post({
+        url: new URL(
+          Protocol.HTTP,
+          WorkflowHostname,
+          new Route(
+            `/${WorkflowRoute.toString()}/analytics-model/${projectId.toString()}/${Text.pascalCaseToDashes(
+              this.getModel().tableName!,
+            )}/${triggerType}`,
+          ),
+        ),
+        data: {
+          _id: id.toString(),
+        },
+        headers: {
+          ...ClusterKeyAuthorization.getClusterKeyHeaders(),
+        },
+      }).catch((error: Error) => {
+        logger.error(error, {
+          projectId: projectId?.toString(),
+          tableName: this.getModel().tableName,
+        } as LogAttributes);
+      });
+    }
+  }
+
+  protected checkRequiredFields(data: TBaseModel): TBaseModel {
+    // Check required fields.
+
+    for (const columns of data.getRequiredColumns()) {
+      const requiredField: string = columns.key;
+      const value: unknown = (data as any)[requiredField];
+
+      /*
+       * A present value satisfies the requirement — including `false`, `0` and
+       * `""`, which are all valid column values. Only a genuinely absent value
+       * (null/undefined) triggers a default-fill or a validation error.
+       *
+       * This deliberately treats booleans like every other type. The previous
+       * implementation special-cased booleans with `!val && val !== false`,
+       * which can never be true for a real boolean, so it threw for EVERY
+       * required boolean (both true and false) — making any required Boolean
+       * column impossible to insert via createMany.
+       */
+      if (value !== null && value !== undefined) {
+        continue;
+      }
+
+      if (data.isDefaultValueColumn(requiredField)) {
+        // add default value.
+        data.setColumnValue(
+          requiredField,
+          data.getDefaultValueForColumn(requiredField),
+        );
+      } else {
+        throw new BadDataException(`${requiredField} is required`);
+      }
+    }
+
+    return data;
+  }
+
+  public getModel(): TBaseModel {
+    return this.model;
+  }
+}

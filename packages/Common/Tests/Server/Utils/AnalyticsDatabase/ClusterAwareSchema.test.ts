@@ -1,0 +1,507 @@
+import { ClickhouseAppInstance } from "../../../../Server/Infrastructure/ClickhouseDatabase";
+import StatementGenerator from "../../../../Server/Utils/AnalyticsDatabase/StatementGenerator";
+import {
+  SQL,
+  Statement,
+} from "../../../../Server/Utils/AnalyticsDatabase/Statement";
+import {
+  adaptTableSettingsForStorage,
+  applyClusterToMaterializedViewQuery,
+  getClickhouseClusterName,
+  getDistributedDdlTaskTimeoutSeconds,
+  getDistributedEngine,
+  getStorageEngine,
+  getStorageTableName,
+  onClusterClause,
+} from "../../../../Server/Utils/AnalyticsDatabase/ClusterConfig";
+import UpdateBy from "../../../../Server/Types/AnalyticsDatabase/UpdateBy";
+import "../../TestingUtils/Init";
+import AnalyticsBaseModel, {
+  AnalyticsBaseModelType,
+} from "../../../../Models/AnalyticsModels/AnalyticsBaseModel/AnalyticsBaseModel";
+import Route from "../../../../Types/API/Route";
+import AnalyticsTableEngine from "../../../../Types/AnalyticsDatabase/AnalyticsTableEngine";
+import AnalyticsTableColumn, {
+  SkipIndexType,
+} from "../../../../Types/AnalyticsDatabase/TableColumn";
+import TableColumnType from "../../../../Types/AnalyticsDatabase/TableColumnType";
+import MetricItemAggMV1m from "../../../../Models/AnalyticsModels/MetricItemAggMV1m";
+import MetricItemAggMV1mByHostV2 from "../../../../Models/AnalyticsModels/MetricItemAggMV1mByHostV2";
+import MetricItemAggMV1mByService from "../../../../Models/AnalyticsModels/MetricItemAggMV1mByService";
+import MetricItemAggMV1mByK8sCluster from "../../../../Models/AnalyticsModels/MetricItemAggMV1mByK8sCluster";
+import MetricItemAggMV1mByContainer from "../../../../Models/AnalyticsModels/MetricItemAggMV1mByContainer";
+import MetricBaselineHourly from "../../../../Models/AnalyticsModels/MetricBaselineHourly";
+import SpanCountBaseline from "../../../../Models/AnalyticsModels/SpanCountBaseline";
+import LogCountBaseline from "../../../../Models/AnalyticsModels/LogCountBaseline";
+
+const CLUSTER_ENV_KEY: string = "CLICKHOUSE_CLUSTER_NAME";
+const SHARDING_ENV_KEY: string = "CLICKHOUSE_SHARDING_KEY";
+const DDL_TIMEOUT_ENV_KEY: string =
+  "CLICKHOUSE_DISTRIBUTED_DDL_TASK_TIMEOUT_SECONDS";
+
+/*
+ * Flatten a Statement into a single string (raw SQL + serialized identifier
+ * params) so assertions don't have to care whether a name landed in the query
+ * text or in query_params as a {pN:Identifier} parameter.
+ */
+function fullText(statement: Statement | string): string {
+  if (typeof statement === "string") {
+    return statement;
+  }
+  return statement.query + " :: " + JSON.stringify(statement.query_params);
+}
+
+describe("ClickHouse cluster-aware schema (always-on)", () => {
+  const originalCluster: string | undefined = process.env[CLUSTER_ENV_KEY];
+  const originalSharding: string | undefined = process.env[SHARDING_ENV_KEY];
+  const originalDdlTimeout: string | undefined =
+    process.env[DDL_TIMEOUT_ENV_KEY];
+
+  afterEach(() => {
+    if (originalCluster === undefined) {
+      delete process.env[CLUSTER_ENV_KEY];
+    } else {
+      process.env[CLUSTER_ENV_KEY] = originalCluster;
+    }
+    if (originalSharding === undefined) {
+      delete process.env[SHARDING_ENV_KEY];
+    } else {
+      process.env[SHARDING_ENV_KEY] = originalSharding;
+    }
+    if (originalDdlTimeout === undefined) {
+      delete process.env[DDL_TIMEOUT_ENV_KEY];
+    } else {
+      process.env[DDL_TIMEOUT_ENV_KEY] = originalDdlTimeout;
+    }
+  });
+
+  describe("ClusterConfig helpers", () => {
+    test("cluster name defaults to 'oneuptime' and is overridable", () => {
+      delete process.env[CLUSTER_ENV_KEY];
+      expect(getClickhouseClusterName()).toBe("oneuptime");
+      expect(onClusterClause()).toBe(" ON CLUSTER 'oneuptime'");
+
+      process.env[CLUSTER_ENV_KEY] = "ext_cluster";
+      expect(getClickhouseClusterName()).toBe("ext_cluster");
+      expect(onClusterClause()).toBe(" ON CLUSTER 'ext_cluster'");
+
+      // whitespace-only falls back to the default
+      process.env[CLUSTER_ENV_KEY] = "   ";
+      expect(getClickhouseClusterName()).toBe("oneuptime");
+    });
+
+    test("storage table name always gets the Local suffix", () => {
+      expect(getStorageTableName("SpanItemV3")).toBe("SpanItemV3Local");
+    });
+
+    test("engines always map to their Replicated variant", () => {
+      expect(getStorageEngine(AnalyticsTableEngine.MergeTree)).toBe(
+        "ReplicatedMergeTree",
+      );
+      expect(getStorageEngine(AnalyticsTableEngine.AggregatingMergeTree)).toBe(
+        "ReplicatedAggregatingMergeTree",
+      );
+    });
+
+    test("table settings always swap to the replicated dedup window", () => {
+      expect(
+        adaptTableSettingsForStorage(
+          "ttl_only_drop_parts = 1, non_replicated_deduplication_window = 10000",
+        ),
+      ).toBe(
+        "ttl_only_drop_parts = 1, replicated_deduplication_window = 10000",
+      );
+    });
+
+    test("distributed DDL task timeout: default 180, overridable, garbage-safe", () => {
+      delete process.env[DDL_TIMEOUT_ENV_KEY];
+      expect(getDistributedDdlTaskTimeoutSeconds()).toBe(180);
+
+      process.env[DDL_TIMEOUT_ENV_KEY] = "1800";
+      expect(getDistributedDdlTaskTimeoutSeconds()).toBe(1800);
+
+      // ClickHouse semantics pass through: 0 = async, negative = no server cap.
+      process.env[DDL_TIMEOUT_ENV_KEY] = "0";
+      expect(getDistributedDdlTaskTimeoutSeconds()).toBe(0);
+      process.env[DDL_TIMEOUT_ENV_KEY] = "-1";
+      expect(getDistributedDdlTaskTimeoutSeconds()).toBe(-1);
+
+      // Garbage and whitespace fall back to the default.
+      process.env[DDL_TIMEOUT_ENV_KEY] = "not-a-number";
+      expect(getDistributedDdlTaskTimeoutSeconds()).toBe(180);
+      process.env[DDL_TIMEOUT_ENV_KEY] = "   ";
+      expect(getDistributedDdlTaskTimeoutSeconds()).toBe(180);
+    });
+
+    test("distributed engine: model key, with global override winning", () => {
+      delete process.env[SHARDING_ENV_KEY];
+      // model sharding key is used
+      expect(
+        getDistributedEngine("SpanItemV3Local", "cityHash64(traceId)"),
+      ).toContain("SpanItemV3Local, cityHash64(traceId))");
+      // no model key -> default cityHash64(projectId)
+      expect(getDistributedEngine("LogItemV3Local")).toContain(
+        "cityHash64(projectId))",
+      );
+      // global override wins over the model key
+      process.env[SHARDING_ENV_KEY] = "rand()";
+      expect(
+        getDistributedEngine("SpanItemV3Local", "cityHash64(traceId)"),
+      ).toContain("SpanItemV3Local, rand())");
+    });
+  });
+
+  describe("StatementGenerator DDL", () => {
+    class SpanModel extends AnalyticsBaseModel {
+      public constructor() {
+        super({
+          tableName: "SpanItemV3",
+          singularName: "Span",
+          pluralName: "Spans",
+          tableColumns: [
+            new AnalyticsTableColumn({
+              key: "projectId",
+              title: "Project",
+              description: "Project",
+              required: true,
+              type: TableColumnType.ObjectID,
+            }),
+            new AnalyticsTableColumn({
+              key: "traceId",
+              title: "Trace",
+              description: "Trace",
+              required: true,
+              type: TableColumnType.Text,
+              skipIndex: {
+                name: "idx_trace_id",
+                type: SkipIndexType.BloomFilter,
+                params: [0.01],
+                granularity: 1,
+              },
+            }),
+          ],
+          crudApiPath: new Route("span"),
+          primaryKeys: ["projectId"],
+          sortKeys: ["projectId"],
+          partitionKey: "toYYYYMMDD(startTime)",
+          shardingKey: "cityHash64(traceId)",
+          tableEngine: AnalyticsTableEngine.MergeTree,
+          ttlExpression: "retentionDate DELETE",
+          tableSettings:
+            "ttl_only_drop_parts = 1, non_replicated_deduplication_window = 10000",
+        });
+      }
+    }
+
+    class AggregatingModel extends AnalyticsBaseModel {
+      public constructor() {
+        super({
+          tableName: "MetricItemAggMV1m",
+          singularName: "Agg",
+          pluralName: "Aggs",
+          tableColumns: [
+            new AnalyticsTableColumn({
+              key: "projectId",
+              title: "Project",
+              description: "Project",
+              required: true,
+              type: TableColumnType.ObjectID,
+            }),
+            new AnalyticsTableColumn({
+              key: "bucketTime",
+              title: "Bucket",
+              description: "Bucket",
+              required: true,
+              type: TableColumnType.Date,
+            }),
+            new AnalyticsTableColumn({
+              key: "retentionDate",
+              title: "Retention",
+              description: "Retention",
+              required: true,
+              type: TableColumnType.Date,
+              simpleAggregateFunction: "max",
+            }),
+            new AnalyticsTableColumn({
+              key: "valueState",
+              title: "Value",
+              description: "Value",
+              required: true,
+              type: TableColumnType.AggregateFunction,
+              aggregateFunctionDefinition: "sum, Float64",
+            }),
+          ],
+          crudApiPath: new Route("agg"),
+          primaryKeys: ["projectId", "bucketTime"],
+          sortKeys: ["projectId", "bucketTime"],
+          partitionKey: "toYYYYMM(bucketTime)",
+          tableEngine: AnalyticsTableEngine.AggregatingMergeTree,
+          ttlExpression: "retentionDate DELETE",
+          includeBaseColumns: false,
+          defaultSortColumn: "bucketTime",
+        });
+      }
+    }
+
+    let spanGen: StatementGenerator<SpanModel>;
+    let aggregatingGen: StatementGenerator<AggregatingModel>;
+
+    beforeEach(() => {
+      delete process.env[CLUSTER_ENV_KEY];
+      delete process.env[SHARDING_ENV_KEY];
+      spanGen = new StatementGenerator<SpanModel>({
+        modelType: SpanModel,
+        database: ClickhouseAppInstance,
+      });
+      aggregatingGen = new StatementGenerator<AggregatingModel>({
+        modelType: AggregatingModel,
+        database: ClickhouseAppInstance,
+      });
+    });
+
+    test("CREATE TABLE builds the local Replicated table ON CLUSTER with replicated dedup", () => {
+      const stmt: Statement = spanGen.toTableCreateStatement();
+      expect(stmt.query).toContain("ENGINE = ReplicatedMergeTree");
+      expect(stmt.query).toContain("ON CLUSTER 'oneuptime'");
+      expect(stmt.query).toContain("replicated_deduplication_window = 10000");
+      expect(stmt.query).not.toContain("non_replicated_deduplication_window");
+      expect(fullText(stmt)).toContain("SpanItemV3Local");
+    });
+
+    test("cluster name override flows into the DDL", () => {
+      process.env[CLUSTER_ENV_KEY] = "ext_cluster";
+      expect(spanGen.toTableCreateStatement().query).toContain(
+        "ON CLUSTER 'ext_cluster'",
+      );
+    });
+
+    test("AggregatingMergeTree maps to ReplicatedAggregatingMergeTree", () => {
+      const stmt: Statement = aggregatingGen.toTableCreateStatement();
+      expect(stmt.query).toContain("ENGINE = ReplicatedAggregatingMergeTree");
+      expect(fullText(stmt)).toContain("MetricItemAggMV1mLocal");
+    });
+
+    test("AggregatingMergeTree CREATE uses real measures without the dimension bypass", () => {
+      const stmt: Statement = aggregatingGen.toTableCreateStatement();
+      expect(stmt.query).toContain("SimpleAggregateFunction(max, DateTime)");
+      expect(stmt.query).toContain("AggregateFunction(sum, Float64)");
+      expect(fullText(stmt)).not.toContain('"_id"');
+      expect(fullText(stmt)).not.toContain('"createdAt"');
+      expect(stmt.query).not.toContain("allow_dimensions_outside_sorting_key");
+    });
+
+    test("all metric aggregate models satisfy the strict off-key measure invariant", () => {
+      const models: Array<AnalyticsBaseModel> = [
+        new MetricItemAggMV1m(),
+        new MetricItemAggMV1mByHostV2(),
+        new MetricItemAggMV1mByService(),
+        new MetricItemAggMV1mByK8sCluster(),
+        new MetricItemAggMV1mByContainer(),
+        new MetricBaselineHourly(),
+        new SpanCountBaseline(),
+        new LogCountBaseline(),
+      ];
+
+      for (const model of models) {
+        expect(model.tableEngine).toBe(
+          AnalyticsTableEngine.AggregatingMergeTree,
+        );
+        expect(model.getTableColumn("_id")).toBeNull();
+        expect(model.getTableColumn("createdAt")).toBeNull();
+        expect(model.getTableColumn("updatedAt")).toBeNull();
+        expect(model.defaultSortColumn).toBeTruthy();
+        expect(model.sortKeys).toContain(model.defaultSortColumn);
+        expect(model.tableSettings).not.toContain(
+          "allow_dimensions_outside_sorting_key",
+        );
+
+        for (const column of model.tableColumns) {
+          if (model.sortKeys.includes(column.key)) {
+            continue;
+          }
+          expect(
+            column.type === TableColumnType.AggregateFunction ||
+              Boolean(column.simpleAggregateFunction),
+          ).toBe(true);
+        }
+
+        const retentionDate: AnalyticsTableColumn | null =
+          model.getTableColumn("retentionDate");
+        if (retentionDate) {
+          expect(retentionDate.simpleAggregateFunction).toBe("max");
+          expect(model.materializedViews[0]?.query).toContain(
+            "maxSimpleState(retentionDate) AS retentionDate",
+          );
+        }
+      }
+    });
+
+    test("every concrete metric aggregate model generates strict ClickHouse DDL", () => {
+      const modelTypes: Array<AnalyticsBaseModelType> = [
+        MetricItemAggMV1m,
+        MetricItemAggMV1mByHostV2,
+        MetricItemAggMV1mByService,
+        MetricItemAggMV1mByK8sCluster,
+        MetricItemAggMV1mByContainer,
+        MetricBaselineHourly,
+        SpanCountBaseline,
+        LogCountBaseline,
+      ];
+
+      for (const modelType of modelTypes) {
+        const model: AnalyticsBaseModel = new modelType();
+        const generator: StatementGenerator<AnalyticsBaseModel> =
+          new StatementGenerator<AnalyticsBaseModel>({
+            modelType,
+            database: ClickhouseAppInstance,
+          });
+        const statement: Statement = generator.toTableCreateStatement();
+        const ddl: string = fullText(statement);
+
+        expect(statement.query).toContain(
+          "ENGINE = ReplicatedAggregatingMergeTree",
+        );
+        expect(ddl).toContain(`${model.tableName}Local`);
+        expect(ddl).not.toContain('"_id"');
+        expect(ddl).not.toContain('"createdAt"');
+        expect(ddl).not.toContain('"updatedAt"');
+        expect(statement.query).not.toContain(
+          "allow_dimensions_outside_sorting_key",
+        );
+
+        if (model.getTableColumn("retentionDate")) {
+          expect(statement.query).toContain(
+            "retentionDate SimpleAggregateFunction(max, DateTime)",
+          );
+          expect(statement.query).toContain("TTL retentionDate DELETE");
+        } else {
+          expect(statement.query).not.toContain("retentionDate");
+        }
+      }
+    });
+
+    test("retention materialized views emit the state type their targets declare", () => {
+      const models: Array<AnalyticsBaseModel> = [
+        new MetricItemAggMV1m(),
+        new MetricItemAggMV1mByHostV2(),
+        new MetricItemAggMV1mByService(),
+        new MetricItemAggMV1mByK8sCluster(),
+        new MetricItemAggMV1mByContainer(),
+      ];
+
+      for (const model of models) {
+        const query: string = model.materializedViews[0]?.query || "";
+        expect(query).toContain(
+          "maxSimpleState(retentionDate) AS retentionDate",
+        );
+        expect(query).not.toContain("max(retentionDate) AS retentionDate");
+        expect(
+          model.getTableColumn("retentionDate")?.simpleAggregateFunction,
+        ).toBe("max");
+      }
+
+      const baseline: MetricBaselineHourly = new MetricBaselineHourly();
+      expect(baseline.getTableColumn("retentionDate")).toBeNull();
+      expect(baseline.materializedViews[0]?.query).not.toContain(
+        "retentionDate",
+      );
+    });
+
+    test("plain MergeTree CREATE does NOT add the aggregating-only setting", () => {
+      const stmt: Statement = spanGen.toTableCreateStatement();
+      expect(stmt.query).not.toContain("allow_dimensions_outside_sorting_key");
+    });
+
+    test("Distributed wrapper uses the model sharding key and local table", () => {
+      const q: string = spanGen.toDistributedTableCreateStatement().query;
+      expect(q).toContain("ON CLUSTER 'oneuptime'");
+      expect(q).toContain(
+        "Distributed('oneuptime', oneuptime, SpanItemV3Local, cityHash64(traceId))",
+      );
+      expect(q).toContain("AS ");
+      expect(q).toContain("SpanItemV3 "); // the app-facing distributed name
+    });
+
+    test("global sharding-key override beats the model key in the Distributed engine", () => {
+      process.env[SHARDING_ENV_KEY] = "rand()";
+      expect(spanGen.toDistributedTableCreateStatement().query).toContain(
+        "SpanItemV3Local, rand())",
+      );
+    });
+
+    test("schema ALTERs target the local table ON CLUSTER", () => {
+      const column: AnalyticsTableColumn = new SpanModel().tableColumns[1]!;
+
+      /*
+       * Column / skip-index ADD + DROP must carry ON CLUSTER: the local storage
+       * table is Replicated per shard, and Keeper only replicates within a
+       * shard. Without ON CLUSTER a reconciled column/index lands on a single
+       * shard, so a scatter-gather read through the Distributed wrapper hits a
+       * shard that lacks it and fails with "Missing columns" (Code 47).
+       */
+      const addColumn: string = fullText(spanGen.toAddColumnStatement(column));
+      expect(addColumn).toContain("SpanItemV3Local");
+      expect(addColumn).toContain("ON CLUSTER 'oneuptime'");
+
+      const addIndex: string = fullText(
+        spanGen.toAddSkipIndexStatement(column)!,
+      );
+      expect(addIndex).toContain("SpanItemV3Local");
+      expect(addIndex).toContain("ON CLUSTER 'oneuptime'");
+
+      const dropColumn: string = spanGen.toDropColumnStatement("traceId");
+      expect(dropColumn).toContain("SpanItemV3Local");
+      expect(dropColumn).toContain("ON CLUSTER 'oneuptime'");
+
+      const dropIndex: string =
+        spanGen.toDropSkipIndexStatement("idx_trace_id");
+      expect(dropIndex).toContain("SpanItemV3Local");
+      expect(dropIndex).toContain("ON CLUSTER 'oneuptime'");
+    });
+
+    test("ALTER UPDATE mutates the local table with ON CLUSTER", () => {
+      spanGen.toSetStatement = jest.fn(() => {
+        return SQL`name = 'x'`;
+      });
+      spanGen.toWhereStatement = jest.fn(() => {
+        return SQL` AND projectId = 'p'`;
+      });
+      const updateBy: UpdateBy<SpanModel> = {
+        data: new SpanModel(),
+        query: {},
+        props: {},
+      };
+      const stmt: Statement = spanGen.toUpdateStatement(updateBy);
+      expect(stmt.query).toContain("ON CLUSTER 'oneuptime'");
+      expect(stmt.query).toContain("UPDATE");
+      expect(fullText(stmt)).toContain("SpanItemV3Local");
+    });
+  });
+
+  describe("applyClusterToMaterializedViewQuery", () => {
+    const MV_QUERY: string = `CREATE MATERIALIZED VIEW IF NOT EXISTS MetricItemAggMV1m_mv
+TO MetricItemAggMV1m
+AS
+SELECT
+  projectId,
+  toStartOfMinute(time) AS bucketTime,
+  sumState(toFloat64(coalesce(value, sum, 0))) AS valueSumState
+FROM MetricItemV3
+GROUP BY projectId, bucketTime`;
+
+    test("injects ON CLUSTER and retargets TO/FROM at local tables", () => {
+      delete process.env[CLUSTER_ENV_KEY];
+      const out: string = applyClusterToMaterializedViewQuery(MV_QUERY);
+      expect(out).toContain(
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS MetricItemAggMV1m_mv ON CLUSTER 'oneuptime'",
+      );
+      expect(out).toContain("TO MetricItemAggMV1mLocal");
+      expect(out).toContain("FROM MetricItemV3Local");
+      // aggregate columns / time bucketing must NOT be rewritten
+      expect(out).toContain("toStartOfMinute(time) AS bucketTime");
+      expect(out).toContain("sumState(toFloat64(coalesce(value, sum, 0)))");
+      expect(out).not.toContain("MetricItemAggMV1mLocalLocal");
+      expect(out).not.toContain("MetricItemV3LocalLocal");
+    });
+  });
+});

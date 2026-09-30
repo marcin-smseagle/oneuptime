@@ -1,0 +1,1398 @@
+import LabelsElement from "Common/UI/Components/Label/Labels";
+import PageMap from "../../../Utils/PageMap";
+import RouteMap, { RouteUtil } from "../../../Utils/RouteMap";
+import PageComponentProps from "../../PageComponentProps";
+import MonitorsTable from "../../../Components/Monitor/MonitorTable";
+import { getMonitorTemplateFacetSelection } from "../../../Components/Monitor/MonitorFacets";
+import { getMonitorListRouteForFacet } from "../../../Components/Monitor/MonitorListFacetRoute";
+import Route from "Common/Types/API/Route";
+import URL from "Common/Types/API/URL";
+import HTTPResponse from "Common/Types/API/HTTPResponse";
+import HTTPErrorResponse from "Common/Types/API/HTTPErrorResponse";
+import IconProp from "Common/Types/Icon/IconProp";
+import { ErrorFunction, VoidFunction } from "Common/Types/FunctionTypes";
+import { JSONObject } from "Common/Types/JSON";
+import ObjectID from "Common/Types/ObjectID";
+import FormFieldSchemaType from "Common/UI/Components/Forms/Types/FormFieldSchemaType";
+import ModelDelete from "Common/UI/Components/ModelDelete/ModelDelete";
+import CustomFieldsDetail from "Common/UI/Components/CustomFields/CustomFieldsDetail";
+import CardModelDetail from "Common/UI/Components/ModelDetail/CardModelDetail";
+import ConfirmModal from "Common/UI/Components/Modal/ConfirmModal";
+import {
+  buildSyncResultSummary,
+  SyncResultSummary,
+} from "./MonitorTemplateSyncResultUtil";
+import FieldType from "Common/UI/Components/Types/FieldType";
+import { ButtonStyleType } from "Common/UI/Components/Button/Button";
+import { ModalWidth } from "Common/UI/Components/Modal/Modal";
+import API from "Common/UI/Utils/API/API";
+import { APP_API_URL } from "Common/UI/Config";
+import BasicFormModal from "Common/UI/Components/FormModal/BasicFormModal";
+import ModelAPI, { ListResult } from "Common/UI/Utils/ModelAPI/ModelAPI";
+import ProjectUtil from "Common/UI/Utils/Project";
+import SortOrder from "Common/Types/BaseDatabase/SortOrder";
+import Query from "Common/Types/BaseDatabase/Query";
+import { LIMIT_PER_PROJECT } from "Common/Types/Database/LimitMax";
+import Navigation from "Common/UI/Utils/Navigation";
+import Label from "Common/Models/DatabaseModels/Label";
+import Monitor from "Common/Models/DatabaseModels/Monitor";
+import MonitorCustomField from "Common/Models/DatabaseModels/MonitorCustomField";
+import MonitorTemplate from "Common/Models/DatabaseModels/MonitorTemplate";
+import MonitorTemplateCustomFieldUtil from "Common/Utils/Monitor/MonitorTemplateCustomFieldUtil";
+import MonitorStepsType from "Common/Types/Monitor/MonitorSteps";
+import MonitorType, {
+  MonitorTypeHelper,
+} from "Common/Types/Monitor/MonitorType";
+import MonitorTypeUtil from "../../../Utils/MonitorType";
+import MonitorStepsForm from "../../../Components/Form/Monitor/MonitorSteps";
+import {
+  getMonitorTemplateSyncFieldSummary,
+  MonitorTemplateSyncFieldsSummary,
+} from "../../../Components/Form/Monitor/MonitorTemplateSyncFields";
+import MonitorStepsViewer from "../../../Components/Monitor/MonitorSteps/MonitorSteps";
+import MonitoringInterval from "../../../Utils/MonitorIntervalDropdownOptions";
+import { DropdownOption } from "Common/UI/Components/Dropdown/Dropdown";
+import { CustomElementProps } from "Common/UI/Components/Forms/Types/Field";
+import FormValues from "Common/UI/Components/Forms/Types/FormValues";
+import React, {
+  Fragment,
+  FunctionComponent,
+  ReactElement,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
+
+const MonitorTemplatesView: FunctionComponent<
+  PageComponentProps
+> = (): ReactElement => {
+  /*
+   * Memoize modelId so child components (CardModelDetail / ModelDetail) get a
+   * stable reference. Without this, Navigation.getLastParamAsObjectID() returns
+   * a new ObjectID every render, ModelDetail's useEffect dep changes, and the
+   * page re-fetches in a loop — that's the flicker.
+   */
+  const modelId: ObjectID = useMemo(() => {
+    return Navigation.getLastParamAsObjectID();
+  }, []);
+
+  /*
+   * Memoized so MonitorsTable's underlying ModelTable doesn't see a new query
+   * reference every render — that would cancel the in-flight fetch and refetch
+   * each time, contributing to the flicker.
+   */
+  const linkedMonitorsQuery: Query<Monitor> = useMemo(() => {
+    return {
+      projectId: ProjectUtil.getCurrentProjectId()!,
+      monitorTemplateId: modelId,
+    };
+  }, [modelId]);
+
+  /*
+   * monitorType is loaded once at the top so the Criteria and Interval cards
+   * can decide whether to render. Each card otherwise fetches its own slice of
+   * the template independently.
+   */
+  const [monitorType, setMonitorType] = useState<MonitorType | undefined>(
+    undefined,
+  );
+  const [templateMonitorSteps, setTemplateMonitorSteps] = useState<
+    MonitorStepsType | undefined
+  >(undefined);
+
+  const protectedFieldsSummary: string = getMonitorTemplateSyncFieldSummary({
+    monitorType: monitorType || MonitorType.Manual,
+    monitorSteps: templateMonitorSteps,
+  });
+
+  /*
+   * The default monitor name this template gives the monitors it creates.
+   * The criteria form quotes it when it seeds criteria ("Check if <name>
+   * is offline"), and compares against those same seeded strings to tell
+   * criteria nobody has edited from criteria somebody has - so handing it
+   * the wrong name costs both a readable criteria and that comparison.
+   *
+   * Optional since issue #3486, hence the template's own name beside it:
+   * the seeded strings are persisted into monitorSteps and inherited by
+   * every monitor made from this template, so a blank here has to fall back
+   * to something readable rather than seed "Check if  is offline" forever.
+   */
+  const [templateMonitorName, setTemplateMonitorName] = useState<string>("");
+  const [templateName, setTemplateName] = useState<string>("");
+
+  const criteriaSeedMonitorName: string = templateMonitorName || templateName;
+
+  const [linkedMonitorCount, setLinkedMonitorCount] = useState<number | null>(
+    null,
+  );
+  const [syncResultMessage, setSyncResultMessage] = useState<string>("");
+  const [syncResultTitle, setSyncResultTitle] = useState<string>("Done");
+
+  const [showCriteriaSyncModal, setShowCriteriaSyncModal] =
+    useState<boolean>(false);
+  const [isSyncingCriteria, setIsSyncingCriteria] = useState<boolean>(false);
+  const [criteriaSyncError, setCriteriaSyncError] = useState<string>("");
+
+  const [showIntervalSyncModal, setShowIntervalSyncModal] =
+    useState<boolean>(false);
+  const [isSyncingInterval, setIsSyncingInterval] = useState<boolean>(false);
+  const [intervalSyncError, setIntervalSyncError] = useState<string>("");
+
+  const [showLabelsSyncModal, setShowLabelsSyncModal] =
+    useState<boolean>(false);
+  const [isSyncingLabels, setIsSyncingLabels] = useState<boolean>(false);
+  const [labelsSyncError, setLabelsSyncError] = useState<string>("");
+
+  const [showCustomFieldsSyncModal, setShowCustomFieldsSyncModal] =
+    useState<boolean>(false);
+  const [isSyncingCustomFields, setIsSyncingCustomFields] =
+    useState<boolean>(false);
+  const [customFieldsSyncError, setCustomFieldsSyncError] =
+    useState<string>("");
+  /*
+   * Reported by the Custom Field Defaults card itself rather than fetched
+   * here, so it reflects an edit made on this page without a second read.
+   */
+  const [templateCustomFields, setTemplateCustomFields] = useState<JSONObject>(
+    {},
+  );
+
+  const [singleSyncMonitor, setSingleSyncMonitor] = useState<Monitor | null>(
+    null,
+  );
+  const [isSyncingSingle, setIsSyncingSingle] = useState<boolean>(false);
+  const [singleSyncError, setSingleSyncError] = useState<string>("");
+
+  const [showLinkModal, setShowLinkModal] = useState<boolean>(false);
+  const [eligibleMonitors, setEligibleMonitors] = useState<Array<Monitor>>([]);
+  const [isLoadingEligibleMonitors, setIsLoadingEligibleMonitors] =
+    useState<boolean>(false);
+  const [isLinking, setIsLinking] = useState<boolean>(false);
+  const [linkError, setLinkError] = useState<string>("");
+
+  const [unlinkTarget, setUnlinkTarget] = useState<Monitor | null>(null);
+  const [isUnlinking, setIsUnlinking] = useState<boolean>(false);
+  const [unlinkError, setUnlinkError] = useState<string>("");
+
+  // Bumping this triggers a refetch in the linked-monitors MonitorTable.
+  const [tableRefreshToggle, setTableRefreshToggle] = useState<string>(
+    Math.random().toString(),
+  );
+
+  const fetchLinkedMonitorCount: () => Promise<void> =
+    async (): Promise<void> => {
+      try {
+        const count: number = await ModelAPI.count<Monitor>({
+          modelType: Monitor,
+          query: {
+            projectId: ProjectUtil.getCurrentProjectId()!,
+            monitorTemplateId: modelId,
+          },
+        });
+        setLinkedMonitorCount(count);
+      } catch {
+        /*
+         * Surface as 0 — the table is the source of truth and will still
+         * render whatever monitors actually match.
+         */
+        setLinkedMonitorCount(0);
+      }
+    };
+
+  useEffect(() => {
+    fetchLinkedMonitorCount();
+
+    const fetchMonitorType: () => Promise<void> = async (): Promise<void> => {
+      try {
+        const item: MonitorTemplate | null =
+          await ModelAPI.getItem<MonitorTemplate>({
+            modelType: MonitorTemplate,
+            id: modelId,
+            select: {
+              monitorType: true,
+              monitorSteps: true,
+              monitorName: true,
+              templateName: true,
+            },
+          });
+        setMonitorType(item?.monitorType);
+        setTemplateMonitorSteps(item?.monitorSteps);
+        setTemplateMonitorName(item?.monitorName?.trim() || "");
+        setTemplateName(item?.templateName?.trim() || "");
+      } catch {
+        // Leave undefined — the dependent cards will simply not render.
+      }
+    };
+
+    fetchMonitorType();
+  }, []);
+
+  const onSyncCriteriaSubmit: () => Promise<void> = async (): Promise<void> => {
+    setIsSyncingCriteria(true);
+    setCriteriaSyncError("");
+    try {
+      const response: HTTPResponse<JSONObject> | HTTPErrorResponse =
+        await API.post<JSONObject>({
+          url: URL.fromString(APP_API_URL.toString()).addRoute(
+            `/monitor-template/${modelId.toString()}/sync-to-linked-monitors`,
+          ),
+          data: {
+            fields: ["monitorSteps"],
+          },
+          headers: ModelAPI.getCommonHeaders(),
+        });
+
+      if (response.isFailure()) {
+        setCriteriaSyncError(API.getFriendlyMessage(response));
+        setIsSyncingCriteria(false);
+        return;
+      }
+
+      const synced: number = (response.data["syncedMonitors"] as number) || 0;
+      const total: number =
+        (response.data["totalLinkedMonitors"] as number) || 0;
+
+      const summary: SyncResultSummary = buildSyncResultSummary({
+        subject: "criteria",
+        syncedMonitors: synced,
+        totalLinkedMonitors: total,
+      });
+
+      setSyncResultTitle(summary.title);
+      setSyncResultMessage(summary.message);
+      setShowCriteriaSyncModal(false);
+      setIsSyncingCriteria(false);
+      fetchLinkedMonitorCount();
+      setTableRefreshToggle(Math.random().toString());
+    } catch (e) {
+      setCriteriaSyncError(API.getFriendlyMessage(e));
+      setIsSyncingCriteria(false);
+    }
+  };
+
+  const onSyncIntervalSubmit: () => Promise<void> = async (): Promise<void> => {
+    setIsSyncingInterval(true);
+    setIntervalSyncError("");
+    try {
+      const response: HTTPResponse<JSONObject> | HTTPErrorResponse =
+        await API.post<JSONObject>({
+          url: URL.fromString(APP_API_URL.toString()).addRoute(
+            `/monitor-template/${modelId.toString()}/sync-to-linked-monitors`,
+          ),
+          data: {
+            fields: ["monitoringInterval", "minimumProbeAgreement"],
+          },
+          headers: ModelAPI.getCommonHeaders(),
+        });
+
+      if (response.isFailure()) {
+        setIntervalSyncError(API.getFriendlyMessage(response));
+        setIsSyncingInterval(false);
+        return;
+      }
+
+      const synced: number = (response.data["syncedMonitors"] as number) || 0;
+      const total: number =
+        (response.data["totalLinkedMonitors"] as number) || 0;
+
+      const summary: SyncResultSummary = buildSyncResultSummary({
+        subject: "monitoring interval",
+        syncedMonitors: synced,
+        totalLinkedMonitors: total,
+      });
+
+      setSyncResultTitle(summary.title);
+      setSyncResultMessage(summary.message);
+      setShowIntervalSyncModal(false);
+      setIsSyncingInterval(false);
+      fetchLinkedMonitorCount();
+      setTableRefreshToggle(Math.random().toString());
+    } catch (e) {
+      setIntervalSyncError(API.getFriendlyMessage(e));
+      setIsSyncingInterval(false);
+    }
+  };
+
+  const onSyncLabelsSubmit: () => Promise<void> = async (): Promise<void> => {
+    setIsSyncingLabels(true);
+    setLabelsSyncError("");
+    try {
+      const response: HTTPResponse<JSONObject> | HTTPErrorResponse =
+        await API.post<JSONObject>({
+          url: URL.fromString(APP_API_URL.toString()).addRoute(
+            `/monitor-template/${modelId.toString()}/sync-to-linked-monitors`,
+          ),
+          data: {
+            fields: ["labels"],
+          },
+          headers: ModelAPI.getCommonHeaders(),
+        });
+
+      if (response.isFailure()) {
+        setLabelsSyncError(API.getFriendlyMessage(response));
+        setIsSyncingLabels(false);
+        return;
+      }
+
+      const synced: number = (response.data["syncedMonitors"] as number) || 0;
+      const total: number =
+        (response.data["totalLinkedMonitors"] as number) || 0;
+
+      const summary: SyncResultSummary = buildSyncResultSummary({
+        subject: "labels",
+        syncedMonitors: synced,
+        totalLinkedMonitors: total,
+      });
+
+      setSyncResultTitle(summary.title);
+      setSyncResultMessage(summary.message);
+      setShowLabelsSyncModal(false);
+      setIsSyncingLabels(false);
+      fetchLinkedMonitorCount();
+      setTableRefreshToggle(Math.random().toString());
+    } catch (e) {
+      setLabelsSyncError(API.getFriendlyMessage(e));
+      setIsSyncingLabels(false);
+    }
+  };
+
+  /*
+   * The backfill half of custom field defaults (issue #3548). Setting defaults
+   * on the template only reaches monitors provisioned AFTER the edit, and the
+   * fleet that made this a problem — a thousand devices an auto-import rule
+   * already imported — is entirely on the other side of that line. This is
+   * what reaches them.
+   *
+   * Scoped to `customFields` by name because an unscoped sync deliberately
+   * leaves them alone: see DEFAULT_SYNCABLE_FIELDS in MonitorTemplateService.
+   */
+  const onSyncCustomFieldsSubmit: () => Promise<void> =
+    async (): Promise<void> => {
+      setIsSyncingCustomFields(true);
+      setCustomFieldsSyncError("");
+      try {
+        const response: HTTPResponse<JSONObject> | HTTPErrorResponse =
+          await API.post<JSONObject>({
+            url: URL.fromString(APP_API_URL.toString()).addRoute(
+              `/monitor-template/${modelId.toString()}/sync-to-linked-monitors`,
+            ),
+            data: {
+              fields: ["customFields"],
+            },
+            headers: ModelAPI.getCommonHeaders(),
+          });
+
+        if (response.isFailure()) {
+          setCustomFieldsSyncError(API.getFriendlyMessage(response));
+          setIsSyncingCustomFields(false);
+          return;
+        }
+
+        const synced: number = (response.data["syncedMonitors"] as number) || 0;
+        const total: number =
+          (response.data["totalLinkedMonitors"] as number) || 0;
+
+        const summary: SyncResultSummary = buildSyncResultSummary({
+          subject: "custom field defaults",
+          syncedMonitors: synced,
+          totalLinkedMonitors: total,
+        });
+
+        setSyncResultTitle(summary.title);
+        setSyncResultMessage(summary.message);
+        setShowCustomFieldsSyncModal(false);
+        setIsSyncingCustomFields(false);
+        fetchLinkedMonitorCount();
+        setTableRefreshToggle(Math.random().toString());
+      } catch (e) {
+        setCustomFieldsSyncError(API.getFriendlyMessage(e));
+        setIsSyncingCustomFields(false);
+      }
+    };
+
+  const onSingleSyncSubmit: () => Promise<void> = async (): Promise<void> => {
+    if (!singleSyncMonitor || !singleSyncMonitor.id) {
+      return;
+    }
+
+    setIsSyncingSingle(true);
+    setSingleSyncError("");
+    try {
+      const response: HTTPResponse<JSONObject> | HTTPErrorResponse =
+        await API.post<JSONObject>({
+          url: URL.fromString(APP_API_URL.toString()).addRoute(
+            `/monitor-template/${modelId.toString()}/sync-to-monitor/${singleSyncMonitor.id.toString()}`,
+          ),
+          headers: ModelAPI.getCommonHeaders(),
+        });
+
+      if (response.isFailure()) {
+        setSingleSyncError(API.getFriendlyMessage(response));
+        setIsSyncingSingle(false);
+        return;
+      }
+
+      const monitorName: string = singleSyncMonitor.name || "monitor";
+      setSingleSyncMonitor(null);
+      setIsSyncingSingle(false);
+      setSyncResultTitle("Done");
+      setSyncResultMessage(`Synced "${monitorName}" from this template.`);
+      setTableRefreshToggle(Math.random().toString());
+    } catch (e) {
+      setSingleSyncError(API.getFriendlyMessage(e));
+      setIsSyncingSingle(false);
+    }
+  };
+
+  /*
+   * Pull monitors eligible to be linked when the Link modal opens. We fetch
+   * all monitors in this project of the matching type and filter out the ones
+   * already linked here on the client — there's no clean cross-project
+   * null-or-not-equal filter at the query-DSL level.
+   */
+  useEffect(() => {
+    if (!showLinkModal || !monitorType) {
+      return;
+    }
+
+    const loadEligible: () => Promise<void> = async (): Promise<void> => {
+      setIsLoadingEligibleMonitors(true);
+      setLinkError("");
+      try {
+        const result: ListResult<Monitor> = await ModelAPI.getList<Monitor>({
+          modelType: Monitor,
+          query: {
+            projectId: ProjectUtil.getCurrentProjectId()!,
+            monitorType: monitorType,
+          },
+          limit: LIMIT_PER_PROJECT,
+          skip: 0,
+          select: {
+            _id: true,
+            name: true,
+            monitorTemplateId: true,
+          },
+          sort: {
+            name: SortOrder.Ascending,
+          },
+        });
+
+        const templateIdString: string = modelId.toString();
+        const eligible: Array<Monitor> = result.data.filter(
+          (monitor: Monitor) => {
+            return (
+              !monitor.monitorTemplateId ||
+              monitor.monitorTemplateId.toString() !== templateIdString
+            );
+          },
+        );
+
+        setEligibleMonitors(eligible);
+      } catch (e) {
+        setLinkError(API.getFriendlyMessage(e));
+        setEligibleMonitors([]);
+      }
+      setIsLoadingEligibleMonitors(false);
+    };
+
+    loadEligible();
+  }, [showLinkModal, monitorType, modelId]);
+
+  const onLinkSubmit: (formData: {
+    monitorIds: Array<string>;
+  }) => Promise<void> = async (formData: {
+    monitorIds: Array<string>;
+  }): Promise<void> => {
+    const monitorIds: Array<string> = formData.monitorIds || [];
+    if (monitorIds.length === 0) {
+      setLinkError("Select at least one monitor to link.");
+      return;
+    }
+
+    setIsLinking(true);
+    setLinkError("");
+
+    const errors: Array<string> = [];
+    for (const monitorId of monitorIds) {
+      try {
+        const response: HTTPResponse<JSONObject> | HTTPErrorResponse =
+          await API.post<JSONObject>({
+            url: URL.fromString(APP_API_URL.toString()).addRoute(
+              `/monitor-template/${modelId.toString()}/link-monitor/${monitorId}`,
+            ),
+            headers: ModelAPI.getCommonHeaders(),
+          });
+        if (response.isFailure()) {
+          errors.push(API.getFriendlyMessage(response));
+        }
+      } catch (e) {
+        errors.push(API.getFriendlyMessage(e));
+      }
+    }
+
+    setIsLinking(false);
+
+    if (errors.length > 0) {
+      setLinkError(
+        errors.length === 1
+          ? errors[0]!
+          : `${errors.length} of ${monitorIds.length} link operations failed: ${errors.join("; ")}`,
+      );
+      return;
+    }
+
+    setShowLinkModal(false);
+    setEligibleMonitors([]);
+    setSyncResultTitle("Done");
+    setSyncResultMessage(
+      `Linked ${monitorIds.length} monitor${monitorIds.length === 1 ? "" : "s"} to this template.`,
+    );
+    fetchLinkedMonitorCount();
+    setTableRefreshToggle(Math.random().toString());
+  };
+
+  const onUnlinkSubmit: () => Promise<void> = async (): Promise<void> => {
+    if (!unlinkTarget || !unlinkTarget.id) {
+      return;
+    }
+
+    setIsUnlinking(true);
+    setUnlinkError("");
+    try {
+      const response: HTTPResponse<JSONObject> | HTTPErrorResponse =
+        await API.post<JSONObject>({
+          url: URL.fromString(APP_API_URL.toString()).addRoute(
+            `/monitor-template/${modelId.toString()}/unlink-monitor/${unlinkTarget.id.toString()}`,
+          ),
+          headers: ModelAPI.getCommonHeaders(),
+        });
+
+      if (response.isFailure()) {
+        setUnlinkError(API.getFriendlyMessage(response));
+        setIsUnlinking(false);
+        return;
+      }
+
+      const monitorName: string = unlinkTarget.name || "monitor";
+      setUnlinkTarget(null);
+      setIsUnlinking(false);
+      setSyncResultTitle("Done");
+      setSyncResultMessage(`Unlinked "${monitorName}" from this template.`);
+      fetchLinkedMonitorCount();
+      setTableRefreshToggle(Math.random().toString());
+    } catch (e) {
+      setUnlinkError(API.getFriendlyMessage(e));
+      setIsUnlinking(false);
+    }
+  };
+
+  const syncCriteriaButtonTitle: string =
+    linkedMonitorCount === null
+      ? "Sync Criteria to Linked Monitors"
+      : `Sync Criteria to ${linkedMonitorCount} Linked Monitor${linkedMonitorCount === 1 ? "" : "s"}`;
+
+  const syncIntervalButtonTitle: string =
+    linkedMonitorCount === null
+      ? "Sync Interval to Linked Monitors"
+      : `Sync Interval to ${linkedMonitorCount} Linked Monitor${linkedMonitorCount === 1 ? "" : "s"}`;
+
+  const syncLabelsButtonTitle: string =
+    linkedMonitorCount === null
+      ? "Sync Labels to Linked Monitors"
+      : `Sync Labels to ${linkedMonitorCount} Linked Monitor${linkedMonitorCount === 1 ? "" : "s"}`;
+
+  const syncCustomFieldsButtonTitle: string =
+    linkedMonitorCount === null
+      ? "Sync Custom Fields to Linked Monitors"
+      : `Sync Custom Fields to ${linkedMonitorCount} Linked Monitor${linkedMonitorCount === 1 ? "" : "s"}`;
+
+  /*
+   * A template with no defaults set has nothing to push, and a sync that
+   * writes nothing comes back as "0 of N synced" — which the summary reads as
+   * a permissions problem and tells the operator to run it again as somebody
+   * else. Say what is actually wrong instead, on a button that stays visible
+   * so the sentence has somewhere to hang.
+   */
+  const customFieldDefaultNames: Array<string> = Object.keys(
+    MonitorTemplateCustomFieldUtil.getDefaults(templateCustomFields),
+  );
+
+  const hasCustomFieldDefaults: boolean = customFieldDefaultNames.length > 0;
+
+  /*
+   * The count goes in the title rather than only inside the sync buttons: "how
+   * many monitors would a template edit touch" is the question this page is
+   * open to answer, and it should be answerable without reading a button that
+   * is about to overwrite them.
+   */
+  const linkedMonitorsTitle: string =
+    linkedMonitorCount === null
+      ? "Linked Monitors"
+      : `Linked Monitors (${linkedMonitorCount})`;
+
+  return (
+    <Fragment>
+      {/* Template Info — identity of the template itself. */}
+      <CardModelDetail<MonitorTemplate>
+        name="Template Info"
+        cardProps={{
+          title: "Template Info",
+          description: "Identity for this monitor template.",
+          buttons: [
+            {
+              title: "Create Monitor from Template",
+              icon: IconProp.Add,
+              buttonStyle: ButtonStyleType.PRIMARY,
+              onClick: () => {
+                const createRoute: Route = RouteUtil.populateRouteParams(
+                  RouteMap[PageMap.MONITOR_CREATE] as Route,
+                );
+                Navigation.navigate(
+                  createRoute.addQueryParams({
+                    monitorTemplateId: modelId.toString(),
+                  }),
+                );
+              },
+            },
+          ],
+        }}
+        isEditable={true}
+        editButtonText="Edit Template Info"
+        formFields={[
+          {
+            field: {
+              templateName: true,
+            },
+            title: "Template Name",
+            fieldType: FormFieldSchemaType.Text,
+            required: true,
+            placeholder: "Production API Health",
+            validation: {
+              minLength: 2,
+            },
+          },
+          {
+            field: {
+              templateDescription: true,
+            },
+            title: "Template Description",
+            fieldType: FormFieldSchemaType.LongText,
+            required: true,
+            placeholder: "What is this template for?",
+            validation: {
+              minLength: 2,
+            },
+          },
+        ]}
+        /*
+         * The template's own name is the stand-in the criteria editor seeds
+         * with while the optional default monitor name is blank (issue
+         * #3486), so a rename here has to reach that state too.
+         */
+        onSaveSuccess={(item: MonitorTemplate) => {
+          if (item.templateName?.trim()) {
+            setTemplateName(item.templateName.trim());
+          }
+        }}
+        modelDetailProps={{
+          showDetailsInNumberOfColumns: 2,
+          modelType: MonitorTemplate,
+          id: "model-detail-monitor-template-info",
+          fields: [
+            {
+              field: {
+                _id: true,
+              },
+              title: "Monitor Template ID",
+              fieldType: FieldType.ObjectID,
+            },
+            {
+              field: {
+                templateName: true,
+              },
+              title: "Template Name",
+              fieldType: FieldType.Text,
+            },
+            {
+              field: {
+                templateDescription: true,
+              },
+              title: "Template Description",
+              fieldType: FieldType.LongText,
+            },
+            {
+              field: {
+                createdAt: true,
+              },
+              title: "Created At",
+              fieldType: FieldType.DateTime,
+            },
+          ],
+          modelId: modelId,
+        }}
+      />
+
+      {/* Monitor Defaults — what new monitors created from this template start with. */}
+      <CardModelDetail<MonitorTemplate>
+        name="Monitor Defaults"
+        cardProps={{
+          title: "Monitor Defaults",
+          description:
+            "Default name, description, and type applied to monitors created from this template.",
+        }}
+        createEditModalWidth={ModalWidth.Large}
+        isEditable={true}
+        editButtonText="Edit Monitor Defaults"
+        formFields={[
+          {
+            field: {
+              monitorName: true,
+            },
+            title: "Default Monitor Name",
+            /*
+             * Optional, and clearable back to blank, since issue #3486 - see
+             * the note on the model column. No minLength, because a field
+             * that accepts nothing at all has no business rejecting a
+             * one-character name.
+             */
+            description:
+              "Default name applied to monitors created from this template. Leave it blank to name each monitor after the resource it watches.",
+            fieldType: FormFieldSchemaType.Text,
+            required: false,
+            placeholder: "Monitor Name",
+          },
+          {
+            field: {
+              monitorDescription: true,
+            },
+            title: "Default Monitor Description",
+            fieldType: FormFieldSchemaType.LongText,
+            required: false,
+            placeholder: "Description",
+          },
+          {
+            field: {
+              monitorType: true,
+            },
+            title: "Monitor Type",
+            description: "What kind of monitor will this template produce?",
+            fieldType: FormFieldSchemaType.CardSelect,
+            required: true,
+            cardSelectOptions:
+              MonitorTypeUtil.monitorTypesAsCategorizedCardSelectOptions(),
+            cardSelectSearchable: true,
+            cardSelectSearchPlaceholder:
+              "Search monitor types - try ping, ssl, k8s, postgres",
+            cardSelectCollapsibleGroups: true,
+          },
+        ]}
+        onSaveSuccess={(item: MonitorTemplate) => {
+          if (item.monitorType) {
+            setMonitorType(item.monitorType as MonitorType);
+          }
+
+          /*
+           * Assigned unconditionally: the name is clearable now, and a
+           * truthiness guard here would leave the criteria editor quoting a
+           * default name the template no longer carries.
+           */
+          setTemplateMonitorName(item.monitorName?.trim() || "");
+        }}
+        modelDetailProps={{
+          showDetailsInNumberOfColumns: 2,
+          modelType: MonitorTemplate,
+          id: "model-detail-monitor-template-defaults",
+          onItemLoaded: (item: MonitorTemplate) => {
+            if (item.monitorType && !monitorType) {
+              setMonitorType(item.monitorType as MonitorType);
+            }
+
+            if (item.monitorName?.trim() && !templateMonitorName) {
+              setTemplateMonitorName(item.monitorName.trim());
+            }
+          },
+          fields: [
+            {
+              field: {
+                monitorName: true,
+              },
+              title: "Default Monitor Name",
+              fieldType: FieldType.Text,
+              /*
+               * Rendered when the column is empty. Without it the row is a
+               * labelled blank, which reads as a failed load rather than as
+               * the deliberate "name monitors after the resource" choice.
+               */
+              placeholder: "Named after the resource",
+            },
+            {
+              field: {
+                monitorType: true,
+              },
+              title: "Monitor Type",
+              fieldType: FieldType.Text,
+            },
+            {
+              field: {
+                monitorDescription: true,
+              },
+              title: "Default Monitor Description",
+              fieldType: FieldType.LongText,
+            },
+          ],
+          modelId: modelId,
+        }}
+      />
+
+      {/* Monitoring Criteria — only meaningful for non-Manual monitor types. */}
+      {monitorType && monitorType !== MonitorType.Manual && (
+        <CardModelDetail<MonitorTemplate>
+          key={monitorType}
+          name="Monitoring Criteria"
+          cardProps={{
+            title: "Monitoring Criteria",
+            description:
+              "What this template watches for and when it should fire.",
+            buttons: [
+              {
+                title: syncCriteriaButtonTitle,
+                icon: IconProp.Refresh,
+                buttonStyle: ButtonStyleType.NORMAL,
+                disabled: linkedMonitorCount === 0,
+                onClick: () => {
+                  setSyncResultMessage("");
+                  setCriteriaSyncError("");
+                  setShowCriteriaSyncModal(true);
+                },
+              },
+            ],
+          }}
+          createEditModalWidth={ModalWidth.Large}
+          isEditable={true}
+          editButtonText="Edit Criteria"
+          onSaveSuccess={(item: MonitorTemplate) => {
+            setTemplateMonitorSteps(item.monitorSteps);
+          }}
+          formFields={[
+            {
+              field: {
+                monitorSteps: true,
+              },
+              title: "Monitor Details",
+              fieldType: FormFieldSchemaType.CustomComponent,
+              required: true,
+              customValidation: (values: FormValues<MonitorTemplate>) => {
+                return MonitorStepsType.getValidationError(
+                  values.monitorSteps as MonitorStepsType,
+                  monitorType,
+                );
+              },
+              getCustomElement: (
+                _value: FormValues<MonitorTemplate>,
+                fieldProps: CustomElementProps,
+              ) => {
+                return (
+                  <MonitorStepsForm
+                    {...fieldProps}
+                    isMonitorTemplate={true}
+                    monitorType={monitorType}
+                    monitorName={criteriaSeedMonitorName}
+                  />
+                );
+              },
+            },
+          ]}
+          modelDetailProps={{
+            showDetailsInNumberOfColumns: 1,
+            modelType: MonitorTemplate,
+            id: "model-detail-monitor-template-criteria",
+            onItemLoaded: (item: MonitorTemplate) => {
+              setTemplateMonitorSteps(item.monitorSteps);
+            },
+            fields: [
+              {
+                field: {
+                  monitorSteps: true,
+                },
+                title: "",
+                fieldType: FieldType.Element,
+                getElement: (item: MonitorTemplate): ReactElement => {
+                  if (!item.monitorSteps) {
+                    return <p>No criteria configured.</p>;
+                  }
+                  return (
+                    <>
+                      <MonitorTemplateSyncFieldsSummary
+                        monitorSteps={item.monitorSteps as MonitorStepsType}
+                        monitorType={monitorType}
+                      />
+                      <MonitorStepsViewer
+                        monitorSteps={item.monitorSteps as MonitorStepsType}
+                        monitorType={monitorType}
+                      />
+                    </>
+                  );
+                },
+              },
+            ],
+            modelId: modelId,
+          }}
+        />
+      )}
+
+      {/* Monitoring Interval — only for monitor types that have an interval. */}
+      {monitorType &&
+        MonitorTypeHelper.doesMonitorTypeHaveInterval(monitorType) && (
+          <CardModelDetail<MonitorTemplate>
+            name="Monitoring Interval"
+            cardProps={{
+              title: "Monitoring Interval",
+              description:
+                "How often monitors created from this template will be evaluated, and how many probes must agree before the status changes.",
+              buttons: [
+                {
+                  title: syncIntervalButtonTitle,
+                  icon: IconProp.Refresh,
+                  buttonStyle: ButtonStyleType.NORMAL,
+                  disabled: linkedMonitorCount === 0,
+                  onClick: () => {
+                    setSyncResultMessage("");
+                    setIntervalSyncError("");
+                    setShowIntervalSyncModal(true);
+                  },
+                },
+              ],
+            }}
+            isEditable={true}
+            editButtonText="Edit Interval"
+            formFields={[
+              {
+                field: {
+                  monitoringInterval: true,
+                },
+                title: "Monitoring Interval",
+                fieldType: FormFieldSchemaType.Dropdown,
+                required: true,
+                fetchDropdownOptions: () => {
+                  let interval: Array<DropdownOption> = [...MonitoringInterval];
+
+                  if (
+                    monitorType === MonitorType.SyntheticMonitor ||
+                    monitorType === MonitorType.CustomJavaScriptCode ||
+                    monitorType === MonitorType.SSLCertificate
+                  ) {
+                    interval = interval.filter((option: DropdownOption) => {
+                      return (
+                        option.value !== "* * * * *" &&
+                        option.value !== "*/2 * * * *"
+                      );
+                    });
+                  }
+
+                  return Promise.resolve(interval);
+                },
+                placeholder: "Select Monitoring Interval",
+              },
+              {
+                field: {
+                  minimumProbeAgreement: true,
+                },
+                title: "Minimum Probe Agreement",
+                description:
+                  "Minimum number of probes that must agree before a status change. Leave blank to require all enabled probes to agree.",
+                fieldType: FormFieldSchemaType.Number,
+                required: false,
+                placeholder: "e.g. 2",
+              },
+            ]}
+            modelDetailProps={{
+              showDetailsInNumberOfColumns: 2,
+              modelType: MonitorTemplate,
+              id: "model-detail-monitor-template-interval",
+              fields: [
+                {
+                  field: {
+                    monitoringInterval: true,
+                  },
+                  title: "Monitoring Interval",
+                  fieldType: FieldType.Text,
+                },
+                {
+                  field: {
+                    minimumProbeAgreement: true,
+                  },
+                  title: "Minimum Probe Agreement",
+                  fieldType: FieldType.Number,
+                },
+              ],
+              modelId: modelId,
+            }}
+          />
+        )}
+
+      {/* Labels — applied to monitors created from this template. */}
+      <CardModelDetail<MonitorTemplate>
+        name="Labels"
+        cardProps={{
+          title: "Labels",
+          description:
+            "Default labels applied to monitors created from this template.",
+          buttons: [
+            {
+              title: syncLabelsButtonTitle,
+              icon: IconProp.Refresh,
+              buttonStyle: ButtonStyleType.NORMAL,
+              disabled: linkedMonitorCount === 0,
+              onClick: () => {
+                setSyncResultMessage("");
+                setLabelsSyncError("");
+                setShowLabelsSyncModal(true);
+              },
+            },
+          ],
+        }}
+        isEditable={true}
+        editButtonText="Edit Labels"
+        formFields={[
+          {
+            field: {
+              labels: true,
+            },
+            title: "Labels",
+            description:
+              "Default labels applied to monitors created from this template.",
+            fieldType: FormFieldSchemaType.MultiSelectDropdown,
+            dropdownModal: {
+              type: Label,
+              labelField: "name",
+              valueField: "_id",
+            },
+            required: false,
+            placeholder: "Labels",
+          },
+        ]}
+        modelDetailProps={{
+          showDetailsInNumberOfColumns: 1,
+          modelType: MonitorTemplate,
+          id: "model-detail-monitor-template-labels",
+          fields: [
+            {
+              field: {
+                labels: {
+                  name: true,
+                  color: true,
+                },
+              },
+              title: "Labels",
+              fieldType: FieldType.Element,
+              getElement: (item: MonitorTemplate): ReactElement => {
+                return <LabelsElement labels={item.labels || []} />;
+              },
+            },
+          ],
+          modelId: modelId,
+        }}
+      />
+
+      {/*
+       * Custom field defaults (issue #3548). Written onto every monitor this
+       * template provisions — including the ones an auto-import rule creates
+       * from a discovery scan, which is the case where filling them in by hand
+       * afterwards means opening a thousand monitors one at a time.
+       *
+       * `hideIfEmpty` for the same reason the resource overview pages use it:
+       * a project that has defined no Monitor Custom Fields has nothing to
+       * default, and reading the schema is gated on a billing plan besides.
+       */}
+      <CustomFieldsDetail
+        title="Custom Field Defaults"
+        description="Custom field values written onto every monitor created from this template — including monitors provisioned automatically by auto-import rules and alert policies. Fields left blank here are not defaulted."
+        modelType={MonitorTemplate}
+        customFieldType={MonitorCustomField}
+        name="Monitor Template Custom Field Defaults"
+        projectId={ProjectUtil.getCurrentProject()!.id!}
+        modelId={modelId}
+        hideIfEmpty={true}
+        onValuesLoaded={setTemplateCustomFields}
+        additionalButtons={[
+          {
+            title: syncCustomFieldsButtonTitle,
+            icon: IconProp.Refresh,
+            buttonStyle: ButtonStyleType.NORMAL,
+            disabled: linkedMonitorCount === 0 || !hasCustomFieldDefaults,
+            tooltip: hasCustomFieldDefaults
+              ? undefined
+              : "Set at least one default above before syncing.",
+            onClick: () => {
+              setSyncResultMessage("");
+              setCustomFieldsSyncError("");
+              setShowCustomFieldsSyncModal(true);
+            },
+          },
+        ]}
+      />
+
+      <MonitorsTable
+        title={linkedMonitorsTitle}
+        description="Monitors created from or linked to this template. Use the sync buttons on the cards above to push the template's criteria, monitoring interval, labels, or custom field defaults onto every linked monitor."
+        noItemsMessage="No monitors are linked to this template yet."
+        disableCreate={true}
+        query={linkedMonitorsQuery}
+        cardButtons={[
+          {
+            /*
+             * The same rows, on the page where monitors are actually worked
+             * with — bulk actions, saved views, every other chip. The Template
+             * chip travels in the monitor list's own facet URL namespace, so
+             * the list arrives with a real, editable chip rather than a filter
+             * hidden under the table.
+             */
+            title: "Open in Monitors List",
+            icon: IconProp.ExternalLink,
+            buttonStyle: ButtonStyleType.NORMAL,
+            onClick: () => {
+              Navigation.navigate(
+                getMonitorListRouteForFacet(
+                  getMonitorTemplateFacetSelection(modelId.toString()),
+                ),
+              );
+            },
+          },
+          {
+            title: "Link Existing Monitors",
+            icon: IconProp.Add,
+            buttonStyle: ButtonStyleType.NORMAL,
+            disabled: !monitorType,
+            onClick: () => {
+              setSyncResultMessage("");
+              setLinkError("");
+              setShowLinkModal(true);
+            },
+          },
+        ]}
+        actionButtons={[
+          {
+            title: "Sync from Template",
+            icon: IconProp.Refresh,
+            buttonStyleType: ButtonStyleType.NORMAL,
+            onClick: (
+              monitor: Monitor,
+              onCompleteAction: VoidFunction,
+              _onError: ErrorFunction,
+            ) => {
+              setSyncResultMessage("");
+              setSingleSyncError("");
+              setSingleSyncMonitor(monitor);
+              onCompleteAction();
+            },
+          },
+          {
+            title: "Unlink from Template",
+            icon: IconProp.Close,
+            buttonStyleType: ButtonStyleType.NORMAL,
+            onClick: (
+              monitor: Monitor,
+              onCompleteAction: VoidFunction,
+              _onError: ErrorFunction,
+            ) => {
+              setSyncResultMessage("");
+              setUnlinkError("");
+              setUnlinkTarget(monitor);
+              onCompleteAction();
+            },
+          },
+        ]}
+        refreshToggle={tableRefreshToggle}
+      />
+
+      <ModelDelete
+        modelType={MonitorTemplate}
+        modelId={modelId}
+        onDeleteSuccess={() => {
+          Navigation.navigate(
+            RouteUtil.populateRouteParams(
+              RouteMap[PageMap.MONITORS_SETTINGS_TEMPLATES] as Route,
+              { modelId },
+            ),
+          );
+        }}
+      />
+
+      {showCriteriaSyncModal && (
+        <ConfirmModal
+          title="Sync Criteria to Linked Monitors"
+          description={
+            <span>
+              {`This will copy the template's criteria and step settings, including destinations and request options where applicable, to ${linkedMonitorCount} linked monitor${linkedMonitorCount === 1 ? "" : "s"}. ${protectedFieldsSummary} Monitoring interval, minimum probe agreement, name, description, labels, and custom field values will be left alone. This cannot be undone.`}
+            </span>
+          }
+          submitButtonText="Sync Criteria"
+          submitButtonType={ButtonStyleType.PRIMARY}
+          isLoading={isSyncingCriteria}
+          error={criteriaSyncError}
+          onSubmit={onSyncCriteriaSubmit}
+          onClose={() => {
+            setShowCriteriaSyncModal(false);
+            setCriteriaSyncError("");
+          }}
+        />
+      )}
+
+      {showIntervalSyncModal && (
+        <ConfirmModal
+          title="Sync Interval to Linked Monitors"
+          description={
+            <span>
+              {`This will overwrite the monitoring interval and minimum probe agreement on ${linkedMonitorCount} monitor${linkedMonitorCount === 1 ? "" : "s"} created from this template. Criteria, name, description, labels, and custom field values will be left alone. This cannot be undone.`}
+            </span>
+          }
+          submitButtonText="Sync Interval"
+          submitButtonType={ButtonStyleType.PRIMARY}
+          isLoading={isSyncingInterval}
+          error={intervalSyncError}
+          onSubmit={onSyncIntervalSubmit}
+          onClose={() => {
+            setShowIntervalSyncModal(false);
+            setIntervalSyncError("");
+          }}
+        />
+      )}
+
+      {showLabelsSyncModal && (
+        <ConfirmModal
+          title="Sync Labels to Linked Monitors"
+          description={
+            <span>
+              {`This will overwrite ONLY the labels on ${linkedMonitorCount} monitor${linkedMonitorCount === 1 ? "" : "s"} created from this template. Criteria, monitoring interval, minimum probe agreement, name, description, and custom field values will be left alone. This cannot be undone.`}
+            </span>
+          }
+          submitButtonText="Sync Labels"
+          submitButtonType={ButtonStyleType.PRIMARY}
+          isLoading={isSyncingLabels}
+          error={labelsSyncError}
+          onSubmit={onSyncLabelsSubmit}
+          onClose={() => {
+            setShowLabelsSyncModal(false);
+            setLabelsSyncError("");
+          }}
+        />
+      )}
+
+      {showCustomFieldsSyncModal && (
+        <ConfirmModal
+          title="Sync Custom Fields to Linked Monitors"
+          description={
+            <span>
+              {`This will overwrite the ${customFieldDefaultNames.length} custom field${customFieldDefaultNames.length === 1 ? "" : "s"} this template defaults (${customFieldDefaultNames.join(", ")}) on ${linkedMonitorCount} monitor${linkedMonitorCount === 1 ? "" : "s"} created from this template, replacing any value entered on those monitors. Custom fields this template leaves blank are not touched, and neither are criteria, monitoring interval, labels, name, or description. This cannot be undone.`}
+            </span>
+          }
+          submitButtonText="Sync Custom Fields"
+          submitButtonType={ButtonStyleType.PRIMARY}
+          isLoading={isSyncingCustomFields}
+          error={customFieldsSyncError}
+          onSubmit={onSyncCustomFieldsSubmit}
+          onClose={() => {
+            setShowCustomFieldsSyncModal(false);
+            setCustomFieldsSyncError("");
+          }}
+        />
+      )}
+
+      {singleSyncMonitor && (
+        <ConfirmModal
+          title="Sync Monitor from Template"
+          description={
+            <span>
+              {`This will copy the template's criteria and step settings, including destinations and request options where applicable, plus its monitoring interval, minimum probe agreement, and labels to "${singleSyncMonitor.name || "this monitor"}". ${protectedFieldsSummary} Name, description, and custom field values will be left alone. This cannot be undone.`}
+            </span>
+          }
+          submitButtonText="Sync Now"
+          submitButtonType={ButtonStyleType.PRIMARY}
+          isLoading={isSyncingSingle}
+          error={singleSyncError}
+          onSubmit={onSingleSyncSubmit}
+          onClose={() => {
+            setSingleSyncMonitor(null);
+            setSingleSyncError("");
+          }}
+        />
+      )}
+
+      {showLinkModal && (
+        <BasicFormModal<{ monitorIds: Array<string> }>
+          title="Link Existing Monitors"
+          description={
+            isLoadingEligibleMonitors
+              ? "Loading monitors that can be linked…"
+              : `Select ${monitorType ? monitorType : ""} monitors in this project to link to this template. Monitors already linked here are hidden; monitors linked to a different template will be moved to this one.`
+          }
+          submitButtonText="Link"
+          isLoading={isLinking}
+          error={linkError}
+          onClose={() => {
+            setShowLinkModal(false);
+            setLinkError("");
+            setEligibleMonitors([]);
+          }}
+          onSubmit={onLinkSubmit}
+          formProps={{
+            fields: [
+              {
+                field: {
+                  monitorIds: true,
+                },
+                title: "Monitors",
+                description:
+                  eligibleMonitors.length === 0 && !isLoadingEligibleMonitors
+                    ? "No eligible monitors found in this project for this monitor type."
+                    : "",
+                fieldType: FormFieldSchemaType.MultiSelectDropdown,
+                required: true,
+                dropdownOptions: eligibleMonitors.map((monitor: Monitor) => {
+                  return {
+                    label: monitor.name || "(unnamed monitor)",
+                    value: monitor._id?.toString() || "",
+                  };
+                }),
+              },
+            ],
+          }}
+        />
+      )}
+
+      {unlinkTarget && (
+        <ConfirmModal
+          title="Unlink Monitor from Template"
+          description={
+            <span>
+              {`This will detach "${unlinkTarget.name || "this monitor"}" from this template. The monitor keeps its current criteria, interval, and other settings — but it will no longer receive sync updates from this template.`}
+            </span>
+          }
+          submitButtonText="Unlink"
+          submitButtonType={ButtonStyleType.DANGER}
+          isLoading={isUnlinking}
+          error={unlinkError}
+          onSubmit={onUnlinkSubmit}
+          onClose={() => {
+            setUnlinkTarget(null);
+            setUnlinkError("");
+          }}
+        />
+      )}
+
+      {syncResultMessage && (
+        <ConfirmModal
+          title={syncResultTitle}
+          description={syncResultMessage}
+          submitButtonText="OK"
+          submitButtonType={ButtonStyleType.PRIMARY}
+          onSubmit={() => {
+            setSyncResultMessage("");
+          }}
+        />
+      )}
+    </Fragment>
+  );
+};
+
+export default MonitorTemplatesView;

@@ -45,21 +45,117 @@
     },
     "clusterName": {
       "type": "string",
-      "description": "Unique name for this cluster (used as k8s.cluster.name attribute)"
+      "description": "Unique name for this cluster (used as k8s.cluster.name attribute). Set it: OneUptime folds k8s.cluster.name into the identity of every Kubernetes entity, so an empty value keys this cluster's pods, nodes and namespaces cluster-lessly and lets them collide with another cluster's."
     },
     "namespaceFilters": {
       "type": "object",
-      "description": "Namespace filters to limit which namespaces are monitored",
+      "description": "Scoped namespace rules. Patterns match the full namespace name and support * as a wildcard. Include rules form a per-scope allowlist; exclude rules always win.",
       "properties": {
-        "include": {
+        "rules": {
           "type": "array",
-          "items": { "type": "string" },
-          "description": "If set, only these namespaces are monitored (empty = all namespaces)"
+          "description": "Namespace filtering rules evaluated independently for each scope.",
+          "items": {
+            "type": "object",
+            "required": ["action", "namespaces", "scopes"],
+            "properties": {
+              "action": {
+                "type": "string",
+                "enum": ["include", "exclude"],
+                "description": "Include creates an allowlist for the selected scopes; exclude drops matching namespaces and always wins."
+              },
+              "namespaces": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 63,
+                  "pattern": "^[a-z0-9*]([-a-z0-9*]*[a-z0-9*])?$"
+                },
+                "description": "Full namespace names or patterns using * as a wildcard."
+              },
+              "scopes": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "enum": ["podLogs", "ebpfDiscovery", "metrics", "traces"]
+                },
+                "description": "Where this rule applies. podLogs and ebpfDiscovery filter at source; metrics and traces filter after metadata enrichment."
+              }
+            },
+            "additionalProperties": false
+          },
+          "default": []
+        }
+      },
+      "required": ["rules"],
+      "additionalProperties": false
+    },
+    "filters": {
+      "type": "object",
+      "description": "Drop telemetry at the agent, before export, via an OTel filter processor",
+      "properties": {
+        "logs": {
+          "type": "object",
+          "description": "Log filtering",
+          "properties": {
+            "minSeverity": {
+              "type": "string",
+              "enum": ["", "TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL"],
+              "description": "Drop pod log records below this severity. Empty keeps everything. Applies in both log modes. Does not filter Kubernetes events or resource specs. In api mode, lines with no recognisable level are kept. Default: \"\""
+            }
+          },
+          "additionalProperties": false
         },
-        "exclude": {
-          "type": "array",
-          "items": { "type": "string" },
-          "description": "Namespaces to exclude from monitoring"
+        "metrics": {
+          "type": "object",
+          "description": "Metric filtering by name, across every receiver",
+          "properties": {
+            "include": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Allowlist of metric names. When non-empty, only matching metrics are sent."
+            },
+            "exclude": {
+              "type": "array",
+              "items": { "type": "string" },
+              "description": "Denylist of metric names. Applied on top of include, so exclude always wins."
+            },
+            "matchType": {
+              "type": "string",
+              "enum": ["strict", "regexp"],
+              "description": "How include/exclude entries match: 'strict' (exact name) or 'regexp' (RE2, unanchored, no lookahead). Default: strict"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "sampling": {
+      "type": "object",
+      "description": "Keep a fraction of traces and drop the rest at the agent, before export",
+      "properties": {
+        "traces": {
+          "type": "object",
+          "description": "Trace sampling. Hash-based on the trace ID, so whole traces are kept or dropped together",
+          "properties": {
+            "percentage": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 100,
+              "description": "Percentage of traces to KEEP, 0-100. 100 keeps everything and omits the sampler. 0 keeps none — it is a rate, not an off switch; use ebpf.enabled=false to stop collecting traces. Only applies when ebpf.enabled. Does not affect eBPF RED metrics, which ride the metrics pipeline. Default: 100"
+            },
+            "hashSeed": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295,
+              "description": "Seed for the trace-ID hash. Collectors that must agree on which traces to keep need a matching hashSeed AND percentage. Change only to deliberately decorrelate two sampling tiers. Bounded to uint32 because the collector stores it as one and truncates silently past that. Default: 22"
+            }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false
@@ -245,6 +341,17 @@
           "enum": ["", "daemonset", "api", "disabled"],
           "description": "Advanced override. Leave empty to let 'preset' decide. daemonset: hostPath filelog DaemonSet. api: Kubernetes API log tailer Deployment (GKE Autopilot compatible). disabled: no log collection."
         },
+        "windowsPods": {
+          "type": "object",
+          "description": "Hybrid log collection for clusters with Windows node pools. Only meaningful in daemonset log mode.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Run the API log tailer alongside the DaemonSet, restricted to pods on Windows nodes (which the Linux-only DaemonSet cannot reach). Linux pods keep node-local file tailing; the two collectors never ship the same line twice. Requires a tailer image no older than this chart's release — older images ignore NODE_OS_INCLUDE and tail every pod, duplicating Linux logs. No effect in api mode or when logs are disabled. Default: false"
+            }
+          },
+          "additionalProperties": false
+        },
         "resources": {
           "type": "object",
           "properties": {
@@ -378,7 +485,7 @@
         "metricsAllowlist": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Exact __name__ allowlist. Each entry adds one series per container, so keep it tight."
+          "description": "Allowlist of cAdvisor metric names. Entries are joined into a Prometheus keep rule of the form ^(a|b)$, so each one is an RE2 fragment rather than a literal name. Each entry adds one series per container, so keep it tight."
         }
       },
       "additionalProperties": false
@@ -398,10 +505,15 @@
           "description": "URL to scrape when mode == 'external'. Example: http://kube-state-metrics.kube-system.svc.cluster.local:8080/metrics"
         },
         "scrapeInterval": { "type": "string" },
+        "collectResources": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Which Kubernetes objects the bundled KSM watches (--resources). A hard ceiling on metricsAllowlist: KSM cannot emit a metric for an object it never watched. Ignored when mode is 'external'. Default: [pods, resourcequotas]"
+        },
         "metricsAllowlist": {
           "type": "array",
           "items": { "type": "string" },
-          "description": "Exact __name__ allowlist. KSM exports ~100 metric families by default; only keep the ones that power monitors."
+          "description": "Allowlist of KSM metric names. Each entry is used as a prefix ('.*' is appended), so kube_pod_status also keeps kube_pod_status_phase. In bundled mode an entry only yields series if its object is listed in collectResources."
         },
         "image": {
           "type": "object",
@@ -424,6 +536,186 @@
               "type": "object",
               "properties": { "cpu": { "type": "string" }, "memory": { "type": "string" } },
               "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "cost": {
+      "type": "object",
+      "description": "Kubernetes cost observability. `cost.enabled=true` alone is a complete install: the chart bundles OpenCost plus a minimal dedicated Prometheus. Set cost.engine.url to use an existing OpenCost/Kubecost instead (nothing is bundled then).",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "engine": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "description": "Base URL of an EXISTING cost engine. Empty (default) bundles OpenCost + a minimal Prometheus. Example: http://opencost.opencost.svc.cluster.local:9003"
+            },
+            "prometheusUrl": {
+              "type": "string",
+              "description": "Prometheus the cost agent reads per-container memory peaks from, for right-sizing recommendations. Empty (default) uses the bundled Prometheus when the engine is bundled, and nothing when an external engine is configured. Without it, CPU recommendations still work and memory ones are unavailable."
+            },
+            "prometheusCadvisorJob": {
+              "type": "string",
+              "description": "Prometheus job label of the cAdvisor scrape. Empty (default) uses kubernetes-nodes-cadvisor, which is what the bundled Prometheus names it. Override when reusing your own Prometheus."
+            },
+            "allocationPath": {
+              "type": "string",
+              "description": "Explicit Allocation API path. Empty auto-detects (/model/allocation, /allocation/compute, /allocation)."
+            }
+          },
+          "additionalProperties": false
+        },
+        "opencost": {
+          "type": "object",
+          "description": "Bundled OpenCost engine. Deployed only when cost.enabled is true and cost.engine.url is empty.",
+          "properties": {
+            "image": {
+              "type": "object",
+              "properties": {
+                "repository": { "type": "string" },
+                "tag": { "type": "string" },
+                "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+              },
+              "additionalProperties": false
+            },
+            "logLevel": { "type": "string" },
+            "resources": {
+              "type": "object",
+              "properties": {
+                "requests": {
+                  "type": "object",
+                  "properties": { "cpu": { "type": "string" }, "memory": { "type": "string" } },
+                  "additionalProperties": false
+                },
+                "limits": {
+                  "type": "object",
+                  "properties": { "cpu": { "type": "string" }, "memory": { "type": "string" } },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            },
+            "customPricing": {
+              "type": "object",
+              "description": "Rate card for on-prem / bare-metal clusters. All values are USD per resource-HOUR.",
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "cpuPerCoreHour": { "type": "string" },
+                "spotCpuPerCoreHour": { "type": "string" },
+                "ramPerGiBHour": { "type": "string" },
+                "spotRamPerGiBHour": { "type": "string" },
+                "gpuPerHour": { "type": "string" },
+                "storagePerGBHour": { "type": "string" },
+                "zoneNetworkEgressPerGB": { "type": "string" },
+                "regionNetworkEgressPerGB": { "type": "string" },
+                "internetNetworkEgressPerGB": { "type": "string" }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "prometheus": {
+          "type": "object",
+          "description": "Minimal dedicated Prometheus for the bundled OpenCost (usage/price history). Deployed only alongside the bundled engine.",
+          "properties": {
+            "image": {
+              "type": "object",
+              "properties": {
+                "repository": { "type": "string" },
+                "tag": { "type": "string" },
+                "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+              },
+              "additionalProperties": false
+            },
+            "retention": { "type": "string" },
+            "scrapeInterval": { "type": "string" },
+            "resources": {
+              "type": "object",
+              "properties": {
+                "requests": {
+                  "type": "object",
+                  "properties": { "cpu": { "type": "string" }, "memory": { "type": "string" } },
+                  "additionalProperties": false
+                },
+                "limits": {
+                  "type": "object",
+                  "properties": { "cpu": { "type": "string" }, "memory": { "type": "string" } },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            },
+            "persistence": {
+              "type": "object",
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "size": { "type": "string" },
+                "storageClass": { "type": "string" }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "agent": {
+          "type": "object",
+          "description": "Allocation poller Deployment (oneuptime/kubernetes-cost-agent).",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "image": {
+              "type": "object",
+              "properties": {
+                "repository": { "type": "string" },
+                "tag": { "type": "string" },
+                "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+              },
+              "additionalProperties": false
+            },
+            "windowSeconds": { "type": "integer" },
+            "pollIntervalSeconds": { "type": "integer" },
+            "engineSettleSeconds": { "type": "integer" },
+            "lookbackWindows": { "type": "integer" },
+            "includeIdle": { "type": "boolean" },
+            "currency": { "type": "string" },
+            "logLevel": { "type": "string" },
+            "resources": {
+              "type": "object",
+              "properties": {
+                "requests": {
+                  "type": "object",
+                  "properties": { "cpu": { "type": "string" }, "memory": { "type": "string" } },
+                  "additionalProperties": false
+                },
+                "limits": {
+                  "type": "object",
+                  "properties": { "cpu": { "type": "string" }, "memory": { "type": "string" } },
+                  "additionalProperties": false
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "metrics": {
+          "type": "object",
+          "description": "Prometheus scrape of the engine's /metrics through the deployment collector's OTLP export.",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "endpoint": {
+              "type": "string",
+              "description": "Metrics endpoint. Empty defaults to <cost.engine.url>/metrics."
+            },
+            "scrapeInterval": { "type": "string" },
+            "metricsAllowlist": {
+              "type": "array",
+              "items": { "type": "string" }
             }
           },
           "additionalProperties": false
@@ -475,7 +767,7 @@
         },
         "nodeSelector": {
           "type": "object",
-          "description": "nodeSelector for the eBPF agent DaemonSet pods."
+          "description": "nodeSelector for the eBPF agent DaemonSet pods. The chart always merges in `kubernetes.io/os: linux` (keys set here win on conflict) so agent pods never schedule onto Windows nodes."
         },
         "tolerations": {
           "type": "array",
@@ -542,12 +834,12 @@
         },
         "contextPropagation": {
           "type": "boolean",
-          "description": "Inject W3C `traceparent` into outbound traffic so traces span services without SDK changes."
+          "description": "Inject a W3C `traceparent` into outbound traffic so traces span services without SDK changes. **Off by default** — this matches OBI's own default, and it is off because every mode rewrites in-flight traffic: plaintext HTTP is widened in place via `bpf_probe_write_user`, while TLS and raw TCP get a TCP option appended from a Traffic Control hook. A bad rewrite desynchronizes the connection instead of just losing a span — the reported symptom is transfers through an L7 proxy (nginx) hanging mid-body once the response grows past ~64KB. There is no kernel version at which enabling this is inert — below 5.17 OBI falls back to bounded-scan program variants and keeps rewriting traffic, so do not use kernel age to rule the agent out as a suspect. Injection is gated on CAP_SYS_ADMIN and the absence of kernel lockdown, and this DaemonSet runs privileged, so that gate is always open. Opt in on a non-production cluster first."
         },
         "contextPropagationMode": {
           "type": "string",
-          "enum": ["headers", "ip", "all"],
-          "description": "How OBI injects the traceparent. 'headers' (default, safe with service meshes / mTLS / eBPF CNIs) — HTTP/1.1 request headers only. 'ip' — IPv4/IPv6 option on outbound packets (covers raw TCP but may be dropped by middleboxes). 'all' — both (most coverage; the IP-option half can break service-mesh proxies)."
+          "enum": ["headers", "tcp", "all"],
+          "description": "How OBI injects the traceparent; only read when `contextPropagation` is true. 'headers' (default) — HTTP/1.1 request headers; narrowest blast radius, but not packet-free (plaintext HTTP is widened in place, and HTTPS falls back to the TCP-option path since OBI cannot see the headers). 'tcp' — TCP option injected via Linux Traffic Control; covers non-HTTP and encrypted traffic but is often stripped by middleboxes and must chain with other TC programs (Cilium, Calico). 'all' — both; most coverage and most rewriting, and the TCP-option half can break service-mesh proxies (linkerd2-proxy, envoy) by corrupting bytes they validate. The legacy 'ip' value was removed upstream and now does nothing, so it is rejected here rather than silently disabling propagation."
         },
         "trackRequestHeaders": {
           "type": "boolean",
@@ -699,6 +991,225 @@
         "annotations": {
           "type": "object",
           "additionalProperties": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "aiAgent": {
+      "type": "object",
+      "description": "Kubernetes AI agent: one small pod that lets OneUptime AI run read-only kubectl on this cluster while it investigates incidents and alerts and, with remediation.enabled, policy-checked kubectl fixes. On by default.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Deploy the Kubernetes AI agent (default true) with read-only RBAC (get/list/watch, pod logs and the access reviews kubectl auth can-i needs), bound cluster-wide. It connects with oneuptime.apiKey (a key with a Pinned Service Name cannot register it) and clusterName, and needs a OneUptime server of this chart's version or newer. Set false to turn it off; the deprecated aiAccess.enabled is not read."
+        },
+        "remediation": {
+          "type": "object",
+          "description": "Write access for OneUptime AI's fixes. Leave a key unset to keep the matching stored aiAccess.remediation value; a value set here wins.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Also grant the write RBAC OneUptime AI's fixes use: patch/update on Deployments, StatefulSets, DaemonSets, ReplicaSets, their scale subresource, Jobs, CronJobs, Pods and HPAs; create on Jobs and HPAs; delete on Pods and Jobs only. Patch/update on workloads, pods and CronJobs (and create on Jobs) in a namespace is equivalent to running any image as any ServiceAccount in that namespace and reading its Secrets, so this is bound only in remediation.namespaces when that lists any, and cluster-wide otherwise; the command policy, not RBAC, refuses pod-template security patches, set serviceaccount, create deployment/cronjob/job --image, expose --overrides and patch bodies that are not JSON, while set image stays a riskier change a human approves unless the cluster bypasses approvals or its allowlist names it; in every mode it never runs a write in kube-system, kube-public or kube-node-lease, a drain, a taint or a patch of a node without a human. Never secrets, exec, attach, port-forward, CRDs or RBAC writes. The agent refuses writes locally when this is off. A cluster whose agent connects for the first time with this on starts in ask-for-approval, unless AI settings were already picked on its AI agent page (they are kept as chosen). Unset: a stored aiAccess.enabled plus aiAccess.remediation.enabled carries over, else false."
+            },
+            "namespaces": {
+              "type": "array",
+              "description": "Namespaces to bind the remediation write role in, one RoleBinding each. Empty binds it cluster-wide with a ClusterRoleBinding, which RBAC cannot keep out of kube-system, kube-public, kube-node-lease or this release's namespace: there the policy (never without a human in the three system namespaces) and the agent (never its own namespace) hold the line. The agent refuses writes outside the list before spawning kubectl. This release's own namespace may not be listed. Every listed namespace must already exist: the chart creates a RoleBinding in each and never a namespace, so a missing one fails the install or upgrade with namespaces \"<name>\" not found. Take a namespace off the list before deleting it. To go back to cluster-wide on a release that stores a list, pass --set-json 'aiAgent.remediation.namespaces=[]' (Helm 3.10+), not {} (Helm reads that as one empty name, which is refused). Unset: a stored aiAccess.remediation.namespaces carries over when the stored write access was on.",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 63,
+                "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+              }
+            },
+            "nodeOperations": {
+              "type": "boolean",
+              "description": "With remediation.enabled, also grant cordon/uncordon/taint (patch on nodes) and drain (create on pods/eviction), cluster-wide since nodes are cluster-scoped, in a ClusterRole of their own. A drain, a taint or a patch of a node always waits for a human, in every mode. Default true (or a stored aiAccess.remediation.nodeOperations); set false to keep OneUptime AI's fixes off nodes: no node RBAC is granted and ONEUPTIME_KUBECTL_ALLOW_NODE_OPERATIONS=false tells the agent to refuse cordon, uncordon, drain, taint and label/annotate/patch on a node before it spawns kubectl."
+            }
+          },
+          "additionalProperties": false
+        },
+        "image": {
+          "type": "object",
+          "properties": {
+            "repository": {
+              "type": "string",
+              "description": "Default oneuptime/kubernetes-ai-agent. Point it at a mirror when the cluster cannot pull from Docker Hub."
+            },
+            "tag": {
+              "type": "string",
+              "description": "Empty tracks the moving release tag. Pin a OneUptime version to hold it."
+            },
+            "pullPolicy": {
+              "type": "string",
+              "description": "Empty means Always for a moving tag (release, the default) and IfNotPresent for a pinned tag.",
+              "enum": [
+                "",
+                "Always",
+                "IfNotPresent",
+                "Never"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "imagePullSecrets": {
+          "type": "array",
+          "description": "Image pull secrets (existing Secrets in this release's namespace) for a private registry or mirror of the agent image.",
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+              "name": { "type": "string", "minLength": 1 }
+            },
+            "additionalProperties": false
+          }
+        },
+        "resources": {
+          "type": "object",
+          "properties": {
+            "requests": {
+              "type": "object",
+              "properties": {
+                "cpu": {
+                  "type": "string"
+                },
+                "memory": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            },
+            "limits": {
+              "type": "object",
+              "properties": {
+                "cpu": {
+                  "type": "string"
+                },
+                "memory": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "extraEnv": {
+          "type": "array",
+          "description": "Extra environment variables for the agent container, as Kubernetes EnvVar objects (use --set-string for values), e.g. HTTPS_PROXY and NO_PROXY for an egress proxy. Names the chart sets itself (ONEUPTIME_URL, ONEUPTIME_API_KEY, ONEUPTIME_KUBERNETES_CLUSTER_NAME, ONEUPTIME_KUBERNETES_AGENT_CHART_VERSION, ONEUPTIME_KUBECTL_ALLOW_WRITES, ONEUPTIME_KUBECTL_WRITE_NAMESPACES, ONEUPTIME_KUBECTL_ALLOW_NODE_OPERATIONS, ONEUPTIME_AI_AGENT_POD_NAMESPACE, HOME, KUBECACHEDIR, PORT) fail the render. Unset: a stored aiAccess.extraEnv carries over; clear it with --set-json 'aiAgent.extraEnv=[]' (--set passes [] as a string, which is refused).",
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "value": { "type": "string" },
+              "valueFrom": { "type": "object" }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "aiAccess": {
+      "type": "object",
+      "description": "Deprecated: use aiAgent. Kept so releases that stored these values (charts 14.0.2 to 14.0.8) still upgrade. remediation.* and extraEnv carry over to the Kubernetes AI agent while the matching aiAgent key is unset; enabled, image and resources are ignored.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Deprecated and ignored: the Kubernetes AI agent is on by default; turn it off with aiAgent.enabled=false. Carries aiAccess.remediation.enabled over only when both are true."
+        },
+        "remediation": {
+          "type": "object",
+          "description": "Deprecated: use aiAgent.remediation.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Deprecated: use aiAgent.remediation.enabled."
+            },
+            "namespaces": {
+              "type": "array",
+              "description": "Deprecated: use aiAgent.remediation.namespaces.",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 63,
+                "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+              }
+            },
+            "nodeOperations": {
+              "type": "boolean",
+              "description": "Deprecated: use aiAgent.remediation.nodeOperations."
+            }
+          },
+          "additionalProperties": false
+        },
+        "image": {
+          "type": "object",
+          "description": "Deprecated and ignored: use aiAgent.image.",
+          "properties": {
+            "repository": {
+              "type": "string"
+            },
+            "tag": {
+              "type": "string"
+            },
+            "pullPolicy": {
+              "type": "string",
+              "enum": [
+                "",
+                "Always",
+                "IfNotPresent",
+                "Never"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "resources": {
+          "type": "object",
+          "description": "Deprecated and ignored: use aiAgent.resources.",
+          "properties": {
+            "requests": {
+              "type": "object",
+              "properties": {
+                "cpu": {
+                  "type": "string"
+                },
+                "memory": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            },
+            "limits": {
+              "type": "object",
+              "properties": {
+                "cpu": {
+                  "type": "string"
+                },
+                "memory": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
+        },
+        "extraEnv": {
+          "type": "array",
+          "description": "Deprecated: use aiAgent.extraEnv. Carried over while aiAgent.extraEnv is unset, with the same reserved names refused.",
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "value": { "type": "string" },
+              "valueFrom": { "type": "object" }
+            },
+            "additionalProperties": false
+          }
         }
       },
       "additionalProperties": false

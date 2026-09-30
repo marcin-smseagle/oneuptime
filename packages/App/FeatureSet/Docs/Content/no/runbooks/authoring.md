@@ -1,0 +1,99 @@
+# Skrive et runbook
+
+Opprett et runbook under **Runbooks → Opprett runbook**, åpne det og gå til fanen **Trinn**.
+
+## Anatomien til et trinn
+
+Hvert trinn har:
+
+| Felt                            | Hensikt                                                                                                     |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| **Tittel**                      | Kort betegnelse i sjekkliste-UI-en. Påkrevd.                                                                |
+| **Beskrivelse**                 | Valgfri kontekst til responderen. Markdown-tekst.                                                           |
+| **Fortsett ved feil**           | Hvis på, stopper et feilet trinn ikke kjøringen — neste trinn kjører likevel.                               |
+| **Krev godkjenning**            | Hvis på, pauser runbook'et etter dette trinnet og venter på at en bruker godkjenner før neste trinn kjøres. |
+| **Typespesifikk konfigurasjon** | Skript, URL, agent osv. — se nedenfor.                                                                      |
+
+Trinn kjører **i rekkefølge**. Omorganiser med pilene opp/ned i trinn-editoren.
+
+## Trinntyper
+
+### Manuell
+
+En boks responderen huker av. Kjøringen pauses ved et manuelt trinn og blir værende i `WaitingForManualStep` til noen markerer det som fullført (eller hopper over).
+
+Bruk det for noe bare et menneske kan verifisere: "Trafikken er flyttet til sekundær region ifølge load balancer-dashbordet — bekreftet."
+
+### JavaScript
+
+En JavaScript-snutt som kjøres i en `isolated-vm`-sandkasse. Sandkassen lever på en [Runbook-agent](/docs/runbooks/agents) i din egen infrastruktur — ikke på OneUptime-Worker'en.
+
+Konfigurer på et JavaScript-trinn:
+
+- **Runbook-agent** — velg agenten som skal kjøre dette trinnet, fra nedtrekksmenyen. Bare den valgte agenten kan claime jobben.
+- **Skript** — JavaScript-koden som skal kjøres.
+- **Execution timeout** — hvor lenge agenten lar snutten kjøre før isolaten rives ned. Standard er 30 sekunder.
+- **Claim timeout** — hvor lenge Worker'en venter på at agenten plukker opp jobben. Standard er 2 minutter.
+
+```js
+const start = Date.now();
+// ... din logikk ...
+return { durationMs: Date.now() - start };
+```
+
+Returverdien lagres på trinn-kjøringen. `console.log`-output fanges som loglinjer. Standard execution timeout: 30 sekunder. Standard claim timeout (hvor lenge Worker'en venter på at agenten plukker opp jobben): 2 minutter. Begge kan redigeres på trinnet — se **Execution timeout** og **Claim timeout** under skriptet.
+
+### HTTP-forespørsel
+
+Et utgående HTTP-kall. Konfigurer metode (GET/POST/PUT/PATCH/DELETE/HEAD), URL, valgfrie JSON-headere, valgfri body og en **Request timeout** (standard 30 sekunder). Status, headere og body på svaret lagres (totalt opp til 50 KB).
+
+Nyttig for: åpne en PagerDuty-hendelse, poste på Slack, kalle din egen admin-API osv. HTTP-trinn kjører direkte på OneUptime-Worker'en; ingen agent påkrevd.
+
+### Bash
+
+Et bash-skript (`bash -c <skript>`) som kjøres på en [Runbook-agent](/docs/runbooks/agents) i din egen infrastruktur. Bash kjøres aldri på OneUptime-Worker'en.
+
+Konfigurer på et Bash-trinn:
+
+- **Runbook-agent** — velg agenten som skal kjøre dette trinnet, fra nedtrekksmenyen. Bare den valgte agenten kan claime jobben.
+- **Skript** — bash'en som skal kjøres. Output (stdout + stderr) fanges opp til 50 KB; prosessen drepes ved timeout.
+- **Execution timeout** — hvor lenge agenten lar skriptet kjøre før den dreper det med `SIGKILL`. Standard er 30 sekunder; øk den for trinn som faktisk trenger flere minutter.
+- **Claim timeout** — hvor lenge Worker'en venter på at agenten plukker opp jobben. Standard er 2 minutter.
+
+Hvis den valgte agenten er offline når runbook'et når dette trinnet, venter trinnet opp til **claim timeout** (standard 2 minutter) og feiler så med `TimedOut`. Legg til en agent under **Runbooks → Innstillinger → Agents** før du baserer deg på et Bash-trinn.
+
+### AI
+
+Be AI om å analysere, oppsummere eller avgjøre noe midt i kjøringen. Prompten sendes til prosjektets LLM-leverandør (**Innstillinger → AI → LLM-leverandører**), og modellens svar blir trinnets output på kjøringstidslinjen. AI-trinn kjører på OneUptime-Worker'en; ingen agent påkrevd.
+
+Konfigurer på et AI-trinn:
+
+- **Prompt** — hva AI-en skal gjøre. For eksempel: "Gjennomgå outputen fra de foregående trinnene og angi om det er trygt å fortsette med utbedring."
+- **Inkluder kontekst fra tidligere trinn** — hvis på, ser AI-en alt om trinnene som kjørte før dette: tittel, type, status, output og feilmeldinger.
+- **Inkluder trigger-kontekst** — hvis på, ser AI-en hva som startet kjøringen: den tilknyttede hendelsen, varselet eller det planlagte vedlikeholdet (beskrivelse, alvorlighetsgrad, gjeldende tilstand, berørte monitorer, rotårsak, tilstandstidslinje og offentlige notater), eller hvem som kjørte runbook'et manuelt.
+
+Kombiner et AI-trinn med **Krev godkjenning** for å ha et menneske i loopen: AI-en analyserer, en responder leser svaret og godkjenner, og først da kjører neste (utbedrings-)trinn.
+
+**Hva AI-en aldri ser.** Svaret fra et AI-trinn lagres som trinn-output på kjøringen, og kjøringer kan leses av alle med lesetilgang til runbooks — et bredere publikum enn hendelsens ACL. Derfor utelater trigger-konteksten bevisst **private interne notater** og **Slack/Teams-kanalmeldinger**: de forblir inne i hendelsen, der de eksisterende postmortem- og notatgeneratorene beholder sin avledede tekst. Output fra tidligere trinn skannes for hemmeligheter (tokens, nøkler, påloggingsinformasjon) og maskeres før det sendes til modellen.
+
+AI-trinn måles og faktureres som enhver annen AI-funksjon. Hvis ingen LLM-leverandør er konfigurert for prosjektet, feiler trinnet med en tydelig feilmelding (slå på **Fortsett ved feil** hvis resten av runbook'et likevel skal kjøre).
+
+## Lagre og redigere
+
+Trykk **Lagre trinn** for å lagre. Pågående kjøringer av eldre versjoner av runbook'et er upåvirket — de fortsetter med sitt snapshot.
+
+## Flere trinn og feilhåndtering
+
+Som standard stopper et feilet trinn kjøringen og markerer den `Failed`. Slår du på **Fortsett ved feil** på et trinn, registreres feilen, men neste trinn kjører likevel. Nyttig for mønstre som "prøv disse tre tingene, gi så beskjed".
+
+## Et gjennomarbeidet eksempel
+
+Et enkelt runbook for "Primær DB ikke nåbar":
+
+1. **JavaScript** — hent nåværende primærvert fra konfig-tjenesten og logg den.
+2. **Manuelt** — "Replikasjonsetterslep på sekundær under 5 sekunder — bekreftet."
+3. **HTTP-forespørsel** — POST til API-en på failover-orkestratoren din.
+4. **Manuelt** — "Skrivinger går til den nye primaryen — bekreftet."
+5. **HTTP-forespørsel** — POST til Slack med "alt klart"-melding.
+
+Responderen ser et automatisert trinn kjøre, huker av et manuelt, ser neste automatiserte, og så videre. Hvert trinns output lagres til postmortem.

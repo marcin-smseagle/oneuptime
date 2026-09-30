@@ -11,6 +11,9 @@ x-common-variables: &common-variables
 
   NODE_ENV: ${ENVIRONMENT}
   BILLING_ENABLED: ${BILLING_ENABLED}
+  # Deprecated (see config.example.env): the edition is the image APP_TAG
+  # pulls, and true on the Community image makes the App refuse to start. Deliberately no ONEUPTIME_EDITION here: an empty value
+  # would override the ONEUPTIME_EDITION=enterprise the Enterprise image sets.
   IS_ENTERPRISE_EDITION: ${IS_ENTERPRISE_EDITION}
   BILLING_PUBLIC_KEY: ${BILLING_PUBLIC_KEY}
   SUBSCRIPTION_PLAN_BASIC: ${SUBSCRIPTION_PLAN_BASIC}
@@ -19,6 +22,7 @@ x-common-variables: &common-variables
   SUBSCRIPTION_PLAN_ENTERPRISE: ${SUBSCRIPTION_PLAN_ENTERPRISE}
   ANALYTICS_KEY: ${ANALYTICS_KEY}
   ANALYTICS_HOST: ${ANALYTICS_HOST}
+  GOOGLE_TAG_MANAGER_ENABLED: ${GOOGLE_TAG_MANAGER_ENABLED}
   CAPTCHA_ENABLED: ${CAPTCHA_ENABLED}
   CAPTCHA_SITE_KEY: ${CAPTCHA_SITE_KEY}
 
@@ -28,13 +32,30 @@ x-common-variables: &common-variables
 
   ALLOWED_ACTIVE_MONITOR_COUNT_IN_FREE_PLAN: ${ALLOWED_ACTIVE_MONITOR_COUNT_IN_FREE_PLAN}
 
+  # Outbound webhook egress policy — see config.example.env for the full
+  # explanation. Both are off by default and instance-wide; there is no
+  # per-project setting.
+  ALLOW_PRIVATE_NETWORK_WEBHOOKS: ${ALLOW_PRIVATE_NETWORK_WEBHOOKS:-false}
+  PRIVATE_NETWORK_WEBHOOK_ALLOWLIST: ${PRIVATE_NETWORK_WEBHOOK_ALLOWLIST:-}
+  # Egress policy for everything that is not a webhook (data sources, LLM
+  # providers, SMTP, OIDC discovery, runbook HTTP steps) — see
+  # config.example.env. Defaulted so a config.env upgraded in place, which will
+  # not have the key, keeps today's self-hosted behaviour.
+  DATA_SOURCE_BLOCK_PRIVATE_ADDRESSES: ${DATA_SOURCE_BLOCK_PRIVATE_ADDRESSES:-false}
+
   SERVER_APP_HOSTNAME: app
   SERVER_HOME_HOSTNAME: home
   #Ports. Usually they don't need to change.
   APP_PORT: ${APP_PORT}
   HOME_PORT: ${HOME_PORT}
+  # Backend exporter configuration. Headers may contain secrets and are never
+  # included in a frontend env.js response.
   OPENTELEMETRY_EXPORTER_OTLP_ENDPOINT: ${OPENTELEMETRY_EXPORTER_OTLP_ENDPOINT}
   OPENTELEMETRY_EXPORTER_OTLP_HEADERS: ${OPENTELEMETRY_EXPORTER_OTLP_HEADERS}
+  # Browser RUM is a separate, deliberately public channel. This key must be
+  # a Browser ingestion key with an origin allowlist, never a Server key.
+  PUBLIC_OPENTELEMETRY_EXPORTER_OTLP_ENDPOINT: ${PUBLIC_OPENTELEMETRY_EXPORTER_OTLP_ENDPOINT:-}
+  PUBLIC_OPENTELEMETRY_EXPORTER_OTLP_BROWSER_INGESTION_KEY: ${PUBLIC_OPENTELEMETRY_EXPORTER_OTLP_BROWSER_INGESTION_KEY:-}
 
   SLACK_APP_CLIENT_ID: ${SLACK_APP_CLIENT_ID}
 
@@ -72,14 +93,29 @@ x-common-runtime-variables: &common-runtime-variables
   LETS_ENCRYPT_NOTIFICATION_EMAIL: ${LETS_ENCRYPT_NOTIFICATION_EMAIL}
   LETS_ENCRYPT_ACCOUNT_KEY: ${LETS_ENCRYPT_ACCOUNT_KEY}
 
-  REDIS_USERNAME: ${REDIS_USERNAME}
-  REDIS_PASSWORD: ${REDIS_PASSWORD}
-  REDIS_HOST: ${REDIS_HOST}
-  REDIS_PORT: ${REDIS_PORT}
-  REDIS_DB: ${REDIS_DB}
-  REDIS_IP_FAMILY: ${REDIS_IP_FAMILY}
-  REDIS_TLS_CA: ${REDIS_TLS_CA}
-  REDIS_TLS_SENTINEL_MODE: ${REDIS_TLS_SENTINEL_MODE}
+  # Cache and queues. VALKEY_* is the current name; the `:-${REDIS_*}` fallback is
+  # what lets a config.env written before the rename keep working with no edits.
+  VALKEY_USERNAME: ${VALKEY_USERNAME:-${REDIS_USERNAME}}
+  VALKEY_PASSWORD: ${VALKEY_PASSWORD:-${REDIS_PASSWORD}}
+  VALKEY_HOST: ${VALKEY_HOST:-${REDIS_HOST}}
+  VALKEY_PORT: ${VALKEY_PORT:-${REDIS_PORT}}
+  VALKEY_DB: ${VALKEY_DB:-${REDIS_DB}}
+  VALKEY_IP_FAMILY: ${VALKEY_IP_FAMILY:-${REDIS_IP_FAMILY}}
+  VALKEY_TLS_CA: ${VALKEY_TLS_CA:-${REDIS_TLS_CA}}
+  VALKEY_TLS_SENTINEL_MODE: ${VALKEY_TLS_SENTINEL_MODE:-${REDIS_TLS_SENTINEL_MODE}}
+
+  # Deprecated mirrors, carrying the identical value. The app reads VALKEY_* and
+  # only falls back to these, so they are dead weight for a matching image --
+  # they exist because APP_TAG lets you pin an OLDER image against this file, and
+  # an image from before the rename reads nothing else.
+  REDIS_USERNAME: ${VALKEY_USERNAME:-${REDIS_USERNAME}}
+  REDIS_PASSWORD: ${VALKEY_PASSWORD:-${REDIS_PASSWORD}}
+  REDIS_HOST: ${VALKEY_HOST:-${REDIS_HOST}}
+  REDIS_PORT: ${VALKEY_PORT:-${REDIS_PORT}}
+  REDIS_DB: ${VALKEY_DB:-${REDIS_DB}}
+  REDIS_IP_FAMILY: ${VALKEY_IP_FAMILY:-${REDIS_IP_FAMILY}}
+  REDIS_TLS_CA: ${VALKEY_TLS_CA:-${REDIS_TLS_CA}}
+  REDIS_TLS_SENTINEL_MODE: ${VALKEY_TLS_SENTINEL_MODE:-${REDIS_TLS_SENTINEL_MODE}}
 
   ENCRYPTION_SECRET: ${ENCRYPTION_SECRET}
 
@@ -88,11 +124,22 @@ x-common-runtime-variables: &common-runtime-variables
   BILLING_ENABLED: ${BILLING_ENABLED}
   BILLING_WEBHOOK_SECRET: ${BILLING_WEBHOOK_SECRET}
 
+  # TEST-ONLY. Unset (empty) in every shipped config, so the API never returns
+  # a notification-channel verification code. The CI end-to-end job sets it to
+  # "true" for its own stack because the e2e suite has no mailbox to read the
+  # emailed code from; production leaves it empty and the code stays on the
+  # mail path only. See Common/Server/Services/UserEmailService.ts.
+  EXPOSE_VERIFICATION_CODE_IN_API_RESPONSE_FOR_E2E: ${EXPOSE_VERIFICATION_CODE_IN_API_RESPONSE_FOR_E2E:-}
+
   CLICKHOUSE_USER: ${CLICKHOUSE_USER}
   CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
   CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE}
   CLICKHOUSE_HOST: ${CLICKHOUSE_HOST}
   CLICKHOUSE_PORT: ${CLICKHOUSE_PORT}
+  # Per-container ClickHouse pool ceilings; the ingest pool (fan-in telemetry
+  # writer) inherits CLICKHOUSE_MAX_OPEN_CONNECTIONS when left empty.
+  CLICKHOUSE_MAX_OPEN_CONNECTIONS: ${CLICKHOUSE_MAX_OPEN_CONNECTIONS}
+  CLICKHOUSE_INGEST_MAX_OPEN_CONNECTIONS: ${CLICKHOUSE_INGEST_MAX_OPEN_CONNECTIONS}
 
   AVERAGE_SPAN_ROW_SIZE_IN_BYTES: ${AVERAGE_SPAN_ROW_SIZE_IN_BYTES}
   AVERAGE_LOG_ROW_SIZE_IN_BYTES: ${AVERAGE_LOG_ROW_SIZE_IN_BYTES}
@@ -107,6 +154,37 @@ x-common-runtime-variables: &common-runtime-variables
   DISABLE_AUTOMATIC_ALERT_CREATION: ${DISABLE_AUTOMATIC_ALERT_CREATION}
 
   DISABLE_TELEMETRY_INGESTION: ${DISABLE_TELEMETRY_INGESTION}
+
+  # Defaulted, unlike its siblings: this one gates outbound traffic, and an
+  # existing config.env upgraded in place will not have the key.
+  DISABLE_UPDATE_CHECK: ${DISABLE_UPDATE_CHECK:-false}
+  LATEST_RELEASE_CHECK_URL: ${LATEST_RELEASE_CHECK_URL:-}
+
+  # On-call calendar feeds (token-in-URL .ics subscriptions). Defaulted so a
+  # config.env upgraded in place, which will not have these keys, neither warns
+  # nor hands the container an empty kill switch. Blank rate-limit values mean
+  # "use the built-in default".
+  DISABLE_ON_CALL_CALENDAR_FEED: ${DISABLE_ON_CALL_CALENDAR_FEED:-false}
+  ON_CALL_CALENDAR_FEED_RATE_LIMIT_WINDOW_SECONDS: ${ON_CALL_CALENDAR_FEED_RATE_LIMIT_WINDOW_SECONDS:-}
+  ON_CALL_CALENDAR_FEED_RATE_LIMIT_PER_TOKEN_PER_WINDOW: ${ON_CALL_CALENDAR_FEED_RATE_LIMIT_PER_TOKEN_PER_WINDOW:-}
+  ON_CALL_CALENDAR_FEED_RATE_LIMIT_PER_IP_PER_WINDOW: ${ON_CALL_CALENDAR_FEED_RATE_LIMIT_PER_IP_PER_WINDOW:-}
+
+  # Browser source map upload / symbolication limits. Blank means "use the
+  # built-in default", so a config.env upgraded in place keeps today's
+  # behaviour. maxFilesPerRequest and maxFileSizeBytes can only be lowered --
+  # the multipart parser's shared, pre-auth ceilings sit above them.
+  SOURCE_MAP_MAX_MAPS_PER_RELEASE: ${SOURCE_MAP_MAX_MAPS_PER_RELEASE:-}
+  SOURCE_MAP_MAX_FILES_PER_REQUEST: ${SOURCE_MAP_MAX_FILES_PER_REQUEST:-}
+  SOURCE_MAP_MAX_FILE_SIZE_BYTES: ${SOURCE_MAP_MAX_FILE_SIZE_BYTES:-}
+  SOURCE_MAP_MAX_BYTES_PER_RESOLVE: ${SOURCE_MAP_MAX_BYTES_PER_RESOLVE:-}
+  SOURCE_MAP_RETENTION_DAYS: ${SOURCE_MAP_RETENTION_DAYS:-}
+
+  # How many appending proxies of your own sit in front of the app. Decides
+  # which X-Forwarded-For entry counts as the client for IP allowlists and rate
+  # limits. Defaulted because an existing config.env upgraded in place will not
+  # have the key, and an empty value here would read as "no proxy" and make
+  # every visitor look like the ingress container.
+  TRUSTED_PROXY_HOPS: ${TRUSTED_PROXY_HOPS:-1}
 
   # Open Source Deployment Webhook
   OPEN_SOURCE_DEPLOYMENT_WEBHOOK_URL: ${OPEN_SOURCE_DEPLOYMENT_WEBHOOK_URL}
@@ -143,16 +221,26 @@ x-common-runtime-variables: &common-runtime-variables
   QUEUE_DASHBOARD_SECRET: ${QUEUE_DASHBOARD_SECRET}
 
 services:
-  redis:
-    image: redis:7.0.12
+  # Valkey is the BSD-licensed fork of Redis 7.2 that most of the original Redis
+  # contributors moved to after Redis 7.4 left the BSD licence, and it speaks the
+  # same wire protocol -- point VALKEY_HOST at a managed Redis instead and
+  # nothing else changes.
+  #
+  # The service is reachable as both "valkey" and "redis" (see the network
+  # alias), so a config.env written before the rename, still saying
+  # REDIS_HOST=redis, resolves with no edits.
+  valkey:
+    image: valkey/valkey:9.1-alpine
     restart: always
     networks:
-      - oneuptime
-    command: redis-server --requirepass "${REDIS_PASSWORD}" --save "" --appendonly no
+      oneuptime:
+        aliases:
+          - redis
+    command: valkey-server --requirepass "${VALKEY_PASSWORD:-${REDIS_PASSWORD}}" --save "" --appendonly no
     environment:
-      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      VALKEY_PASSWORD: ${VALKEY_PASSWORD:-${REDIS_PASSWORD}}
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      test: ["CMD", "valkey-cli", "-a", "${VALKEY_PASSWORD:-${REDIS_PASSWORD}}", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -163,7 +251,12 @@ services:
         max-size: "1000m"
 
   clickhouse:
-    image: clickhouse/clickhouse-server:25.7
+    # Pinned to 26.7 to match the Helm/production ClickHouse (which tracks the
+    # newer server). ClickHouse 26.7 validates that every off-key column on an
+    # AggregatingMergeTree is an aggregate measure; staying on 25.7 here
+    # diverged from production and let invalid aggregate schemas slip past the
+    # E2E stack.
+    image: clickhouse/clickhouse-server:26.7
     restart: always
     environment:
       CLICKHOUSE_USER: ${CLICKHOUSE_USER}
@@ -184,6 +277,17 @@ services:
       # and dashboards lag). users.d is merged into the users config, where profiles
       # are read. Mirrors the Altinity operator defaults.
       - ./Clickhouse/users.d/distributed-insert-tuning.xml:/etc/clickhouse-server/users.d/distributed-insert-tuning.xml
+      # System-log retention drop-in: ClickHouse's own query_log/trace_log/… ship
+      # with their TTL commented out, so without this they grow forever and eat the
+      # clickhouse volume (processors_profile_log alone reached 536 GiB on the
+      # hosted deployment). Caps six system logs at 6h from event_time and removes
+      # processors_profile_log, mirroring the Helm path (values.yaml ->
+      # clickhouse.configuration); Tests/Ops fails the build if the two drift.
+      # The TTL keys off event_time (DateTime), NOT event_date (Date): adding
+      # hours to a Date pins the expiry to 06:00 on the row's own day, which
+      # discards nearly everything written after 06:00 instead of keeping 6h.
+      # See the header of Clickhouse/config.d/system-log-ttl.xml.
+      - ./Clickhouse/config.d/system-log-ttl.xml:/etc/clickhouse-server/config.d/system-log-ttl.xml
     healthcheck:
       test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1'"]
       interval: 10s
@@ -248,6 +352,28 @@ services:
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY}
       # Telemetry ingestion settings (merged from telemetry service)
       TELEMETRY_CONCURRENCY: ${TELEMETRY_CONCURRENCY}
+      # Network device polling throughput — see config.example.env for docs.
+      # Empty falls back to the code default.
+      NETWORK_DEVICE_POLL_FETCH_LIMIT: ${NETWORK_DEVICE_POLL_FETCH_LIMIT:-}
+      # The project's daily session replay upload limit — see
+      # config.example.env. This container enforces it and also measures the
+      # storage budget metrics against it, so the two always agree. Empty
+      # falls back to the code default (1 GiB).
+      SESSION_REPLAY_MAX_BYTES_PER_PROJECT_PER_DAY: ${SESSION_REPLAY_MAX_BYTES_PER_PROJECT_PER_DAY:-}
+      # Fan-in telemetry writer knobs — see config.example.env for docs.
+      # Empty values fall back to the code defaults.
+      TELEMETRY_FANIN_MAX_BATCH_ROWS: ${TELEMETRY_FANIN_MAX_BATCH_ROWS}
+      TELEMETRY_FANIN_MAX_WAIT_MS: ${TELEMETRY_FANIN_MAX_WAIT_MS}
+      TELEMETRY_FANIN_MAX_CONCURRENT_INSERTS: ${TELEMETRY_FANIN_MAX_CONCURRENT_INSERTS}
+      TELEMETRY_FANIN_MAX_PENDING_ROWS: ${TELEMETRY_FANIN_MAX_PENDING_ROWS}
+      TELEMETRY_FANIN_RETRY_MAX_ATTEMPTS: ${TELEMETRY_FANIN_RETRY_MAX_ATTEMPTS}
+      TELEMETRY_FANIN_RETRY_BASE_DELAY_MS: ${TELEMETRY_FANIN_RETRY_BASE_DELAY_MS}
+      TELEMETRY_FANIN_RETRY_MAX_DELAY_MS: ${TELEMETRY_FANIN_RETRY_MAX_DELAY_MS}
+      TELEMETRY_WAIT_FOR_ASYNC_INSERT: ${TELEMETRY_WAIT_FOR_ASYNC_INSERT}
+      TELEMETRY_WRITER_URL: ${TELEMETRY_WRITER_URL}
+      TELEMETRY_WRITER_REQUEST_TIMEOUT_MS: ${TELEMETRY_WRITER_REQUEST_TIMEOUT_MS}
+      TELEMETRY_WRITER_MAX_BODY_BYTES: ${TELEMETRY_WRITER_MAX_BODY_BYTES}
+      TELEMETRY_WRITER_MAX_INFLIGHT_REQUESTS: ${TELEMETRY_WRITER_MAX_INFLIGHT_REQUESTS}
       REGISTER_PROBE_KEY: ${REGISTER_PROBE_KEY}
       # MQTT ingest for IoT devices. MQTT-over-WebSocket rides the
       # ingress at /mqtt out of the box; the raw TCP listener stays
@@ -275,6 +401,38 @@ services:
   probe-1:
     restart: always
     network_mode: host
+    # A /dev/shm larger than Docker's 64MB default. The synthetic runtime's
+    # browsers do not use it: Playwright starts Chromium with
+    # --disable-dev-shm-usage, so Chromium keeps its shared memory in the
+    # per-execution run directory under /tmp, and Firefox uses memfd.
+    shm_size: ${GLOBAL_PROBE_1_SHM_SIZE:-512m}
+    # The probe remains root so its trusted supervisor can assign a unique UID
+    # to every synthetic execution. Drop everything except the capabilities it
+    # needs to prepare, terminate, and clean up those workers (plus NET_RAW for
+    # ping/traceroute monitors). no-new-privileges is inherited by workers.
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - KILL
+      - NET_RAW
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+      # Playwright's official Docker profile
+      # (https://github.com/microsoft/playwright/blob/main/utils/docker/seccomp_profile.json)
+      # with one change: chroot is allowed next to clone/setns/unshare.
+      # Firefox and Chromium both sandbox their child processes by creating
+      # a user namespace and calling chroot inside it, which needs no
+      # capability. Upstream allows chroot only to a container holding
+      # CAP_SYS_CHROOT, which cap_drop ALL removes, and that crashed every
+      # Firefox content process and the Chromium zygote at launch. Allowing
+      # the syscall in the profile, rather than adding the capability back,
+      # keeps chroot(2) unusable for the root supervisor itself.
+      # Probe/Tests/Build/ProbeContainerBrowserSandbox.test.ts pins this.
+      - seccomp=./packages/Probe/seccomp_profile.json
     environment:
       ONEUPTIME_URL: ${GLOBAL_PROBE_1_ONEUPTIME_URL}
       REGISTER_PROBE_KEY: ${REGISTER_PROBE_KEY}
@@ -283,8 +441,29 @@ services:
       PROBE_MONITORING_WORKERS: ${GLOBAL_PROBE_1_MONITORING_WORKERS}
       PROBE_KEY: ${GLOBAL_PROBE_1_KEY}
       PROBE_SYNTHETIC_MONITOR_SCRIPT_TIMEOUT_IN_MS: ${GLOBAL_PROBE_1_SYNTHETIC_MONITOR_SCRIPT_TIMEOUT_IN_MS}
+      PROBE_SYNTHETIC_MONITOR_MAX_CONCURRENCY: ${GLOBAL_PROBE_1_SYNTHETIC_MONITOR_MAX_CONCURRENCY}
+      PROBE_SYNTHETIC_MONITOR_MAX_PROCESS_TREE_RSS_BYTES: ${GLOBAL_PROBE_1_SYNTHETIC_MONITOR_MAX_PROCESS_TREE_RSS_BYTES:-1610612736}
+      PROBE_SYNTHETIC_MONITOR_MAX_DISK_BYTES: ${GLOBAL_PROBE_1_SYNTHETIC_MONITOR_MAX_DISK_BYTES:-268435456}
+      # Compose installs the bundled seccomp profile above, which allows the
+      # user namespace and the chroot inside it, so the Chromium sandbox can
+      # be required instead of silently falling back to --no-sandbox.
+      PROBE_SYNTHETIC_MONITOR_CHROMIUM_SANDBOX_ENABLED: "true"
       PROBE_CUSTOM_CODE_MONITOR_SCRIPT_TIMEOUT_IN_MS: ${GLOBAL_PROBE_1_CUSTOM_CODE_MONITOR_SCRIPT_TIMEOUT_IN_MS}
+      # Honored here too (issue #3879). This one config.env value applies to
+      # both bundled probes, which auto-register as global probes, so "true"
+      # lets monitors from every project on the instance reach private
+      # addresses through them. Off by default; see config.example.env.
+      PROBE_ALLOW_PRIVATE_NETWORK_MONITORS: ${PROBE_ALLOW_PRIVATE_NETWORK_MONITORS:-false}
+      # Lets the probe apply the one exception to the setting above: a global
+      # probe of a billing-enabled (hosted, open-signup) instance stays
+      # public-only. The Helm chart passes billing.enabled the same way.
+      BILLING_ENABLED: ${BILLING_ENABLED}
       PROBE_MONITOR_FETCH_LIMIT: ${GLOBAL_PROBE_1_MONITOR_FETCH_LIMIT}
+      PROBE_NETWORK_DEVICE_POLL_CONCURRENCY: ${GLOBAL_PROBE_1_NETWORK_DEVICE_POLL_CONCURRENCY:-}
+      PROBE_SNMP_GET_CHUNK_SIZE: ${GLOBAL_PROBE_1_SNMP_GET_CHUNK_SIZE:-}
+      HTTP_PROXY_URL: ${GLOBAL_PROBE_1_HTTP_PROXY_URL:-${GLOBAL_PROBE_1_PROXY_URL:-}}
+      HTTPS_PROXY_URL: ${GLOBAL_PROBE_1_HTTPS_PROXY_URL:-${GLOBAL_PROBE_1_PROXY_URL:-}}
+      NO_PROXY: ${GLOBAL_PROBE_1_NO_PROXY:-}
       PORT: ${GLOBAL_PROBE_1_PORT}
       NODE_ENV: ${ENVIRONMENT}
       LOG_LEVEL: ${LOG_LEVEL}
@@ -300,6 +479,23 @@ services:
   probe-2:
     restart: always
     network_mode: host
+    # A /dev/shm larger than Docker's 64MB default. The synthetic runtime's
+    # browsers do not use it: Playwright starts Chromium with
+    # --disable-dev-shm-usage, so Chromium keeps its shared memory in the
+    # per-execution run directory under /tmp, and Firefox uses memfd.
+    shm_size: ${GLOBAL_PROBE_2_SHM_SIZE:-512m}
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - KILL
+      - NET_RAW
+      - SETGID
+      - SETUID
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=./packages/Probe/seccomp_profile.json
     environment:
       ONEUPTIME_URL: ${GLOBAL_PROBE_2_ONEUPTIME_URL}
       REGISTER_PROBE_KEY: ${REGISTER_PROBE_KEY}
@@ -308,8 +504,26 @@ services:
       PROBE_MONITORING_WORKERS: ${GLOBAL_PROBE_2_MONITORING_WORKERS}
       PROBE_KEY: ${GLOBAL_PROBE_2_KEY}
       PROBE_SYNTHETIC_MONITOR_SCRIPT_TIMEOUT_IN_MS: ${GLOBAL_PROBE_2_SYNTHETIC_MONITOR_SCRIPT_TIMEOUT_IN_MS}
+      PROBE_SYNTHETIC_MONITOR_MAX_CONCURRENCY: ${GLOBAL_PROBE_2_SYNTHETIC_MONITOR_MAX_CONCURRENCY}
+      PROBE_SYNTHETIC_MONITOR_MAX_PROCESS_TREE_RSS_BYTES: ${GLOBAL_PROBE_2_SYNTHETIC_MONITOR_MAX_PROCESS_TREE_RSS_BYTES:-1610612736}
+      PROBE_SYNTHETIC_MONITOR_MAX_DISK_BYTES: ${GLOBAL_PROBE_2_SYNTHETIC_MONITOR_MAX_DISK_BYTES:-268435456}
+      PROBE_SYNTHETIC_MONITOR_CHROMIUM_SANDBOX_ENABLED: "true"
       PROBE_CUSTOM_CODE_MONITOR_SCRIPT_TIMEOUT_IN_MS: ${GLOBAL_PROBE_2_CUSTOM_CODE_MONITOR_SCRIPT_TIMEOUT_IN_MS}
+      # Honored here too (issue #3879). This one config.env value applies to
+      # both bundled probes, which auto-register as global probes, so "true"
+      # lets monitors from every project on the instance reach private
+      # addresses through them. Off by default; see config.example.env.
+      PROBE_ALLOW_PRIVATE_NETWORK_MONITORS: ${PROBE_ALLOW_PRIVATE_NETWORK_MONITORS:-false}
+      # Lets the probe apply the one exception to the setting above: a global
+      # probe of a billing-enabled (hosted, open-signup) instance stays
+      # public-only. The Helm chart passes billing.enabled the same way.
+      BILLING_ENABLED: ${BILLING_ENABLED}
       PROBE_MONITOR_FETCH_LIMIT: ${GLOBAL_PROBE_2_MONITOR_FETCH_LIMIT}
+      PROBE_NETWORK_DEVICE_POLL_CONCURRENCY: ${GLOBAL_PROBE_2_NETWORK_DEVICE_POLL_CONCURRENCY:-}
+      PROBE_SNMP_GET_CHUNK_SIZE: ${GLOBAL_PROBE_2_SNMP_GET_CHUNK_SIZE:-}
+      HTTP_PROXY_URL: ${GLOBAL_PROBE_2_HTTP_PROXY_URL:-${GLOBAL_PROBE_2_PROXY_URL:-}}
+      HTTPS_PROXY_URL: ${GLOBAL_PROBE_2_HTTPS_PROXY_URL:-${GLOBAL_PROBE_2_PROXY_URL:-}}
+      NO_PROXY: ${GLOBAL_PROBE_2_NO_PROXY:-}
       PORT: ${GLOBAL_PROBE_2_PORT}
       NODE_ENV: ${ENVIRONMENT}
       LOG_LEVEL: ${LOG_LEVEL}
@@ -322,16 +536,20 @@ services:
       options:
         max-size: "1000m"
 
-  ai-agent:
+  runner:
     restart: always
     network_mode: host
     environment:
       <<: *common-runtime-variables
-      AI_AGENT_KEY: ${AI_AGENT_KEY}
-      ONEUPTIME_URL: ${AI_AGENT_ONEUPTIME_URL}
-      DISABLE_TELEMETRY: ${DISABLE_TELEMETRY_FOR_AI_AGENT}
-      ENABLE_PROFILING: ${ENABLE_PROFILING_FOR_AI_AGENT}
-      PORT: ${AI_AGENT_PORT}
+      ONEUPTIME_RUNNER_KEY: ${ONEUPTIME_RUNNER_KEY}
+      ONEUPTIME_URL: ${ONEUPTIME_RUNNER_ONEUPTIME_URL}
+      # The in-cluster Runner serves code fixes for every project; customer
+      # installs run their own Runner with a project-scoped credential.
+      ONEUPTIME_RUNNER_ENABLE_CODE_FIXES: "true"
+      ONEUPTIME_RUNNER_ENABLE_RUNBOOKS: "false"
+      DISABLE_TELEMETRY: ${DISABLE_TELEMETRY_FOR_RUNNER}
+      ENABLE_PROFILING: ${ENABLE_PROFILING_FOR_RUNNER}
+      PORT: ${ONEUPTIME_RUNNER_PORT}
     logging:
       driver: "json-file"
       options:
@@ -360,6 +578,19 @@ services:
     network_mode: host # This is needed to access the host network,
     environment:
       <<: *common-variables
+      # ExceptionOccurrenceFixture writes to ClickHouse directly, so pass exactly
+      # the connection settings it reads. From this host-networked container the
+      # "clickhouse" hostname does not resolve; with HOST=localhost the fixture
+      # maps it to the loopback port published by
+      # Scripts/Dev/docker-compose.dev.yml or
+      # packages/E2E/docker-compose.e2e-clickhouse.yml. E2E_CLICKHOUSE_URL
+      # overrides both.
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE}
+      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST}
+      CLICKHOUSE_PORT: ${CLICKHOUSE_PORT}
+      E2E_CLICKHOUSE_URL: ${E2E_CLICKHOUSE_URL:-}
       E2E_TEST_IS_USER_REGISTERED: ${E2E_TEST_IS_USER_REGISTERED}
       E2E_TEST_REGISTERED_USER_EMAIL: ${E2E_TEST_REGISTERED_USER_EMAIL}
       E2E_TEST_REGISTERED_USER_PASSWORD: ${E2E_TEST_REGISTERED_USER_PASSWORD}
@@ -374,11 +605,26 @@ services:
     restart: always
     networks:
       - oneuptime
+    # The ingress proxies a high volume of short-lived upstream connections to a
+    # single backend. Widen the ephemeral source-port range and allow TIME_WAIT
+    # reuse so the gateway never exhausts local ports — otherwise nginx starts
+    # returning "connect() ... (99: Address not available)" 502s for every route.
+    # These are per-container (network-namespace) sysctls; no privileged mode.
+    sysctls:
+      net.ipv4.ip_local_port_range: "1024 65535"
+      net.ipv4.tcp_tw_reuse: "1"
+      net.ipv4.tcp_fin_timeout: "15"
     environment:
       <<: *common-runtime-variables
       ONEUPTIME_HTTP_PORT: ${ONEUPTIME_HTTP_PORT}
       NGINX_LISTEN_ADDRESS: ${NGINX_LISTEN_ADDRESS}
       NGINX_LISTEN_OPTIONS: ${NGINX_LISTEN_OPTIONS}
+      # Per-request access logging for the high-volume ingest locations
+      # (/otlp, /telemetry, /session-replay, /kubernetes-cost, /pyroscope).
+      # Defaults to "on" here rather than to config.env, so an operator who has
+      # never heard of this knob keeps every ingest log line. Set it to off /
+      # false / 0 / no in config.env to opt out; anything else keeps logging.
+      NGINX_INGEST_ACCESS_LOG: ${NGINX_INGEST_ACCESS_LOG:-on}
       DISABLE_TELEMETRY: ${DISABLE_TELEMETRY_FOR_INGRESS}
     ports:
       - "${ONEUPTIME_HTTP_PORT}:7849"

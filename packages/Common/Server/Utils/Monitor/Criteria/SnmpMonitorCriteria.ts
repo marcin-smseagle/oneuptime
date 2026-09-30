@@ -1,0 +1,621 @@
+import DataToProcess from "../DataToProcess";
+import CompareCriteria from "./CompareCriteria";
+import PerEntityCriteriaFanOut from "../PerEntityCriteriaFanOut";
+import {
+  AnomalyDetectionSensitivity,
+  CheckOn,
+  CriteriaFilter,
+  CriteriaFilterUtil,
+  FilterType,
+} from "../../../../Types/Monitor/CriteriaFilter";
+import MonitorMetricType from "../../../../Types/Monitor/MonitorMetricType";
+import ObjectID from "../../../../Types/ObjectID";
+import OneUptimeDate from "../../../../Types/Date";
+import SnmpInterface from "../../../../Types/Monitor/SnmpMonitor/SnmpInterface";
+import SnmpMonitorResponse, {
+  SnmpOidResponse,
+} from "../../../../Types/Monitor/SnmpMonitor/SnmpMonitorResponse";
+import SnmpOidListUtil from "../../../../Types/Monitor/SnmpMonitor/SnmpOidListUtil";
+import SnmpTrap from "../../../../Types/Monitor/SnmpMonitor/SnmpTrap";
+import ProbeMonitorResponse from "../../../../Types/Probe/ProbeMonitorResponse";
+import EvaluateOverTime, { OverTimeCriteriaValue } from "./EvaluateOverTime";
+import MetricBaselineService, {
+  BaselineSummary,
+  MetricBaselineService as MetricBaselineServiceClass,
+} from "../../../Services/MetricBaselineService";
+import CaptureSpan from "../../Telemetry/CaptureSpan";
+import logger from "../../Logger";
+
+export default class SnmpMonitorCriteria {
+  /*
+   * Every CheckOn whose value comes out of the SNMP walk. Reachability
+   * (SnmpIsOnline) and traps are the two that do not.
+   */
+  private static isWalkDependentCheckOn(checkOn: CheckOn): boolean {
+    return (
+      checkOn === CheckOn.SnmpWalkIsSucceeding ||
+      checkOn === CheckOn.SnmpResponseTime ||
+      checkOn === CheckOn.SnmpOidExists ||
+      checkOn === CheckOn.SnmpOidValue ||
+      checkOn === CheckOn.SnmpInterfaceIsDown ||
+      checkOn === CheckOn.SnmpInterfaceUtilizationPercent ||
+      checkOn === CheckOn.SnmpInterfaceErrorsPerSecond
+    );
+  }
+
+  /*
+   * Interface scope for the interface CheckOns: when the criteria carries
+   * snmpMonitorOptions.interfaceName, only interfaces whose name or alias
+   * equals it (case-insensitive) are evaluated. Empty scope = every
+   * monitored interface (the historical behavior). Applies to the
+   * instantaneous values in the poll response; over-time aggregation
+   * remains device-wide.
+   */
+  private static scopeInterfaces(
+    interfaces: Array<SnmpInterface>,
+    criteriaFilter: CriteriaFilter,
+  ): Array<SnmpInterface> {
+    const scope: string = (
+      criteriaFilter.snmpMonitorOptions?.interfaceName || ""
+    )
+      .trim()
+      .toLowerCase();
+
+    /*
+     * Empty has always meant "every interface". "*" means the same
+     * thing, and additionally opts the criteria into raising one alert
+     * per interface — see PerEntityCriteriaFanOut. Scoping treats them
+     * identically; only the fan-out tells them apart, so existing
+     * monitors that leave this blank keep their single combined alert.
+     */
+    if (!scope || PerEntityCriteriaFanOut.isWildcard(scope)) {
+      return interfaces;
+    }
+
+    const scoped: Array<SnmpInterface> = interfaces.filter(
+      (snmpInterface: SnmpInterface) => {
+        return (
+          snmpInterface.name?.trim().toLowerCase() === scope ||
+          snmpInterface.alias?.trim().toLowerCase() === scope
+        );
+      },
+    );
+
+    /*
+     * A configured scope that matches nothing (typo, ifName change after
+     * a firmware upgrade, module removed) silently disarms this criteria
+     * — including "Interface Is Down = False" recovery rules. Surface it
+     * in the logs so a dead criteria is diagnosable.
+     */
+    if (scoped.length === 0 && interfaces.length > 0) {
+      logger.warn(
+        `SNMP criteria interface scope "${criteriaFilter.snmpMonitorOptions?.interfaceName}" matched none of the ${interfaces.length} interface(s) in the poll response. This criteria will not evaluate until the scope matches an interface name or alias.`,
+      );
+    }
+
+    return scoped;
+  }
+
+  /*
+   * Anomaly path for interface utilization: compares the busiest in-scope
+   * interface's current utilization to this monitor's same-hour-of-week
+   * baseline of the oneuptime.monitor.snmp.interface.utilization.percent
+   * metric. MonitorMetricUtil writes that metric every check with the
+   * monitorId as the metric's primaryEntityId, so the MetricBaselineHourly
+   * MV already keys a per-monitor baseline — this reuses it via
+   * MetricBaselineService exactly like MetricMonitorCriteria does.
+   *
+   * Note the baseline aggregates every interface sample the monitor
+   * emitted (interfaces are attributes, not part of the baseline key)
+   * while the observed value is the busiest in-scope interface — the same
+   * "worst interface vs device-wide history" trade-off the static
+   * threshold path already makes.
+   *
+   * Missing or unreliable baselines mean the rule is still learning —
+   * never alert from a thin baseline. Zero-variance baselines are skipped
+   * too: any deviation at all would fire.
+   */
+  private static async evaluateUtilizationAnomaly(input: {
+    projectId: ObjectID;
+    monitorId: ObjectID;
+    criteriaFilter: CriteriaFilter;
+    observedUtilizationPercent: number;
+  }): Promise<string | null> {
+    const sensitivity: AnomalyDetectionSensitivity =
+      (input.criteriaFilter.metricMonitorOptions?.anomalyDetection
+        ?.sensitivity as AnomalyDetectionSensitivity | undefined) ||
+      AnomalyDetectionSensitivity.Medium;
+    const sigmaCount: number =
+      MetricBaselineServiceClass.sigmaForSensitivity(sensitivity);
+
+    let baseline: BaselineSummary | null = null;
+    try {
+      baseline = await MetricBaselineService.getBaseline({
+        projectId: input.projectId.toString(),
+        metricName: MonitorMetricType.SnmpInterfaceUtilizationPercent,
+        primaryEntityId: input.monitorId.toString(),
+        hourOfWeek: MetricBaselineServiceClass.computeHourOfWeek(
+          OneUptimeDate.getCurrentDate(),
+        ),
+        windowDays:
+          input.criteriaFilter.metricMonitorOptions?.anomalyDetection
+            ?.windowDays,
+        minSamples:
+          input.criteriaFilter.metricMonitorOptions?.anomalyDetection
+            ?.minSamples,
+      });
+    } catch (err) {
+      logger.error(
+        "Error fetching SNMP interface utilization baseline for anomaly criteria",
+      );
+      logger.error(err);
+      return null;
+    }
+
+    if (!baseline || !baseline.isReliable) {
+      // Cold start: the baseline is still learning; nothing to compare to.
+      return null;
+    }
+
+    if (!Number.isFinite(baseline.stddev) || baseline.stddev === 0) {
+      // A zero-variance baseline would flag every deviation. Skip.
+      return null;
+    }
+
+    const expectedHigh: number = baseline.mean + sigmaCount * baseline.stddev;
+    const expectedLow: number = baseline.mean - sigmaCount * baseline.stddev;
+    const observed: number = input.observedUtilizationPercent;
+
+    const isHighBreach: boolean = observed > expectedHigh;
+    const isLowBreach: boolean = observed < expectedLow;
+
+    let breaches: boolean = false;
+    if (input.criteriaFilter.filterType === FilterType.AnomalouslyHigh) {
+      breaches = isHighBreach;
+    } else if (input.criteriaFilter.filterType === FilterType.AnomalouslyLow) {
+      breaches = isLowBreach;
+    } else if (input.criteriaFilter.filterType === FilterType.Anomalous) {
+      breaches = isHighBreach || isLowBreach;
+    }
+
+    if (!breaches) {
+      return null;
+    }
+
+    const observedSigma: number = (observed - baseline.mean) / baseline.stddev;
+    const direction: string = observedSigma >= 0 ? "above" : "below";
+
+    return (
+      `SNMP interface utilization ${observed.toFixed(2)}% is ` +
+      `${Math.abs(observedSigma).toFixed(2)}σ ${direction} the same-hour baseline ` +
+      `(mean ${baseline.mean.toFixed(2)}%, σ ${baseline.stddev.toFixed(2)}%, ` +
+      `${baseline.sampleCount} samples over ${baseline.windowDays} days, ` +
+      `sensitivity ${sensitivity}).`
+    );
+  }
+
+  @CaptureSpan()
+  public static async isMonitorInstanceCriteriaFilterMet(input: {
+    dataToProcess: DataToProcess;
+    criteriaFilter: CriteriaFilter;
+    /*
+     * The monitor's monitoringInterval cron. Over-time filters use it to
+     * work out how many samples a fully covered window should hold, so a
+     * monitor that has only just started is not mistaken for one whose
+     * whole window is breaching.
+     */
+    monitoringInterval?: string | undefined;
+  }): Promise<string | null> {
+    let threshold: number | string | undefined | null =
+      input.criteriaFilter.value;
+
+    const dataToProcess: ProbeMonitorResponse =
+      input.dataToProcess as ProbeMonitorResponse;
+
+    const snmpResponse: SnmpMonitorResponse | undefined =
+      dataToProcess.snmpResponse;
+
+    /*
+     * Event/check separation. Trap responses are evaluated ONLY against
+     * trap criteria; polled check responses never match trap criteria.
+     * This keeps a trap from misfiring "is online" style filters (it has
+     * no check data) and keeps every poll from re-firing trap criteria.
+     */
+    const snmpTrap: SnmpTrap | undefined = dataToProcess.snmpTrapResponse;
+
+    if (input.criteriaFilter.checkOn === CheckOn.SnmpTrapReceived) {
+      if (!snmpTrap) {
+        return null;
+      }
+
+      const expectedOid: string = String(threshold || "").trim();
+
+      if (!expectedOid) {
+        return null;
+      }
+
+      const trapOid: string = snmpTrap.trapOid;
+      let isMatch: boolean = false;
+
+      switch (input.criteriaFilter.filterType) {
+        case FilterType.EqualTo:
+          isMatch = trapOid === expectedOid;
+          break;
+        case FilterType.NotEqualTo:
+          isMatch = trapOid !== expectedOid;
+          break;
+        case FilterType.Contains:
+          isMatch = trapOid.includes(expectedOid);
+          break;
+        case FilterType.NotContains:
+          isMatch = !trapOid.includes(expectedOid);
+          break;
+        case FilterType.StartsWith:
+          isMatch = trapOid.startsWith(expectedOid);
+          break;
+        case FilterType.EndsWith:
+          isMatch = trapOid.endsWith(expectedOid);
+          break;
+        default:
+          isMatch = false;
+      }
+
+      if (isMatch) {
+        return `SNMP trap ${trapOid} received from ${snmpTrap.sourceIpAddress}.`;
+      }
+
+      return null;
+    }
+
+    if (snmpTrap) {
+      // Trap events never evaluate check-based criteria.
+      return null;
+    }
+
+    /*
+     * No walk, no verdict. A device without usable SNMP credentials is only
+     * pinged, and the walk pipeline hands its monitors a response with
+     * `snmpResponse` undefined - never a synthesized failure. Every criterion
+     * that reads the walk is therefore NOT EVALUATED on such a poll (null),
+     * rather than breaching: "OID Exists is False" must not raise an
+     * incident on a device nobody ever asked an OID of, and "Walk Is
+     * Succeeding is False" must mean "attempted and failed". Reachability
+     * (SnmpIsOnline) is read from the top-level isOnline further down and
+     * is unaffected.
+     *
+     * This runs before the over-time lookup on purpose: a window of stored
+     * walk-time samples says nothing about a poll that walked nothing.
+     */
+    if (
+      SnmpMonitorCriteria.isWalkDependentCheckOn(
+        input.criteriaFilter.checkOn,
+      ) &&
+      !snmpResponse
+    ) {
+      return null;
+    }
+
+    const overTime: OverTimeCriteriaValue =
+      await EvaluateOverTime.getOverTimeValueForCriteriaFilter({
+        projectId: (input.dataToProcess as ProbeMonitorResponse).projectId,
+        monitorId: input.dataToProcess.monitorId!,
+        criteriaFilter: input.criteriaFilter,
+        monitoringInterval: input.monitoringInterval,
+      });
+
+    /*
+     * The window could not back this over-time filter (nothing recorded yet,
+     * or the monitor has not been running long enough to cover it). Return
+     * the decision the no-data policy already made instead of falling
+     * through to the value that arrived with this one check - that fallback
+     * is what let "all values over the last N minutes" fire off a single
+     * bad reading.
+     */
+    if (overTime.earlyReturn) {
+      return overTime.earlyReturn.result;
+    }
+
+    const overTimeValue:
+      | Array<number | boolean>
+      | number
+      | boolean
+      | undefined = overTime.value;
+
+    /*
+     * Device reachability: the top-level isOnline is "answered ping OR the
+     * walk succeeded", stamped by the walk pipeline - the same verdict the
+     * device list's status pill shows. Deliberately not the walk's own
+     * isOnline, which the next CheckOn covers.
+     */
+    if (input.criteriaFilter.checkOn === CheckOn.SnmpIsOnline) {
+      const currentIsOnline: boolean | Array<boolean> =
+        (overTimeValue as Array<boolean>) ??
+        (input.dataToProcess as ProbeMonitorResponse).isOnline;
+
+      return CompareCriteria.compareCriteriaBoolean({
+        value: currentIsOnline,
+        criteriaFilter: input.criteriaFilter,
+      });
+    }
+
+    /*
+     * The walk itself. Gated above: a poll with no walk returns null before
+     * reaching here, so `snmpResponse` is present and "False" genuinely
+     * means the walk was attempted and failed.
+     */
+    if (input.criteriaFilter.checkOn === CheckOn.SnmpWalkIsSucceeding) {
+      if (!snmpResponse) {
+        return null;
+      }
+
+      return CompareCriteria.compareCriteriaBoolean({
+        value: snmpResponse.isOnline === true,
+        criteriaFilter: input.criteriaFilter,
+      });
+    }
+
+    // Check SNMP response time
+    if (input.criteriaFilter.checkOn === CheckOn.SnmpResponseTime) {
+      threshold = CompareCriteria.convertToNumber(threshold);
+
+      if (threshold === null || threshold === undefined) {
+        return null;
+      }
+
+      const currentResponseTime: number | Array<number> =
+        (overTimeValue as Array<number>) ??
+        (snmpResponse?.responseTimeInMs ||
+          (input.dataToProcess as ProbeMonitorResponse).responseTimeInMs);
+
+      if (currentResponseTime === null || currentResponseTime === undefined) {
+        return null;
+      }
+
+      return CompareCriteria.compareCriteriaNumbers({
+        value: currentResponseTime,
+        threshold: threshold as number,
+        criteriaFilter: input.criteriaFilter,
+      });
+    }
+
+    // Check if any monitored interface (in scope) is down
+    if (input.criteriaFilter.checkOn === CheckOn.SnmpInterfaceIsDown) {
+      const interfaces: Array<SnmpInterface> =
+        SnmpMonitorCriteria.scopeInterfaces(
+          snmpResponse?.interfaces || [],
+          input.criteriaFilter,
+        );
+
+      if (interfaces.length === 0) {
+        return null;
+      }
+
+      /*
+       * Administratively disabled interfaces are intentionally down and
+       * never count as failures.
+       */
+      const downInterfaces: Array<SnmpInterface> = interfaces.filter(
+        (snmpInterface: SnmpInterface) => {
+          return (
+            snmpInterface.isAdministrativelyUp &&
+            !snmpInterface.isOperationallyUp
+          );
+        },
+      );
+
+      const isTrueFilter: boolean =
+        input.criteriaFilter.filterType === FilterType.True;
+      const isFalseFilter: boolean =
+        input.criteriaFilter.filterType === FilterType.False;
+
+      if (downInterfaces.length > 0 && isTrueFilter) {
+        const names: string = downInterfaces
+          .slice(0, 5)
+          .map((snmpInterface: SnmpInterface) => {
+            return snmpInterface.name;
+          })
+          .join(", ");
+        return `${downInterfaces.length} interface(s) down: ${names}${
+          downInterfaces.length > 5 ? ", …" : ""
+        }.`;
+      }
+
+      if (downInterfaces.length === 0 && isFalseFilter) {
+        return "All administratively enabled interfaces are up.";
+      }
+
+      return null;
+    }
+
+    // Check the busiest interface's utilization
+    if (
+      input.criteriaFilter.checkOn === CheckOn.SnmpInterfaceUtilizationPercent
+    ) {
+      const utilizations: Array<number> = SnmpMonitorCriteria.scopeInterfaces(
+        snmpResponse?.interfaces || [],
+        input.criteriaFilter,
+      )
+        .map((snmpInterface: SnmpInterface) => {
+          return snmpInterface.utilizationPercent;
+        })
+        .filter((value: number | undefined): value is number => {
+          return typeof value === "number";
+        });
+
+      if (utilizations.length === 0) {
+        return null;
+      }
+
+      /*
+       * Anomaly filters skip the static threshold entirely: the busiest
+       * in-scope interface's utilization is compared to this monitor's
+       * same-hour-of-week utilization baseline instead.
+       */
+      if (
+        CriteriaFilterUtil.isAnomalyFilterType(input.criteriaFilter.filterType)
+      ) {
+        return await SnmpMonitorCriteria.evaluateUtilizationAnomaly({
+          projectId: dataToProcess.projectId,
+          monitorId: input.dataToProcess.monitorId!,
+          criteriaFilter: input.criteriaFilter,
+          observedUtilizationPercent: Math.max(...utilizations),
+        });
+      }
+
+      threshold = CompareCriteria.convertToNumber(threshold);
+
+      if (threshold === null || threshold === undefined) {
+        return null;
+      }
+
+      return CompareCriteria.compareCriteriaNumbers({
+        value: Math.max(...utilizations),
+        threshold: threshold as number,
+        criteriaFilter: input.criteriaFilter,
+      });
+    }
+
+    // Check the worst interface's error rate
+    if (input.criteriaFilter.checkOn === CheckOn.SnmpInterfaceErrorsPerSecond) {
+      threshold = CompareCriteria.convertToNumber(threshold);
+
+      if (threshold === null || threshold === undefined) {
+        return null;
+      }
+
+      const errorRates: Array<number> = SnmpMonitorCriteria.scopeInterfaces(
+        snmpResponse?.interfaces || [],
+        input.criteriaFilter,
+      )
+        .map((snmpInterface: SnmpInterface) => {
+          return snmpInterface.errorsPerSecond;
+        })
+        .filter((value: number | undefined): value is number => {
+          return typeof value === "number";
+        });
+
+      if (errorRates.length === 0) {
+        return null;
+      }
+
+      return CompareCriteria.compareCriteriaNumbers({
+        value: Math.max(...errorRates),
+        threshold: threshold as number,
+        criteriaFilter: input.criteriaFilter,
+      });
+    }
+
+    // Check if a specific OID exists (returns a value)
+    if (input.criteriaFilter.checkOn === CheckOn.SnmpOidExists) {
+      const oid: string | undefined =
+        input.criteriaFilter.snmpMonitorOptions?.oid;
+
+      if (!oid) {
+        return null;
+      }
+
+      /*
+       * Compare canonical forms. ".1.3.6.1" and "1.3.6.1" are the same
+       * object, operators type both, and net-snmp always answers with the
+       * dotless form — so a stored leading dot used to make the criterion
+       * silently un-matchable forever. Newly reachable now that the OID
+       * picker actually writes a value.
+       */
+      const normalizedOid: string = SnmpOidListUtil.normalizeOid(oid);
+
+      const oidResponse: SnmpOidResponse | undefined =
+        snmpResponse?.oidResponses?.find((response: SnmpOidResponse) => {
+          return SnmpOidListUtil.normalizeOid(response.oid) === normalizedOid;
+        });
+
+      const exists: boolean = Boolean(
+        oidResponse && oidResponse.value !== null,
+      );
+
+      const isTrue: boolean =
+        input.criteriaFilter.filterType === FilterType.True;
+      const isFalse: boolean =
+        input.criteriaFilter.filterType === FilterType.False;
+
+      if (exists && isTrue) {
+        return `SNMP OID ${oid} exists and returned a value.`;
+      }
+
+      if (!exists && isFalse) {
+        return `SNMP OID ${oid} does not exist or returned no value.`;
+      }
+
+      return null;
+    }
+
+    // Check the value of a specific OID
+    if (input.criteriaFilter.checkOn === CheckOn.SnmpOidValue) {
+      const oid: string | undefined =
+        input.criteriaFilter.snmpMonitorOptions?.oid;
+
+      if (!oid) {
+        return null;
+      }
+
+      /*
+       * Compare canonical forms. ".1.3.6.1" and "1.3.6.1" are the same
+       * object, operators type both, and net-snmp always answers with the
+       * dotless form — so a stored leading dot used to make the criterion
+       * silently un-matchable forever. Newly reachable now that the OID
+       * picker actually writes a value.
+       */
+      const normalizedOid: string = SnmpOidListUtil.normalizeOid(oid);
+
+      const oidResponse: SnmpOidResponse | undefined =
+        snmpResponse?.oidResponses?.find((response: SnmpOidResponse) => {
+          return SnmpOidListUtil.normalizeOid(response.oid) === normalizedOid;
+        });
+
+      if (!oidResponse || oidResponse.value === null) {
+        return null;
+      }
+
+      const oidValue: string | number = oidResponse.value;
+
+      /*
+       * Numeric comparison — only when the value is genuinely numeric. Guard
+       * against empty/whitespace OctetStrings, which Number("") coerces to 0
+       * and would spuriously satisfy a "== 0" criterion.
+       */
+      const isNumeric: boolean =
+        typeof oidValue === "number" ||
+        (String(oidValue).trim() !== "" && !isNaN(Number(oidValue)));
+      if (isNumeric) {
+        const numericValue: number =
+          typeof oidValue === "number" ? oidValue : Number(oidValue);
+        const numericThreshold: number | null =
+          CompareCriteria.convertToNumber(threshold);
+
+        if (numericThreshold !== null) {
+          const result: string | null = CompareCriteria.compareCriteriaNumbers({
+            value: numericValue,
+            threshold: numericThreshold,
+            criteriaFilter: input.criteriaFilter,
+          });
+
+          if (result) {
+            return `SNMP OID ${oid} (${oidResponse.name || oid}): ${result}`;
+          }
+        }
+      }
+
+      // String comparison
+      const result: string | null = CompareCriteria.compareCriteriaStrings({
+        value: String(oidValue),
+        threshold: String(threshold),
+        criteriaFilter: input.criteriaFilter,
+      });
+
+      if (result) {
+        return `SNMP OID ${oid} (${oidResponse.name || oid}): ${result}`;
+      }
+    }
+
+    return null;
+  }
+}

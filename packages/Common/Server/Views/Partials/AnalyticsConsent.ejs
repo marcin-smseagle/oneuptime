@@ -1,0 +1,498 @@
+<%#
+    Consent Mode v2 and attribution capture, shared by every OneUptime-owned
+    origin that loads the Google Tag Manager container.
+
+    This lived only in Home/Views/head-basic.ejs, which meant the marketing site
+    denied storage by default and asked the visitor, while /accounts and
+    /dashboard loaded the same container with no consent signal at all and
+    captured nothing. Two consequences, both bad: somebody who pressed "Reject
+    all" on the marketing site was tracked anyway the moment they reached the
+    signup page — which is exactly where the conversion fires — and an ad
+    pointed straight at /accounts/register?gclid=... stored no click id, so
+    that signup was permanently unattributable.
+
+    It is one file rather than a copy per origin because the storage contract
+    has to stay byte-identical: the same 'cookiesAccepted' values, the same
+    'clickIds' and 'firstTouch' JSON shapes. Three copies is how those stop
+    agreeing.
+
+    Include this BEFORE the Google Tag Manager snippet. Consent Mode defaults
+    are only meaningful if they are on the dataLayer before the container reads
+    it.
+
+    Home resolves this as ../../Common/Server/Views/Partials/AnalyticsConsent
+    and the App FeatureSets as ../../../../Common/Server/Views/Partials/...;
+    /usr/src/Common is present in both images.
+
+    Deliberately NOT here: the PostHog loader (its project key is Home's) and
+    the home/-prefixed page view and CTA listeners. Those are Home's alone and
+    stay in head-basic.ejs. Reporting on a captured touch is handed back to
+    the page through window.oneUptimeOnAttributionCaptured for the same
+    reason.
+-%>
+<!--
+    Consent.
+
+    This block runs BEFORE Google Tag Manager, because Consent Mode's defaults
+    have to be on the dataLayer before the container reads it.
+
+    MEASUREMENT IS NO LONGER GATED ON THE BANNER. Consent Mode defaults to
+    granted, attribution is captured and stored on every visit, and PostHog
+    loads on every visit. The `cookiesAccepted` key is still written and
+    `oneUptimeConsent` still reports it, because the banner and the footer's
+    cookie-settings link still read and write it — but nothing downstream
+    branches on the answer any more.
+
+    Stated plainly so nobody has to infer it from the code: pressing "Reject
+    all" does not stop measurement, does not stop attribution being stored, and
+    does not clear what an earlier visit stored. This was a deliberate product
+    decision (the booking receiver needs every booking attributed, and a
+    booking is itself a deliberate act by the visitor); it is not an oversight,
+    and it is not the behaviour the banner's own copy describes. If that copy
+    or the banner UI is meant to keep promising a choice, this is the file that
+    has to change back.
+-->
+<% if(typeof enableGoogleTagManager !== 'undefined' ? enableGoogleTagManager : false){ %>
+<!--
+    The dataLayer and the gtag shim, defined before both the consent signals
+    below and the container itself.
+
+    Deliberately inside the enableGoogleTagManager gate. A self-hosted install
+    loads no Google tag at all, and every OneUptime event guards on
+    `typeof dataLayer !== 'undefined'` — so creating the array there would turn
+    those no-ops into an array that grows for the life of the page and that
+    nothing will ever read.
+-->
+<script>
+    window.dataLayer = window.dataLayer || [];
+    function gtag() { dataLayer.push(arguments); }
+</script>
+<% } %>
+
+<script>
+    window.oneUptimeConsent = (function () {
+        var STORAGE_KEY = 'cookiesAccepted';
+
+        function readRaw() {
+            try {
+                return window.localStorage.getItem(STORAGE_KEY);
+            } catch (e) {
+                /*
+                 * Private mode, disabled storage, or a cross-origin sandbox.
+                 * Unreadable storage is not consent.
+                 */
+                return null;
+            }
+        }
+
+        function state() {
+            var raw = readRaw();
+            if (raw === 'true') { return 'granted'; }
+            if (raw === 'false') { return 'denied'; }
+            return 'unset';
+        }
+
+        function isGranted() {
+            return state() === 'granted';
+        }
+
+        /*
+         * Consent Mode v2, defaulting to granted across the board.
+         *
+         * wait_for_update is kept at 500ms so the container's own timing is
+         * unchanged, even though nothing arrives later to change the answer.
+         */
+        function pushConsentSignal(mode, granted) {
+            /*
+             * No tag, nothing to tell. On a self-hosted install gtag is never
+             * defined; the banner's answer is still recorded either way.
+             */
+            if (typeof window.gtag !== 'function') {
+                return;
+            }
+
+            window.gtag('consent', mode, {
+                ad_storage: granted ? 'granted' : 'denied',
+                ad_user_data: granted ? 'granted' : 'denied',
+                ad_personalization: granted ? 'granted' : 'denied',
+                analytics_storage: granted ? 'granted' : 'denied',
+                functionality_storage: granted ? 'granted' : 'denied',
+                personalization_storage: granted ? 'granted' : 'denied',
+                security_storage: 'granted',
+                wait_for_update: 500
+            });
+        }
+
+        pushConsentSignal('default', true);
+
+        function set(granted) {
+            try {
+                window.localStorage.setItem(STORAGE_KEY, granted ? 'true' : 'false');
+            } catch (e) {
+                // Nothing to persist to. The in-page decision still applies.
+            }
+
+            /*
+             * Deliberately NOT pushing a Consent Mode update here. The default
+             * is granted and stays granted; pushing 'denied' on a refusal would
+             * re-gate the Google tag and make the banner functional again,
+             * which is exactly what this file no longer does.
+             *
+             * There is no observer list either. Nothing downstream reacts to
+             * the answer any more, and an onChange() that could never fire is
+             * an API that reads as working code — re-add it alongside the
+             * consumer that needs it, not before.
+             */
+        }
+
+        return {
+            state: state,
+            isGranted: isGranted,
+            grant: function () { set(true); },
+            deny: function () { set(false); }
+        };
+    })();
+</script>
+
+<!--
+    Attribution capture (UTM parameters + ad platform click IDs), and the
+    reader that hands it on to the signup form (through localStorage, same
+    origin).
+
+    STORAGE MODEL
+
+    - Last-touch UTM values live in the individual utm* localStorage keys, read
+      by the signup page and stored on the User record.
+    - Last-touch click IDs live as a JSON object under 'clickIds'.
+    - The visitor's first attributed visit is preserved as JSON under
+      'firstTouch' and never overwritten.
+
+    A visit counts as a new "touch" if it carries ANY utm parameter or ad click
+    ID — Google Ads auto-tagging sends only gclid, no UTMs.
+
+    CONSENT
+
+    None. Every touch is stored on sight, whatever the banner says and whether
+    or not it has been answered. See the block at the top of this file for why.
+
+    CAL.COM BOOKINGS
+
+    window.oneUptimeCalAttributionMetadata(bookingKind) flattens the same
+    attribution into the scalar string map Cal.com accepts as booking metadata.
+    Cal hands it back on its BOOKING_CREATED webhook, which is delivered to the
+    CRM — not to OneUptime, which receives no booking webhook at all
+    (Docs/analytics/enterprise-conversion-tracking.md).
+-->
+<script>
+    (function () {
+        /*
+         * Must stay in step with UtmWireKeyToPropertyKey in
+         * Common/Types/Marketing/Attribution.ts — the signup door whitelists on
+         * that map, so a key written here that is missing there is silently
+         * dropped on arrival. AttributionCapture.test.ts asserts the two are
+         * identical.
+         */
+        var UTM_KEY_MAP = {
+            'utm_source': 'utmSource',
+            'utm_medium': 'utmMedium',
+            'utm_campaign': 'utmCampaign',
+            'utm_term': 'utmTerm',
+            'utm_content': 'utmContent',
+            'utm_id': 'utmId',
+            'utm_source_platform': 'utmSourcePlatform',
+            'utm_creative_format': 'utmCreativeFormat',
+            'utm_marketing_tactic': 'utmMarketingTactic'
+        };
+
+        /*
+         * Must stay in step with AdClickIdKeys in
+         * Common/Types/Marketing/Attribution.ts — the server whitelists on that
+         * list, so a key sent from here that is missing there is silently
+         * dropped on arrival.
+         */
+        var CLICK_ID_PARAMS = ['gclid', 'wbraid', 'gbraid', 'fbclid', 'msclkid', 'li_fat_id', 'twclid', 'rdt_cid'];
+
+        // Mirrors MaxAttributionValueLength on the server.
+        var MAX_VALUE_LENGTH = 500;
+
+        /*
+         * The first touch travels to Cal as one JSON string, so it gets a JSON
+         * bound rather than the 500-char per-value one. Truncating JSON
+         * produces a string the receiver's JSON.parse rejects, which would drop
+         * the whole first touch silently.
+         */
+        var MAX_FIRST_TOUCH_LENGTH = 4000;
+
+        /*
+         * This page's touch, kept in memory as well as written.
+         *
+         * Not a consent buffer — storeTouch runs unconditionally now. This is
+         * for the browser that refuses localStorage outright: private modes,
+         * "block all site data", a sandboxed iframe, enterprise storage policy.
+         * There, every setItem throws and is swallowed as best-effort, so a
+         * reader that trusted storage alone would hand Cal an empty bag for a
+         * visitor who arrived on a paid click seconds earlier — the exact
+         * failure this whole path exists to prevent.
+         */
+        var currentTouch = null;
+
+        function setItem(key, value) {
+            try {
+                window.localStorage.setItem(key, value);
+            } catch (e) {
+                // Storage unavailable; attribution is best-effort.
+            }
+        }
+
+        function removeItem(key) {
+            try {
+                window.localStorage.removeItem(key);
+            } catch (e) {
+                // Nothing to remove from.
+            }
+        }
+
+        function getItem(key) {
+            try {
+                return window.localStorage.getItem(key);
+            } catch (e) {
+                return null;
+            }
+        }
+
+        function bound(value) {
+            return String(value).slice(0, MAX_VALUE_LENGTH);
+        }
+
+        function readTouchFromUrl() {
+            var urlParams = new URLSearchParams(window.location.search);
+
+            var utmValues = {};
+            var hasUtm = false;
+            Object.keys(UTM_KEY_MAP).forEach(function (param) {
+                var value = urlParams.get(param);
+                if (value) {
+                    utmValues[UTM_KEY_MAP[param]] = bound(value);
+                    hasUtm = true;
+                }
+            });
+
+            var clickIds = {};
+            var hasClickId = false;
+            CLICK_ID_PARAMS.forEach(function (param) {
+                var value = urlParams.get(param);
+                if (value) {
+                    clickIds[param] = bound(value);
+                    hasClickId = true;
+                }
+            });
+
+            if (!hasUtm && !hasClickId) {
+                return null;
+            }
+
+            return {
+                utmValues: utmValues,
+                clickIds: clickIds,
+                hasClickId: hasClickId,
+                url: window.location.href,
+                referrer: document.referrer || '',
+                timestamp: new Date().toISOString()
+            };
+        }
+
+        function storeTouch(touch) {
+            // New touch: clear previous last-touch values, then store this visit's.
+            Object.keys(UTM_KEY_MAP).forEach(function (param) {
+                removeItem(UTM_KEY_MAP[param]);
+            });
+            Object.keys(touch.utmValues).forEach(function (key) {
+                setItem(key, touch.utmValues[key]);
+            });
+            setItem('utmUrl', touch.url);
+
+            if (touch.hasClickId) {
+                setItem('clickIds', JSON.stringify(touch.clickIds));
+            } else {
+                removeItem('clickIds');
+            }
+
+            // Preserve the first attributed touch forever.
+            if (!getItem('firstTouch')) {
+                var firstTouch = {};
+                Object.keys(touch.utmValues).forEach(function (key) {
+                    firstTouch[key] = touch.utmValues[key];
+                });
+                if (touch.hasClickId) {
+                    firstTouch.clickIds = touch.clickIds;
+                }
+                firstTouch.landingUrl = touch.url;
+                firstTouch.referrer = touch.referrer;
+                firstTouch.timestamp = touch.timestamp;
+                setItem('firstTouch', JSON.stringify(firstTouch));
+            }
+        }
+
+        function parseStoredJson(key) {
+            var raw = getItem(key);
+            if (!raw) { return null; }
+            try {
+                var parsed = JSON.parse(raw);
+                return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+            } catch (e) {
+                return null;
+            }
+        }
+
+        /*
+         * Everything known about where this visitor came from, whether it
+         * reached storage or is only in memory.
+         *
+         * This page's touch wins: it is this page load, and the stored copy is
+         * at best the same thing and at worst an older visit.
+         */
+        window.oneUptimeGetAttribution = function () {
+            var utm = {};
+            Object.keys(UTM_KEY_MAP).forEach(function (param) {
+                var key = UTM_KEY_MAP[param];
+                var value = (currentTouch && currentTouch.utmValues[key]) || getItem(key);
+                if (value && value !== 'null' && value !== 'undefined') {
+                    utm[key] = value;
+                }
+            });
+
+            var utmUrl = (currentTouch && currentTouch.url) || getItem('utmUrl');
+            if (utmUrl) {
+                utm.utmUrl = utmUrl;
+            }
+
+            var clickIds = (currentTouch && currentTouch.hasClickId ? currentTouch.clickIds : null)
+                || parseStoredJson('clickIds')
+                || {};
+
+            var firstTouch = parseStoredJson('firstTouch');
+
+            /*
+             * Storage refused the write, so there is no stored first touch to
+             * read back. This visit is the only one we will ever know about,
+             * which makes it the first one.
+             */
+            if (!firstTouch && currentTouch) {
+                firstTouch = {};
+                Object.keys(currentTouch.utmValues).forEach(function (key) {
+                    firstTouch[key] = currentTouch.utmValues[key];
+                });
+                if (currentTouch.hasClickId) {
+                    firstTouch.clickIds = currentTouch.clickIds;
+                }
+                firstTouch.landingUrl = currentTouch.url;
+                firstTouch.referrer = currentTouch.referrer;
+                firstTouch.timestamp = currentTouch.timestamp;
+            }
+
+            return {
+                utm: utm,
+                clickIds: clickIds,
+                firstTouch: firstTouch
+            };
+        };
+
+        /*
+         * The same attribution, flattened into the scalar string map Cal.com
+         * accepts as booking metadata.
+         *
+         * Cal takes booking metadata as FLAT, BRACKETED keys on the embed
+         * config — `metadata[utm_source]` — and hands them back on the webhook
+         * as payload.metadata.utm_source. NOT as a nested `metadata: {...}`
+         * object: Cal serialises each config value into a query parameter, so a
+         * nested object becomes the string "[object Object]" and every key
+         * inside it is lost. Nothing errors; bookings keep succeeding, they
+         * just arrive attributable to nothing — indistinguishable from not
+         * having done this at all.
+         *
+         * https://cal.com/help/embedding/prefill-booking-form-embed
+         *
+         * Keys are the snake_case wire spelling, which is what the CRM's Cal
+         * webhook receiver parses. Returns {} when there is nothing to
+         * attribute and no booking kind, so a caller can spread it
+         * unconditionally without sending an empty metadata bag.
+         */
+        window.oneUptimeCalAttributionMetadata = function (bookingKind) {
+            var attribution = window.oneUptimeGetAttribution();
+            var config = {};
+
+            function put(key, value, maxLength) {
+                if (value) {
+                    config['metadata[' + key + ']'] =
+                        String(value).slice(0, maxLength || MAX_VALUE_LENGTH);
+                }
+            }
+
+            Object.keys(UTM_KEY_MAP).forEach(function (param) {
+                put(param, attribution.utm[UTM_KEY_MAP[param]]);
+            });
+
+            put('utm_url', attribution.utm.utmUrl);
+
+            Object.keys(attribution.clickIds).forEach(function (param) {
+                put(param, attribution.clickIds[param]);
+            });
+
+            if (attribution.firstTouch) {
+                var serialized = JSON.stringify(attribution.firstTouch);
+                if (serialized.length <= MAX_FIRST_TOUCH_LENGTH) {
+                    put('ou_first_touch', serialized, MAX_FIRST_TOUCH_LENGTH);
+                }
+            }
+
+            /*
+             * Unconditional, unlike everything above it. All three embeds book
+             * the same Cal event type (oneuptimehq/demo), so without this the
+             * receiver cannot tell a support call from an enterprise demo from
+             * a self-hosted architecture assessment — they arrive identical.
+             */
+            if (bookingKind) {
+                config['metadata[ou_booking_kind]'] = String(bookingKind).slice(0, MAX_VALUE_LENGTH);
+            }
+
+            return config;
+        };
+
+        var touch = readTouchFromUrl();
+
+        if (touch) {
+            currentTouch = touch;
+            storeTouch(touch);
+        }
+
+        /*
+         * Reporting is the including page's business, not this partial's.
+         *
+         * The marketing site emits a `home/`-prefixed PostHog event from here;
+         * the product origins emit nothing, and must not start emitting under
+         * a `home/` name just because they now share the capture code. So the
+         * touch is handed out and the page decides what, if anything, to do
+         * with it.
+         *
+         * Wire keys (utm_source), not property keys (utmSource): this is what
+         * arrived on the URL.
+         */
+        document.addEventListener('DOMContentLoaded', function () {
+            if (!touch || typeof window.oneUptimeOnAttributionCaptured !== 'function') {
+                return;
+            }
+
+            var eventProps = { utm_url: touch.url };
+            Object.keys(UTM_KEY_MAP).forEach(function (param) {
+                if (touch.utmValues[UTM_KEY_MAP[param]]) {
+                    eventProps[param] = touch.utmValues[UTM_KEY_MAP[param]];
+                }
+            });
+            Object.keys(touch.clickIds).forEach(function (param) {
+                eventProps[param] = touch.clickIds[param];
+            });
+
+            window.oneUptimeOnAttributionCaptured(eventProps);
+        });
+    })();
+</script>

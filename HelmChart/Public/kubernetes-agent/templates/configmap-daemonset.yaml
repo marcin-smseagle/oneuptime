@@ -1,4 +1,10 @@
-{{- if and .Values.logs.enabled (eq (include "kubernetes-agent.logMode" .) "daemonset") }}
+{{- /*
+  Config for the node collector. Rendered whenever that DaemonSet runs, which is
+  now independent of logs: the filelog receiver and the logs pipeline are the
+  only parts gated on pod-log collection. Everything else here is metrics.
+*/}}
+{{- $wantLogs := eq (include "kubernetes-agent.daemonSetLogsEnabled" .) "true" }}
+{{- if eq (include "kubernetes-agent.daemonSetEnabled" .) "true" }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -30,20 +36,43 @@ data:
           - container.id
         k8s_api_config:
           auth_type: serviceAccount
-        {{- if .Values.kubeletstats.utilizationMetrics.enabled }}
-        # Saturation metrics — CPU/memory as a percentage of pod
-        # limit/request. All disabled by default in the upstream
-        # kubeletstats receiver because they require pod limits/requests
-        # set; enabling them adds no extra scrape, just derived metric
-        # families from data the receiver already collects.
-        #
-        # The receiver only exposes request/limit utilization at the
-        # container and pod level — there is no node-level
-        # `k8s.node.*.request_utilization` metric in any receiver
-        # version (it's a pod-scheduling ratio, not a kubelet stat).
-        # Node request saturation is derived downstream from
-        # pod/container requests vs. node allocatable.
+        # One `metrics:` map for every optional metric this receiver turns
+        # on. Keep it that way: a second `metrics:` key under kubeletstats
+        # is a duplicate mapping key, and the collector refuses the config.
         metrics:
+          # Node and pod CPU in use, in cores (`{cpu}`). Both are
+          # `enabled: false` upstream at collector 0.96.0, and they are
+          # always on here rather than behind a flag because OneUptime
+          # reads them: the "High Node CPU Utilization" alert template
+          # (k8s-high-cpu) divides `k8s.node.cpu.usage` by
+          # `k8s.node.allocatable_cpu`, and the Kubernetes dashboard
+          # template charts both. Without them that monitor has no
+          # numerator and can never fire, with no error anywhere.
+          #
+          # No extra scrape: the receiver records `*.cpu.usage` from the
+          # same kubelet sample, with the same value, as the default-on
+          # `*.cpu.utilization`, which is a cores gauge too despite its
+          # name. That one is deprecated upstream in favour of these, and
+          # later collectors turn these on and drop it. One series per
+          # node and one per pod; tests/kubeletstats-cpu-usage_test.yaml
+          # keeps both on. `container.cpu.usage` stays off; nothing reads it.
+          k8s.node.cpu.usage:
+            enabled: true
+          k8s.pod.cpu.usage:
+            enabled: true
+          {{- if .Values.kubeletstats.utilizationMetrics.enabled }}
+          # Saturation metrics — CPU/memory as a percentage of pod
+          # limit/request. All disabled by default in the upstream
+          # kubeletstats receiver because they require pod limits/requests
+          # set; enabling them adds no extra scrape, just derived metric
+          # families from data the receiver already collects.
+          #
+          # The receiver only exposes request/limit utilization at the
+          # container and pod level — there is no node-level
+          # `k8s.node.*.request_utilization` metric in any receiver
+          # version (it's a pod-scheduling ratio, not a kubelet stat).
+          # Node request saturation is derived downstream from
+          # pod/container requests vs. node allocatable.
           k8s.container.cpu_limit_utilization:
             enabled: true
           k8s.container.cpu_request_utilization:
@@ -60,7 +89,7 @@ data:
             enabled: true
           k8s.pod.memory_request_utilization:
             enabled: true
-        {{- end }}
+          {{- end }}
 
       {{- if .Values.cadvisor.enabled }}
       # Scrape this node's kubelet cAdvisor endpoint for container-level
@@ -91,7 +120,7 @@ data:
                   action: keep
       {{- end }}
 
-      {{- if .Values.hostMetrics.enabled }}
+      {{- if eq (include "kubernetes-agent.hostMetricsEnabled" .) "true" }}
       # OS-level metrics that kubeletstats doesn't surface: disk I/O
       # queue depth, filesystem inode usage, NIC error counters, load
       # average, paging stats. Reads /proc and /sys directly (mounted
@@ -113,7 +142,7 @@ data:
           processes:
       {{- end }}
 
-      {{- if .Values.auditLogs.enabled }}
+      {{- if and .Values.auditLogs.enabled $wantLogs }}
       # Kubernetes API server audit log. Self-managed clusters only;
       # managed K8s (EKS / GKE / AKS / DOKS) routes audit logs to the
       # cloud provider's sink instead of writing them to a file.
@@ -143,13 +172,32 @@ data:
             value: "kubernetes-audit"
       {{- end }}
 
-      # Collect pod logs from /var/log/pods
+      {{- if $wantLogs }}
+      # Collect pod logs from /var/log/pods.
+      #
+      # The namespace is encoded in the pod-log directory name
+      # (/var/log/pods/<namespace>_<pod>_<uid>/...), so podLogs-scoped
+      # namespace rules are applied here as include/exclude path globs.
+      # Filtered namespaces are never opened, and the same resolved lists
+      # are passed to the API log-tailer when that mode is selected.
+      # Exclude always wins over include.
+      {{- $podLogInclude := include "kubernetes-agent.namespaceRulePatterns" (dict "root" . "action" "include" "scope" "podLogs") | fromJsonArray }}
+      {{- $podLogExclude := include "kubernetes-agent.namespaceRulePatterns" (dict "root" . "action" "exclude" "scope" "podLogs") | fromJsonArray }}
       filelog:
         include:
+          {{- if $podLogInclude }}
+          {{- range $podLogInclude }}
+          - /var/log/pods/{{ . }}_*/*/*.log
+          {{- end }}
+          {{- else }}
           - /var/log/pods/*/*/*.log
+          {{- end }}
         exclude:
-          # Exclude the agent's own logs to avoid feedback loop
-          - /var/log/pods/{{ "{{ .Release.Namespace }}" }}_{{ "{{ include \"kubernetes-agent.fullname\" . }}" }}*/**/*.log
+          # Always exclude the agent's own logs to avoid a feedback loop.
+          - /var/log/pods/{{ .Release.Namespace }}_{{ include "kubernetes-agent.fullname" . }}*/**/*.log
+          {{- range $podLogExclude }}
+          - /var/log/pods/{{ . }}_*/*/*.log
+          {{- end }}
         start_at: end
         include_file_path: true
         include_file_name: false
@@ -274,20 +322,54 @@ data:
           # severity on the log line, so OTel LogRecords arrive at OneUptime
           # with severity_number=0 and render as "Unspecified" on the Logs
           # page. Derive a best-effort severity: route to body-based extraction
-          # when the body carries a recognizable severity keyword (covers
-          # "[ERROR]", "WARN:", " INFO ", etc. used by CoreDNS, most app
-          # frameworks, klog-style Kubernetes components), else fall back to
-          # stdout/stderr mapping. Using a router rather than regex_parser's
-          # on_error keeps this compatible with OTel Collector v0.96.0.
+          # when the body carries a recognizable severity keyword, else fall
+          # back to stdout/stderr mapping. Using a router rather than
+          # regex_parser's on_error keeps this compatible with OTel Collector
+          # v0.96.0.
+          #
+          # A level keyword is only believed when it sits where a LEVEL sits, not
+          # merely because the word turns up somewhere in the line. Two shapes
+          # count, and the pattern is those two, in this order:
+          #
+          #   1. LINE PREAMBLE. The keyword is on the first line of the record and
+          #      everything before it is preamble: punctuation, digits, and word
+          #      tokens that end on a structural delimiter (. ] = - : / | ) }).
+          #      That is "[ERROR] ...", Monolog's "app.INFO: ...", "2026-08-31
+          #      07:25:04 INFO ...", Python's "... - myapp - INFO - ..." and
+          #      logfmt's leading "level=error ...". Prose is not: "Connection
+          #      error, retrying" stops the preamble dead at "Connection ",
+          #      because a bare word followed by a space is not a preamble token.
+          #      The repetition is LAZY, so the first keyword in preamble
+          #      position wins rather than the last.
+          #   2. LEVEL FIELD. The keyword is the value of a level-ish key anywhere
+          #      in the line -- level / lvl / severity / severity_text / levelname
+          #      / log.level / log_level -- quoted or not, separated by ":" or
+          #      "=". That is zap and logrus JSON ({"level":"info"}) and logfmt
+          #      whose level is not the first field (ts=... level=error msg=...).
+          #
+          # The preamble branch is anchored, so when it matches it is the leftmost
+          # match and beats a level field further along the same line. Both
+          # branches take end-of-body as a trailing delimiter, so Docker (whose
+          # json-file driver keeps the newline in the `log` field) and Podman
+          # (whose CRI format does not) read the same line the same way.
+          #
+          # A line matching neither shape takes the stream fallback below, exactly
+          # as it did before any of this existed. Every keyword in the alternation
+          # MUST also resolve in `severity-parser` below: stanza's built-in preset
+          # knows nothing of notice/crit/critical/panic/alert/emerg/emergency, and
+          # an unmapped keyword leaves the record Unspecified, which is worse than
+          # the stream guess it replaced.
+          # Tests/Ops/ContainerAgentLogSeverity.test.js pins all of it, the corpus
+          # of lines that must NOT match included.
           - type: router
             id: severity-router
             routes:
               - output: parse-severity-from-body
-                expr: 'body matches "(?i)(?:^|[\\s\\[(])(TRACE|DEBUG|INFO|NOTICE|WARN|WARNING|ERROR|ERR|FATAL|CRITICAL|CRIT|PANIC)(?:[\\s\\]:=,)])"'
+                expr: 'body matches "(?i)(?:^(?:[^A-Za-z\"\\n]|[A-Za-z][A-Za-z0-9_]*[ \\t]*[.:=,/>|)}\\]-])*?|(?:^|[\\s,{\\[])\"?(?:log[._]?level|severity_?text|severity|levelname|level|lvl)\"?[ \\t]*[:=][ \\t]*\"?)(TRACE|DEBUG|INFO|NOTICE|WARNING|WARN|EMERGENCY|EMERG|ALERT|CRITICAL|CRIT|ERROR|ERR|FATAL|PANIC)(?:$|[\\s\\]:=,)\"}|>])"'
             default: add-fallback-severity
           - type: regex_parser
             id: parse-severity-from-body
-            regex: '(?i)(?:^|[\s\[(])(?P<severity_text>TRACE|DEBUG|INFO|NOTICE|WARN|WARNING|ERROR|ERR|FATAL|CRITICAL|CRIT|PANIC)(?:[\s\]:=,)])'
+            regex: '(?i)(?:^(?:[^A-Za-z"\n]|[A-Za-z][A-Za-z0-9_]*[ \t]*[.:=,/>|)}\]-])*?|(?:^|[\s,{\[])"?(?:log[._]?level|severity_?text|severity|levelname|level|lvl)"?[ \t]*[:=][ \t]*"?)(?P<severity_text>TRACE|DEBUG|INFO|NOTICE|WARNING|WARN|EMERGENCY|EMERG|ALERT|CRITICAL|CRIT|ERROR|ERR|FATAL|PANIC)(?:$|[\s\]:=,)"}|>])'
             parse_from: body
             output: severity-parser
           - type: add
@@ -306,13 +388,19 @@ data:
                 - err
                 - crit
                 - critical
+              # PSR-3 / syslog put alert and emergency above critical, and
+              # neither has a built-in mapping; nginx writes it as [emerg].
               fatal:
                 - panic
+                - alert
+                - emerg
+                - emergency
               info:
                 - notice
           - type: remove
             id: remove-severity-attr
             field: attributes.severity_text
+      {{- end }}
 
     processors:
       # Enrich with K8s metadata
@@ -355,11 +443,30 @@ data:
       resource:
         attributes:
           - key: k8s.cluster.name
-            value: {{ .Values.clusterName | quote }}
+            value: {{ include "kubernetes-agent.clusterName" . | quote }}
             action: upsert
           - key: service.name
             value: "kubernetes-agent-{{ .Values.clusterName }}"
             action: upsert
+          # Node identity. Every receiver in this collector reads
+          # node-local data — /proc and /sys for hostmetrics, this node's
+          # kubelet for kubeletstats and the cAdvisor scrape,
+          # /var/log/pods for filelog — so the node this pod is scheduled
+          # on owns all of it. kubeletstats stamps `k8s.node.name`
+          # itself, but hostmetrics and the Prometheus cAdvisor scrape do
+          # not, so without this every node's `system.*` series arrives
+          # with no node attribution at all and all of them collapse into
+          # one meaningless series. `insert` leaves a receiver-supplied
+          # (or k8sattributes-resolved) value alone.
+          #
+          # It has to be `k8s.node.name`, not `host.name`: OneUptime keys
+          # the k8s.node entity on k8s.cluster.name + k8s.node.name, and
+          # it suppresses Host identity on any resource that already
+          # carries a Kubernetes identity — so a `host.name` here would
+          # populate no entity at all.
+          - key: k8s.node.name
+            value: "${env:NODE_NAME}"
+            action: insert
           - key: oneuptime.agent.version
             value: {{ .Chart.AppVersion | quote }}
             action: upsert
@@ -379,6 +486,10 @@ data:
               - set(attributes["service.name"], attributes["k8s.deployment.name"]) where attributes["k8s.deployment.name"] != nil and attributes["k8s.deployment.name"] != ""
               - set(attributes["service.name"], attributes["k8s.statefulset.name"]) where attributes["k8s.statefulset.name"] != nil and attributes["k8s.statefulset.name"] != "" and attributes["k8s.deployment.name"] == nil
               - set(attributes["service.name"], attributes["k8s.daemonset.name"]) where attributes["k8s.daemonset.name"] != nil and attributes["k8s.daemonset.name"] != "" and attributes["k8s.deployment.name"] == nil and attributes["k8s.statefulset.name"] == nil
+
+      {{- if or (eq (include "kubernetes-agent.logFiltersEnabled" .) "true") (eq (include "kubernetes-agent.metricFiltersEnabled" .) "true") }}
+      {{- include "kubernetes-agent.filterProcessor" (dict "root" . "signals" (list "logs" "metrics")) | nindent 6 }}
+      {{- end }}
 
       batch:
         send_batch_size: 1024
@@ -433,17 +544,23 @@ data:
             {{- if .Values.cadvisor.enabled }}
             - prometheus/cadvisor
             {{- end }}
-            {{- if .Values.hostMetrics.enabled }}
+            {{- if eq (include "kubernetes-agent.hostMetricsEnabled" .) "true" }}
             - hostmetrics
             {{- end }}
           processors:
             - memory_limiter
             - k8sattributes
+            {{- if eq (include "kubernetes-agent.metricFiltersEnabled" .) "true" }}
+            # After k8sattributes so namespace conditions can match; before
+            # batch so dropped series never leave the node.
+            - filter/telemetry
+            {{- end }}
             - resource
             - transform
             - batch
           exporters:
             - otlphttp
+        {{- if $wantLogs }}
         logs:
           receivers:
             - filelog
@@ -453,9 +570,15 @@ data:
           processors:
             - memory_limiter
             - k8sattributes
+            {{- if eq (include "kubernetes-agent.logFiltersEnabled" .) "true" }}
+            # Severity is set by the receiver's operator chain above, so the
+            # filter sees a real severity_number by the time it runs here.
+            - filter/telemetry
+            {{- end }}
             - resource
             - transform
             - batch
           exporters:
             - otlphttp
+        {{- end }}
 {{- end }}

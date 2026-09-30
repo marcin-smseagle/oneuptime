@@ -1,0 +1,373 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=Scripts/GHA/retry.sh
+source "${SCRIPT_DIR}/retry.sh"
+
+usage() {
+	cat <<'EOF'
+Usage: generate_sboms.sh --version <version> [options]
+
+Generates a CycloneDX SBOM for each published OneUptime image by reading the
+already-pushed manifest straight out of GHCR — no docker pull, no daemon.
+
+This complements (does not replace) the SPDX attestations that
+build_docker_images.sh attaches at build time. The attestation answers "what is
+in this image?" for anyone holding the image reference; these files are the
+artifact we attach to the GitHub release, so an enterprise buyer or a
+Dependency-Track instance can ingest them without touching a registry.
+
+Not every published image is scanned — see SKIPPED_IMAGES below for what is
+left out and why. Everything that is scanned is scanned once per published
+architecture. The package sets really
+do differ between them — Chrome build skew in probe, disjoint Debian packages,
+and arch-specific npm binaries (@esbuild/linux-x64 vs @esbuild/linux-arm64) in
+every Node image — so an amd64-only SBOM ingested by an arm64 operator produces
+both false negatives and false positives.
+
+Community tags are scanned for every image, and the enterprise tag only for the
+images in ENTERPRISE_IMAGES below. Those are built from their Dockerfile's
+`enterprise` target (see build_docker_images.sh): the enterprise image is the
+community build plus ee/ and its own npm dependencies, with the Dashboard and
+Admin Dashboard bundles rebuilt, so its package set really differs. Every other
+image's enterprise tag is the same build with a different IS_ENTERPRISE_EDITION
+build arg, which no RUN step reads, so its layers match the community image's
+and a second scan would only duplicate the first.
+
+Required flags:
+	--version <version>   Version to scan (matches the pushed tag, e.g. 11.5)
+
+Optional flags:
+	--output-dir <path>   Directory for generated SBOMs (default: ./sbom)
+	--platforms <list>    Comma-separated platforms to scan
+	                      (default: linux/amd64,linux/arm64)
+	--registry <host>     Registry to read from (default: ghcr.io/oneuptime)
+EOF
+}
+
+VERSION=""
+OUTPUT_DIR="./sbom"
+PLATFORMS="linux/amd64,linux/arm64"
+REGISTRY="ghcr.io/oneuptime"
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--version)
+			VERSION="$2"
+			shift 2
+			;;
+		--output-dir)
+			OUTPUT_DIR="$2"
+			shift 2
+			;;
+		--platforms)
+			PLATFORMS="$2"
+			shift 2
+			;;
+		--registry)
+			REGISTRY="$2"
+			shift 2
+			;;
+		-h|--help)
+			usage
+			exit 0
+			;;
+		*)
+			echo "Unknown option: $1" >&2
+			usage
+			exit 1
+			;;
+	esac
+done
+
+if [[ -z "$VERSION" ]]; then
+	echo "Missing required argument: --version" >&2
+	usage
+	exit 1
+fi
+
+# Keep in sync with the *-docker-image-build jobs in release.yml. The drift
+# check below fails the build if they diverge, so adding a 15th image without
+# adding it here is caught in CI rather than silently shipping an SBOM set that
+# is missing an image.
+IMAGES=(
+	runner
+	app
+	docker-agent
+	e2e
+	kubernetes-ai-agent
+	kubernetes-cost-agent
+	kubernetes-log-tailer
+	nginx
+	podman-agent
+	probe
+	resource-ai-agent
+	test
+	test-server
+)
+
+# Images release.yml builds that this script deliberately does not scan. The
+# drift check below requires every built image to appear in exactly one of the
+# two lists, so a fifteenth image still cannot silently skip SBOM coverage — it
+# has to be named here, on purpose.
+#
+# home is the marketing site and documentation hub for oneuptime.com, and it is
+# not part of a self-hosted or enterprise install: home.enabled defaults to
+# false in HelmChart/Public/oneuptime/values.yaml, and docker-compose.yml has no
+# home service at all. These SBOMs exist so operators and Dependency-Track
+# instances can ingest what they actually run, and nobody self-hosting runs this.
+#
+# It is also the image that made this job fragile. home is 7.86GB with a single
+# 7.4GB layer — a full-history clone of the blog repo, and roughly four times
+# any other image here. GHCR shapes the throughput of a blob read that size,
+# which is what stranded 12.0.27 twice.
+SKIPPED_IMAGES=(
+	home
+)
+
+# Images whose enterprise- tag is a different build, not just different
+# metadata (see the usage text above), so it gets an SBOM of its own. Each must
+# also be in IMAGES; the check below enforces that.
+ENTERPRISE_IMAGES=(
+	app
+)
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+RELEASE_WORKFLOW="${REPO_ROOT}/.github/workflows/release.yml"
+
+if [[ -f "$RELEASE_WORKFLOW" ]]; then
+	# `|| true` because a zero-match grep exits 1, and under `set -o pipefail`
+	# that would abort the script here — before the diagnostic block below ever
+	# runs, leaving a red step with no output at all. The empty check that
+	# follows is load-bearing: `|| true` alone would let an empty result reach
+	# comm, which emits a spurious blank entry instead of a clear error.
+	WORKFLOW_IMAGES="$(grep -oE -- '--image [a-z0-9-]+' "$RELEASE_WORKFLOW" | awk '{print $2}' | sort -u || true)"
+	if [[ -z "$WORKFLOW_IMAGES" ]]; then
+		echo "❌ Found no '--image <name>' arguments in ${RELEASE_WORKFLOW}; the drift check cannot run." >&2
+		echo "   The build jobs were probably refactored (e.g. to a matrix). Update this check." >&2
+		exit 1
+	fi
+	# Both lists together, because an image release.yml builds is accounted for
+	# whether it is scanned or deliberately skipped. The `[@]+` guards are for
+	# `set -u`, which treats expanding an empty array as an unbound variable.
+	SCRIPT_IMAGES="$(printf '%s\n' \
+		${IMAGES[@]+"${IMAGES[@]}"} \
+		${SKIPPED_IMAGES[@]+"${SKIPPED_IMAGES[@]}"} | sort -u)"
+	if [[ "$WORKFLOW_IMAGES" != "$SCRIPT_IMAGES" ]]; then
+		echo "❌ Image list drift between release.yml and generate_sboms.sh" >&2
+		echo "--- only in release.yml ---" >&2
+		comm -23 <(printf '%s\n' "$WORKFLOW_IMAGES") <(printf '%s\n' "$SCRIPT_IMAGES") >&2
+		echo "--- only in generate_sboms.sh (neither scanned nor skipped) ---" >&2
+		comm -13 <(printf '%s\n' "$WORKFLOW_IMAGES") <(printf '%s\n' "$SCRIPT_IMAGES") >&2
+		exit 1
+	fi
+	# Naming the skipped images in the log is the point -- a skip nobody can see
+	# is how an image quietly loses SBOM coverage. Built conditionally because
+	# `${SKIPPED_IMAGES[*]}` on an empty array is an unbound variable under
+	# `set -u` before bash 4.4, and emptying this list should not break the job.
+	SKIPPED_SUMMARY=""
+	if (( ${#SKIPPED_IMAGES[@]} > 0 )); then
+		SKIPPED_SUMMARY=": ${SKIPPED_IMAGES[*]}"
+	fi
+	echo "✅ Image list matches release.yml (${#IMAGES[@]} scanned, ${#SKIPPED_IMAGES[@]} skipped${SKIPPED_SUMMARY})"
+else
+	echo "⚠️  ${RELEASE_WORKFLOW} not found — skipping image list drift check"
+fi
+
+# An enterprise tag is only scanned for an image that is itself scanned, so a
+# typo here cannot quietly scan a tag nobody publishes.
+for enterprise_image in ${ENTERPRISE_IMAGES[@]+"${ENTERPRISE_IMAGES[@]}"}; do
+	if [[ " ${IMAGES[*]} " != *" ${enterprise_image} "* ]]; then
+		echo "❌ ENTERPRISE_IMAGES lists ${enterprise_image}, which is not in IMAGES" >&2
+		exit 1
+	fi
+done
+
+# What gets scanned: every image's community tag, plus the enterprise tag of the
+# ENTERPRISE_IMAGES. Each entry is "<image> <tag prefix>".
+SCAN_TARGETS=()
+for image in "${IMAGES[@]}"; do
+	SCAN_TARGETS+=("${image} ")
+done
+for image in ${ENTERPRISE_IMAGES[@]+"${ENTERPRISE_IMAGES[@]}"}; do
+	SCAN_TARGETS+=("${image} enterprise-")
+done
+if (( ${#ENTERPRISE_IMAGES[@]} > 0 )); then
+	echo "✅ Also scanning the enterprise tag of: ${ENTERPRISE_IMAGES[*]}"
+fi
+
+if ! command -v syft >/dev/null 2>&1; then
+	echo "syft not found on PATH. Install it first (anchore/sbom-action/download-syft in CI)." >&2
+	exit 1
+fi
+
+SANITIZED_VERSION="${VERSION//+/-}"
+
+IFS=',' read -ra PLATFORM_LIST <<< "$PLATFORMS"
+
+mkdir -p "$OUTPUT_DIR"
+
+FAILED=()
+
+# One syft scan, in the shape retry_registry_read needs: a command it can just
+# run again.
+#
+# The `rm -f` is what makes re-running safe. A syft run that dies partway
+# through a read can leave a truncated file behind, and release.yml attaches
+# `sbom/*.cdx.json` by glob — so every attempt starts from no file at all, and
+# the component check below can only ever be reading output this attempt wrote.
+#
+# `registry:` forces syft to read the manifest over the registry API rather than
+# looking for a local daemon image. --platform is required because the tag
+# resolves to a multi-arch index; without it syft picks the runner's arch, which
+# would silently vary with the runner image. syft resolves the platform
+# correctly for an index and hard-errors on a mismatch (anchore/stereoscope#336),
+# so a wrong platform fails here rather than producing a mislabelled file.
+scan_image() {
+	local ref="$1"
+	local platform="$2"
+	local out="$3"
+
+	rm -f "$out"
+
+	syft "registry:${ref}" \
+		--platform "$platform" \
+		--output "cyclonedx-json=${out}"
+}
+
+# Fallback for an image the registry reader cannot get through.
+#
+# syft streams blobs with go-containerregistry, which restarts the whole read
+# when the registry shapes it. That is survivable for a small image and not for
+# a large one: release 12.0.27 burned all four attempts on the same blob of
+# home, which is a single 7.4GB layer in a 7.86GB image, while the smaller
+# images scanned either side of it succeeded — so this is throughput shaping on
+# one enormous blob, not an account-wide limit. syft has no knob for it; `syft
+# config` exposes registry auth and TLS and nothing about retries or timeouts.
+#
+# `docker pull` uses a different puller, one that retries and resumes each layer
+# rather than restarting the read from zero, which is what a throttled
+# multi-gigabyte download needs. So once the registry path is exhausted, pull the
+# image and scan it out of the local daemon instead.
+#
+# The image is removed immediately afterwards. home is ~8GB and this loop makes
+# 28 scans, so anything left behind would fill the runner.
+scan_image_via_docker() {
+	local ref="$1"
+	local platform="$2"
+	local out="$3"
+
+	rm -f "$out"
+
+	docker pull --platform "$platform" "$ref" || return 1
+
+	# A `docker:` source cannot be told which platform to read, so the pull is
+	# the only thing that selected it. Check what actually landed rather than
+	# trusting it: a mislabelled SBOM is worse than a missing one, which is why
+	# the registry path passes --platform in the first place. Anything other
+	# than a plain os/arch platform fails here rather than being assumed.
+	local got
+	got="$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$ref")"
+	if [[ "$got" != "$platform" ]]; then
+		echo "docker pull of ${ref} returned ${got}, expected ${platform}" >&2
+		docker image rm "$ref" >/dev/null 2>&1 || true
+		return 1
+	fi
+
+	local status=0
+	syft "docker:${ref}" --output "cyclonedx-json=${out}" || status=$?
+
+	docker image rm "$ref" >/dev/null 2>&1 || true
+
+	return "$status"
+}
+
+for target in "${SCAN_TARGETS[@]}"; do
+	image="${target%% *}"
+	tag_prefix="${target#* }"
+	tag="${tag_prefix}${SANITIZED_VERSION}"
+	ref="${REGISTRY}/${image}:${tag}"
+	# How a failure is named in the summary: "app", or "app:enterprise".
+	failure_name="${image}"
+	if [[ -n "$tag_prefix" ]]; then
+		failure_name="${image}:${tag_prefix%-}"
+	fi
+
+	for platform in "${PLATFORM_LIST[@]}"; do
+		platform="$(echo "$platform" | xargs)"  # trim whitespace
+		[[ -z "$platform" ]] && continue
+
+		platform_slug="${platform//\//-}"
+		out="${OUTPUT_DIR}/${image}-${tag}-${platform_slug}.cdx.json"
+
+		echo "📦 Scanning ${ref} (${platform})"
+
+		# Retried rather than run once: this loop makes 28 back-to-back reads
+		# of every layer of every image, which is enough to trip GHCR's rate
+		# limiter. See Scripts/GHA/retry.sh — the retry is conditional, so a
+		# tag that genuinely is not there still fails on the first attempt.
+		scanned=false
+
+		if retry_registry_read "SBOM scan of ${ref} (${platform})" \
+			scan_image "$ref" "$platform" "$out"; then
+			scanned=true
+		elif command -v docker >/dev/null 2>&1; then
+			# Last chance before this failure strands the release. A tag that
+			# genuinely is not there fails again here, quickly, and logs a
+			# second clear error rather than a misleading one.
+			echo "↪ Registry read did not get through; retrying ${ref} (${platform}) via docker pull." >&2
+			df -h / | tail -1 | awk '{print "   runner disk: " $4 " free of " $2}' >&2
+
+			if retry_registry_read "docker-pull SBOM scan of ${ref} (${platform})" \
+				scan_image_via_docker "$ref" "$platform" "$out"; then
+				scanned=true
+			fi
+		else
+			echo "↪ docker is not on PATH, so the pull fallback is unavailable." >&2
+		fi
+
+		if [[ "$scanned" != "true" ]]; then
+			echo "❌ Failed to generate SBOM for ${ref} (${platform})" >&2
+			rm -f "$out"
+			FAILED+=("${failure_name}/${platform}")
+			continue
+		fi
+
+		# A syft run that resolves an empty or wrong-media-type manifest can
+		# still exit 0 while producing an SBOM with no components. That would
+		# attach a useless file to the release, so treat it as a failure.
+		if ! component_count="$(python3 - "$out" <<'PY'
+import json, sys
+
+doc = json.load(open(sys.argv[1]))
+print(len(doc.get("components", [])))
+PY
+		)"; then
+			echo "❌ Could not parse SBOM for ${ref} (${platform})" >&2
+			rm -f "$out"
+			FAILED+=("${failure_name}/${platform}")
+			continue
+		fi
+
+		if [[ "$component_count" -eq 0 ]]; then
+			echo "❌ SBOM for ${ref} (${platform}) contains zero components" >&2
+			rm -f "$out"
+			FAILED+=("${failure_name}/${platform}")
+			continue
+		fi
+
+		echo "✅ ${out} (${component_count} components)"
+	done
+done
+
+if [[ ${#FAILED[@]} -gt 0 ]]; then
+	echo "" >&2
+	echo "❌ SBOM generation failed for: ${FAILED[*]}" >&2
+	exit 1
+fi
+
+echo ""
+echo "✅ Generated $(( ${#SCAN_TARGETS[@]} * ${#PLATFORM_LIST[@]} )) CycloneDX SBOMs in ${OUTPUT_DIR} (${#SCAN_TARGETS[@]} image tags × ${#PLATFORM_LIST[@]} platforms)"
+ls -la "$OUTPUT_DIR"

@@ -1,0 +1,57 @@
+<!-- Feature grid with categories -->
+<div class="mt-16 space-y-10" id="hero-feature-grid">
+
+  <!-- Essentials -->
+  <div>
+    <h3 class="text-xs font-semibold uppercase tracking-widest text-gray-400 mb-4 text-left">Essentials</h3>
+    <div class="grid grid-cols-2 gap-4 sm:grid-cols-5 sm:gap-5 auto-rows-fr">
+      <%- include('./status-page') -%>
+      <%- include('./incidents') -%>
+      <%- include('./monitoring') -%>
+      <%- include('./on-call') -%>
+      <%- include('./scheduled-maintenance') -%>
+    </div>
+  </div>
+
+  <!-- Observability -->
+  <div>
+    <h3 class="text-xs font-semibold uppercase tracking-widest text-gray-400 mb-4 text-left">Observability</h3>
+    <div class="grid grid-cols-2 gap-4 sm:grid-cols-5 sm:gap-5 auto-rows-fr">
+      <%- include('./logs') -%>
+      <%- include('./metrics') -%>
+      <%- include('./traces') -%>
+      <%- include('./exceptions') -%>
+      <%- include('./ai-observability') -%>
+      <%- include('./profiles') -%>
+      <%- include('./rum') -%>
+    </div>
+  </div>
+
+  <!-- Infrastructure -->
+  <div>
+    <h3 class="text-xs font-semibold uppercase tracking-widest text-gray-400 mb-4 text-left">Infrastructure</h3>
+    <div class="grid grid-cols-2 gap-4 sm:grid-cols-5 sm:gap-5 auto-rows-fr">
+      <%- include('./kubernetes') -%>
+      <%- include('./docker') -%>
+      <%- include('./podman') -%>
+      <%- include('./host') -%>
+      <%- include('./proxmox') -%>
+      <%- include('./vmware') -%>
+      <%- include('./ceph') -%>
+      <%- include('./docker-swarm') -%>
+      <%- include('./serverless') -%>
+    </div>
+  </div>
+
+  <!-- Automation & Intelligence -->
+  <div>
+    <h3 class="text-xs font-semibold uppercase tracking-widest text-gray-400 mb-4 text-left">Automation & Intelligence</h3>
+    <div class="grid grid-cols-2 gap-4 sm:grid-cols-4 sm:gap-5 auto-rows-fr">
+      <%- include('./workflows') -%>
+      <%- include('./runbooks') -%>
+      <%- include('./dashboards') -%>
+      <%- include('./ai-agent-grid') -%>
+    </div>
+  </div>
+
+</div>

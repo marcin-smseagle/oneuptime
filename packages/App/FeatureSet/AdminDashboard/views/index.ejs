@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+    <meta name="theme-color" content="#f9fafb" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="slack-app-id" content="ACVBMTPJQ">
+    <meta name="description" content="OneUptime - the complete open-source observability platform.">
+
+    <!-- Apply the opt-in preference before CSS/React to avoid a theme flash. -->
+    <script>
+      (function () {
+        var theme = "light";
+        try {
+          if (window.localStorage.getItem("oneuptime-dashboard-theme") === "dark") {
+            theme = "dark";
+          }
+        } catch (_error) {
+          // Storage can be blocked; light is the intentional safe default.
+        }
+
+        var root = document.documentElement;
+        root.classList.toggle("dark", theme === "dark");
+        root.dataset.theme = theme;
+        root.style.colorScheme = theme;
+
+        var themeColor = document.querySelector('meta[name="theme-color"]:not([media])');
+        if (themeColor) {
+          themeColor.setAttribute("content", theme === "dark" ? "#0f172a" : "#f9fafb");
+        }
+      })();
+    </script>
+
+  <%- include('../../../../Common/Server/Views/Partials/AnalyticsConsent', {
+    enableGoogleTagManager: typeof enableGoogleTagManager !== 'undefined' ? enableGoogleTagManager : false
+  }) -%>
+
+    <% if(typeof enableGoogleTagManager !== 'undefined' ? enableGoogleTagManager : false){ %> 
+    <!-- Google Tag Manager -->
+    <script>(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':
+      new Date().getTime(),event:'gtm.js'});var f=d.getElementsByTagName(s)[0],
+      j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
+      'https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);
+      })(window,document,'script','dataLayer','GTM-PKQD5WH');
+    </script>
+    <!-- End Google Tag Manager -->
+    <% } %>
+
+    <link rel="apple-touch-icon" sizes="180x180" href="/admin/assets/img/favicons/apple-touch-icon.png">
+    <link rel="shortcut icon" href="/admin/assets/img/favicons/favicon.ico?v=up-v1">
+    <link rel="icon" type="image/png" sizes="32x32" href="/admin/assets/img/favicons/favicon-32x32.png?v=up-v1">
+    <link rel="icon" type="image/png" sizes="16x16" href="/admin/assets/img/favicons/favicon-16x16.png?v=up-v1">
+    <link rel="icon" type="image/svg+xml" sizes="any" href="/oneuptime-assets/brand/favicons/oneuptime-up-v1.svg">
+    <link rel="mask-icon" href="/admin/assets/img/favicons/safari-pinned-tab.svg" color="#5bbad5">
+    <meta name="msapplication-TileColor" content="#121212">
+    <meta name="msapplication-TileImage" content="/admin/assets/img/favicons/mstile-144x144.png">
+    <link rel="preload" href="/admin/assets/fonts/InterVariable.woff2" as="font" type="font/woff2" crossorigin>
+    <style>
+      @font-face {
+        font-family: 'Inter';
+        font-style: normal;
+        font-weight: 100 900;
+        font-display: swap;
+        src: url('/admin/assets/fonts/InterVariable.woff2') format('woff2') tech('variations'),
+             url('/admin/assets/fonts/InterVariable.woff2') format('woff2-variations');
+      }
+      * {
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      }
+
+
+      input[type="datetime-local"]::-webkit-calendar-picker-indicator {
+         background: transparent;
+          bottom: 0;
+          color: transparent;
+          cursor: pointer;
+          height: auto;
+          left: 0;
+          position: absolute;
+          right: 0;
+          top: 0;
+          width: auto;
+      }
+
+      input[type="date"]::-webkit-calendar-picker-indicator {
+         background: transparent;
+          bottom: 0;
+          color: transparent;
+          cursor: pointer;
+          height: auto;
+          left: 0;
+          position: absolute;
+          right: 0;
+          top: 0;
+          width: auto;
+      }
+      </style>
+    <link rel="preload" href="/admin/assets/js/tailwind-3.4.5.js" as="script">
+
+    <!-- Critical CSS to prevent a light flash before Tailwind and the theme sheet load -->
+    <style>
+      .h-full { height: 100%; }
+      html, body, .bg-gray-50 { background-color: #f9fafb; }
+      html.dark, html.dark body.bg-gray-50 { background-color: #0f172a; }
+      html.dark { color: #f8fafc; }
+      #root { min-height: 100vh; }
+    </style>
+
+    <script src="/admin/assets/js/tailwind-3.4.5.js"></script>
+    
+    <script src="/admin/env.js"></script>
+
+
+    <title>OneUptime Admin Dashboard</title>
+
+  </head>
+  <body class="h-full bg-gray-50">
+    <% if(typeof enableGoogleTagManager !== 'undefined' ? enableGoogleTagManager : false){ %> 
+    <!-- Google Tag Manager (noscript) -->
+<noscript><iframe src="https://www.googletagmanager.com/ns.html?id=GTM-PKQD5WH"
+  height="0" width="0" style="display:none;visibility:hidden"></iframe></noscript>
+  <!-- End Google Tag Manager (noscript) -->
+    <% } %>
+    <noscript>You need to enable JavaScript to run this app.</noscript>
+    <div id="root"></div>
+
+    <script type="module" src="/admin/dist/Index.js"></script>
+    <script>
+      tailwind.config = {
+        darkMode: 'class',
+        theme: {
+          extend:
+          {
+            fontFamily: {
+              'display': ['Inter', 'sans-serif'],
+              'body': ['Inter', 'sans-serif']
+            },
+          },
+        },
+      }
+    </script>
+  </body>
+</html>

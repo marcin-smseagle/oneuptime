@@ -1,0 +1,204 @@
+<head>
+   <meta charset="utf-8" />
+   <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+   <title><%= (typeof t !== 'undefined' ? t('ui.metaTitleSuffix') : 'OneUptime API Reference') %> - <%= pageTitle -%></title>
+   <meta name="description" content="<%= pageDescription -%>">
+
+   <%#
+      Theme bootstrap. Runs before any stylesheet so the first paint is already
+      in the right theme - a dark-mode reader used to get a white flash on every
+      navigation. `oneuptime-reference-theme` holds "light", "dark" or "system";
+      the older `isDarkMode` key is still read so anyone who set it keeps their
+      choice.
+   -%>
+   <script>
+      (function () {
+         var STORAGE_KEY = 'oneuptime-reference-theme';
+
+         window.__referenceTheme = {
+            key: STORAGE_KEY,
+            /* The stored choice, or "system" when nothing has been chosen. */
+            preference: function () {
+               try {
+                  var stored = window.localStorage.getItem(STORAGE_KEY);
+                  if (stored === 'light' || stored === 'dark' || stored === 'system') {
+                     return stored;
+                  }
+                  /* Legacy key, written by the previous version of this page. */
+                  if (window.localStorage.isDarkMode === 'true') {
+                     return 'dark';
+                  }
+                  if (window.localStorage.isDarkMode === 'false') {
+                     return 'light';
+                  }
+               } catch (e) { /* Storage can be blocked; fall through to system. */ }
+               return 'system';
+            },
+            /* What the preference resolves to right now. */
+            resolved: function () {
+               var preference = window.__referenceTheme.preference();
+               if (preference !== 'system') {
+                  return preference;
+               }
+               return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+            },
+            apply: function () {
+               var resolved = window.__referenceTheme.resolved();
+               var root = document.documentElement;
+               root.classList.toggle('dark', resolved === 'dark');
+               root.style.colorScheme = resolved;
+               root.setAttribute('data-theme', resolved);
+               root.setAttribute('data-theme-preference', window.__referenceTheme.preference());
+            }
+         };
+
+         window.__referenceTheme.apply();
+
+         window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function () {
+            if (window.__referenceTheme.preference() === 'system') {
+               window.__referenceTheme.apply();
+            }
+         });
+
+         /* Another tab changing the theme should change this one too. */
+         window.addEventListener('storage', function (event) {
+            if (!event.key || event.key === STORAGE_KEY || event.key === 'isDarkMode') {
+               window.__referenceTheme.apply();
+            }
+         });
+      })();
+   </script>
+
+   <link rel="preload" href="/reference/fonts/InterVariable.woff2" as="font" type="font/woff2" crossorigin>
+
+   <link rel="stylesheet" href="/oneuptime-assets/highlight/styles/github-dark.min.css">
+   <script src="/oneuptime-assets/highlight/highlight.min.js"></script>
+   <%# Grammars for every language the code tabs offer. -%>
+   <script src="/oneuptime-assets/highlight/languages/python.min.js"></script>
+   <script src="/oneuptime-assets/highlight/languages/go.min.js"></script>
+   <script src="/oneuptime-assets/highlight/languages/java.min.js"></script>
+   <script src="/oneuptime-assets/highlight/languages/csharp.min.js"></script>
+   <script src="/oneuptime-assets/highlight/languages/php.min.js"></script>
+   <script src="/oneuptime-assets/highlight/languages/ruby.min.js"></script>
+   <script src="/oneuptime-assets/highlight/languages/rust.min.js"></script>
+   <script src="/oneuptime-assets/highlight/languages/powershell.min.js"></script>
+   <script src="/oneuptime-assets/highlight/languages/bash.min.js"></script>
+   <script src="/oneuptime-assets/highlight/languages/json.min.js"></script>
+   <script src="/oneuptime-assets/highlight/languages/javascript.min.js"></script>
+   <script src="/oneuptime-assets/highlight/languages/typescript.min.js"></script>
+
+   <link rel="preload" href="/oneuptime-assets/tailwind/tailwind-3.4.5.js" as="script">
+   <script src="/oneuptime-assets/tailwind/tailwind-3.4.5.js"></script>
+   <script>
+      /*
+       * Every colour is a CSS variable holding an "R G B" triple, so switching
+       * theme is one variable flip on <html> rather than a `dark:` twin on each
+       * of the several thousand utility classes in these templates. The
+       * <alpha-value> placeholder keeps the /opacity modifiers working.
+       */
+      function referenceColor(variableName) {
+         return 'rgb(var(--ou-' + variableName + ') / <alpha-value>)';
+      }
+
+      tailwind.config = {
+         darkMode: 'class',
+         theme: {
+            extend: {
+               colors: {
+                  canvas: referenceColor('canvas'),
+                  surface: referenceColor('surface'),
+                  'surface-soft': referenceColor('surface-soft'),
+                  'surface-raised': referenceColor('surface-raised'),
+                  line: referenceColor('line'),
+                  'line-soft': referenceColor('line-soft'),
+                  ink: referenceColor('ink'),
+                  'ink-muted': referenceColor('ink-muted'),
+                  'ink-subtle': referenceColor('ink-subtle'),
+                  'ink-faint': referenceColor('ink-faint'),
+                  accent: referenceColor('accent'),
+                  'accent-strong': referenceColor('accent-strong'),
+                  'accent-soft': referenceColor('accent-soft'),
+                  'accent-contrast': referenceColor('accent-contrast'),
+                  success: referenceColor('success'),
+                  'success-soft': referenceColor('success-soft'),
+                  warn: referenceColor('warn'),
+                  'warn-soft': referenceColor('warn-soft'),
+                  danger: referenceColor('danger'),
+                  'danger-soft': referenceColor('danger-soft'),
+                  info: referenceColor('info'),
+                  'info-soft': referenceColor('info-soft')
+               },
+               fontFamily: {
+                  sans: ['Inter', 'ui-sans-serif', 'system-ui', '-apple-system', 'BlinkMacSystemFont', '"Segoe UI"', 'Roboto', 'sans-serif'],
+                  mono: ['"JetBrains Mono"', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'Monaco', 'Consolas', 'monospace']
+               },
+               maxWidth: {
+                  '8xl': '90rem'
+               }
+            }
+         }
+      };
+   </script>
+
+   <%- include('styles') -%>
+
+   <% if(typeof enableGoogleTagManager !== 'undefined' ? enableGoogleTagManager : false){ %>
+   <!-- Google Tag Manager -->
+   <script>(function (w, d, s, l, i) {
+         w[l] = w[l] || []; w[l].push({
+            'gtm.start':
+               new Date().getTime(), event: 'gtm.js'
+         }); var f = d.getElementsByTagName(s)[0],
+            j = d.createElement(s), dl = l != 'dataLayer' ? '&l=' + l : ''; j.async = true; j.src =
+               'https://www.googletagmanager.com/gtm.js?id=' + i + dl; f.parentNode.insertBefore(j, f);
+      })(window, document, 'script', 'dataLayer', 'GTM-PKQD5WH');</script>
+   <!-- End Google Tag Manager -->
+   <% } %>
+
+   <link rel="shortcut icon" href="/img/favicons/favicon.ico">
+   <link rel="apple-touch-icon" sizes="180x180" href="/img/favicons/apple-touch-icon.png">
+   <link rel="icon" type="image/png" sizes="32x32" href="/img/favicons/favicon-32x32.png">
+   <link rel="icon" type="image/png" sizes="16x16" href="/img/favicons/favicon-16x16.png">
+   <link rel="mask-icon" href="/img/favicons/safari-pinned-tab.svg" color="#32335b">
+   <meta name="msapplication-TileColor" content="#32335b">
+   <link rel="apple-touch-icon-precomposed" href="/img/ou-wb.svg">
+   <link rel="icon" href="/img/ou-wb.svg">
+   <link rel="image_src" type="image/png" href="/img/hou-wb.svg">
+   <link rel="manifest" href="/manifest.json">
+
+   <%# Follows the resolved theme so browser chrome does not clash with the page. -%>
+   <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+   <meta name="theme-color" content="#0b1020" media="(prefers-color-scheme: dark)">
+
+   <meta property="og:title" content="OneUptime - One Complete Observability platform.">
+   <meta property="og:url" content="https://oneuptime.com">
+   <meta property="og:type" content="website" />
+   <meta property="og:description"
+      content="OneUptime monitors websites, API's, and servers and alerts your team if something goes wrong. It also keeps your customers updated about any downtime. ">
+   <meta property="og:image" content="https://oneuptime.com/img/hou-wb.svg">
+
+   <meta name="twitter:card" content="summary">
+   <meta name="twitter:image" content="/img/ou-wb.svg">
+   <meta name="twitter:site" content="@oneuptimeinc">
+   <meta name="twitter:title" content="OneUptime - One Complete Observability platform.">
+   <meta name="twitter:description"
+      content="OneUptime monitors websites, API's, and servers and alerts your team if something goes wrong. It also keeps your customers updated about any downtime.">
+
+   <script type="application/ld+json">
+     {
+     "@context": "http://schema.org",
+     "@type": "Corporation",
+     "name": "OneUptime",
+     "url": "https://www.oneuptime.com",
+     "logo": "https://oneuptime.com/img/ou-bb.svg",
+     "sameAs": [
+         "https://www.facebook.com/oneuptimeinc",
+         "https://twitter.com/OneUptimeInc",
+         "https://www.linkedin.com/company/oneuptime",
+         "https://njump.me/npub1kggtaw83q0mctlwvh854xdu3wjmen8tmq9cx9l030x2ylay6wk8qy2f2e6"
+     ],
+     "description": "OneUptime monitors websites, API's, and servers and alerts your team if something goes wrong. It also keeps your customers updated about any downtime."
+ }
+ </script>
+</head>

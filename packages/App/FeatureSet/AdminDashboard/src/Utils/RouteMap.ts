@@ -1,0 +1,128 @@
+import PageMap from "./PageMap";
+import RouteParams from "./RouteParams";
+import Route from "Common/Types/API/Route";
+import Dictionary from "Common/Types/Dictionary";
+import ObjectID from "Common/Types/ObjectID";
+
+const RouteMap: Dictionary<Route> = {
+  [PageMap.INIT]: new Route(`/admin`),
+  [PageMap.HOME]: new Route(`/admin`),
+  [PageMap.HEALTH]: new Route(`/admin/health`),
+  [PageMap.HEALTH_QUEUES]: new Route(`/admin/health/queues`),
+  [PageMap.HEALTH_INSTANCE_LOGS]: new Route(`/admin/health/instance-logs`),
+  [PageMap.HEALTH_POSTGRES]: new Route(`/admin/health/postgres`),
+  [PageMap.HEALTH_CLICKHOUSE]: new Route(`/admin/health/clickhouse`),
+  [PageMap.HEALTH_REDIS]: new Route(`/admin/health/redis`),
+  [PageMap.HEALTH_QUERY]: new Route(`/admin/health/query`),
+  [PageMap.HEALTH_LOGS]: new Route(`/admin/health/logs`),
+  [PageMap.HEALTH_TELEMETRY]: new Route(`/admin/health/telemetry`),
+  [PageMap.HEALTH_PROBES]: new Route(`/admin/health/probes`),
+  [PageMap.HEALTH_MIGRATIONS]: new Route(`/admin/health/migrations`),
+  [PageMap.HEALTH_SUPPORT_BUNDLE]: new Route(`/admin/health/support-bundle`),
+  [PageMap.LOGOUT]: new Route(`/admin/logout`),
+  [PageMap.SETTINGS]: new Route(`/admin/settings/host`),
+
+  [PageMap.PROJECTS]: new Route(`/admin/projects`),
+  [PageMap.PROJECT_VIEW]: new Route(`/admin/projects/${RouteParams.ModelID}`),
+  [PageMap.PROJECT_SUBSCRIPTION]: new Route(
+    `/admin/projects/${RouteParams.ModelID}/subscription`,
+  ),
+  [PageMap.PROJECT_SUPPORT]: new Route(
+    `/admin/projects/${RouteParams.ModelID}/support`,
+  ),
+  [PageMap.PROJECT_DELETE]: new Route(
+    `/admin/projects/${RouteParams.ModelID}/delete`,
+  ),
+  [PageMap.PROJECT_USERS]: new Route(
+    `/admin/projects/${RouteParams.ModelID}/users`,
+  ),
+  [PageMap.PROJECT_USER_VIEW]: new Route(
+    `/admin/projects/${RouteParams.ModelID}/users/${RouteParams.SubModelID}`,
+  ),
+  [PageMap.PROJECT_TEAMS]: new Route(
+    `/admin/projects/${RouteParams.ModelID}/teams`,
+  ),
+  [PageMap.PROJECT_TEAM_VIEW]: new Route(
+    `/admin/projects/${RouteParams.ModelID}/teams/${RouteParams.SubModelID}`,
+  ),
+
+  [PageMap.ENTERPRISE_LICENSES]: new Route(`/admin/enterprise-licenses`),
+  [PageMap.ENTERPRISE_LICENSE_VIEW]: new Route(
+    `/admin/enterprise-licenses/${RouteParams.ModelID}`,
+  ),
+
+  [PageMap.USERS]: new Route(`/admin/users`),
+  [PageMap.USER_VIEW]: new Route(`/admin/users/${RouteParams.ModelID}`),
+  [PageMap.USER_PROJECTS]: new Route(
+    `/admin/users/${RouteParams.ModelID}/projects`,
+  ),
+  [PageMap.USER_AUTHENTICATION]: new Route(
+    `/admin/users/${RouteParams.ModelID}/authentication`,
+  ),
+  [PageMap.USER_SETTINGS]: new Route(
+    `/admin/users/${RouteParams.ModelID}/settings`,
+  ),
+  [PageMap.USER_DELETE]: new Route(
+    `/admin/users/${RouteParams.ModelID}/delete`,
+  ),
+
+  [PageMap.SETTINGS_HOST]: new Route(`/admin/settings/host`),
+  [PageMap.SETTINGS_SMTP]: new Route(`/admin/settings/smtp`),
+  [PageMap.SETTINGS_CALL_AND_SMS]: new Route(`/admin/settings/call-and-sms`),
+  [PageMap.SETTINGS_WHATSAPP]: new Route(`/admin/settings/whatsapp`),
+  [PageMap.SETTINGS_TELEGRAM]: new Route(`/admin/settings/telegram`),
+  [PageMap.SETTINGS_PROBES]: new Route(`/admin/settings/probes`),
+  [PageMap.SETTINGS_AI_AGENTS]: new Route(`/admin/settings/ai-agents`),
+  [PageMap.SETTINGS_LLM_PROVIDERS]: new Route(`/admin/settings/llm-providers`),
+  [PageMap.SETTINGS_AUTHENTICATION]: new Route(
+    `/admin/settings/authentication`,
+  ),
+  [PageMap.SETTINGS_GLOBAL_SSO]: new Route(`/admin/settings/global-sso`),
+  [PageMap.SETTINGS_GLOBAL_SSO_VIEW]: new Route(
+    `/admin/settings/global-sso/${RouteParams.ModelID}`,
+  ),
+  [PageMap.SETTINGS_GLOBAL_OIDC]: new Route(`/admin/settings/global-oidc`),
+  [PageMap.SETTINGS_GLOBAL_OIDC_VIEW]: new Route(
+    `/admin/settings/global-oidc/${RouteParams.ModelID}`,
+  ),
+  [PageMap.SETTINGS_API_KEY]: new Route(`/admin/settings/api-key`),
+  [PageMap.SETTINGS_DATA_RETENTION]: new Route(
+    `/admin/settings/data-retention`,
+  ),
+
+  [PageMap.SEND_EMAIL]: new Route(`/admin/send-email`),
+
+  [PageMap.MORE_EMAIL]: new Route(`/admin/more/email`),
+};
+
+export class RouteUtil {
+  public static populateRouteParams(
+    route: Route,
+    props?: {
+      modelId?: ObjectID;
+      subModelId?: ObjectID;
+    },
+  ): Route {
+    // populate projectid
+
+    const tempRoute: Route = new Route(route.toString());
+
+    if (props && props.modelId) {
+      route = tempRoute.addRouteParam(
+        RouteParams.ModelID,
+        props.modelId.toString(),
+      );
+    }
+
+    if (props && props.subModelId) {
+      route = tempRoute.addRouteParam(
+        RouteParams.SubModelID,
+        props.subModelId.toString(),
+      );
+    }
+
+    return tempRoute;
+  }
+}
+
+export default RouteMap;

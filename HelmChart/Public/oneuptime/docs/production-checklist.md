@@ -13,7 +13,7 @@ Work through this list to make your OneUptime installation production-ready.
     tag: <specific-version>
   ```
 
-- [ ] **Pin PostgreSQL, Redis, and ClickHouse versions too.** Find the running
+- [ ] **Pin PostgreSQL, Valkey, and ClickHouse versions too.** Find the running
   version by describing a pod:
 
   ```console
@@ -28,7 +28,7 @@ Work through this list to make your OneUptime installation production-ready.
   postgresql:
     image:
       tag: <specific-version>
-  redis:
+  valkey:
     image:
       tag: <specific-version>
   clickhouse:
@@ -64,6 +64,65 @@ Work through this list to make your OneUptime installation production-ready.
   keep `worker.keda.minReplicas >= 1`, and set
   `app.keda.targetCPUUtilizationPercentage` (with `app.resources.requests.cpu`)
   so the API tier still autoscales once its queue-size trigger is disabled.
+
+- [ ] **Decide where KEDA comes from before the first install.** `keda.enabled`
+  renders the chart's `ScaledObject`s; `keda.install` decides whether the chart
+  also installs the operator, and follows `keda.enabled` unless you set it. On a
+  cluster where a platform team already runs KEDA, set `keda.install: false` —
+  installing a second operator collides on cluster-scoped objects the existing
+  release owns. On a cluster with no KEDA, the first install needs one extra
+  bootstrap pass, because the bundled operator's CRDs have to reach the cluster
+  before the `ScaledObject`s can. Both paths are in
+  [KEDA Ops](https://github.com/OneUptime/oneuptime/blob/master/HelmChart/Docs/Keda.md).
+
+- [ ] **Size ClickHouse insert concurrency when scaling telemetry ingest
+  workers.** Every telemetry-ingesting pod runs a fan-in writer that batches
+  all telemetry ClickHouse inserts into a handful of large INSERTs, so worker
+  replicas are safe to scale horizontally — ClickHouse sees a few big inserts
+  per pod instead of one per request. The knob that matters fleet-wide is
+  `worker.telemetryFanInMaxConcurrentInserts` (default 4): total ClickHouse
+  insert concurrency = worker replicas ×
+  `TELEMETRY_FANIN_MAX_CONCURRENT_INSERTS`. Keep that product under roughly
+  60% of ClickHouse `max_concurrent_queries` (default 100) so reads and
+  background merges still get query slots — e.g. at the defaults, stay at or
+  below ~15 telemetry-ingesting replicas, or lower the per-pod insert cap as
+  you add replicas. Batch size and flush latency are tunable via
+  `worker.telemetryFanInMaxBatchRows` / `worker.telemetryFanInMaxWaitMs`, and
+  the per-pod ClickHouse pools via `worker.clickhouseMaxOpenConnections` /
+  `worker.clickhouseIngestMaxOpenConnections` (the same keys exist under
+  `app:` for setups that run ingestion on the app pods). Telemetry inserts
+  are fire-and-forget async inserts by default (ClickHouse owns flushing;
+  a ClickHouse crash between buffer-accept and flush can lose that buffer) —
+  set `telemetryWaitForAsyncInsert: true` if you want every ack to wait for
+  the durable flush instead, and account for each in-flight insert then
+  holding a ClickHouse query slot until its buffer flushes.
+
+- [ ] **Enable the telemetry-writer tier before the worker fleet outgrows the
+  sizing rule above.** With `telemetryWriter.enabled: true`, worker and app
+  pods stop inserting telemetry into ClickHouse themselves and ship their
+  batched inserts (cluster-key authenticated HTTP, idempotent retries,
+  end-to-end acks) to a dedicated fixed-size deployment that owns
+  all telemetry insert concurrency. ClickHouse then sees
+  `telemetryWriter.replicaCount × telemetryWriter.telemetryFanInMaxConcurrentInserts`
+  concurrent inserts — a constant — so worker replicas can autoscale WITHOUT
+  limit; the replicas × inserts rule above moves from the (elastic) worker
+  fleet to the (fixed) writer tier. Size the writer tier against ClickHouse
+  capacity: keep its product under ~60% of `max_concurrent_queries`, and
+  never autoscale it on queue depth — when it saturates it sheds load with
+  429, workers back off and retry, and the backlog collects in the BullMQ
+  queue where the worker KEDA scaler (not ClickHouse) absorbs it. Two
+  opt-in autoscalers exist for the tier itself, both bounded by
+  `maxReplicas` (keep `maxReplicas × telemetryFanInMaxConcurrentInserts`
+  inside the ClickHouse budget): `telemetryWriter.autoscaling` (plain
+  CPU/memory HPA; requires `telemetryWriter.resources.requests`) and
+  `telemetryWriter.keda` (scales on the tier-wide shed rate — sustained
+  429s while ClickHouse is healthy are the honest "tier too small" signal,
+  exported at `/metrics/telemetry-writer-shed-rate` from a Valkey-backed
+  counter). Writer-pod memory
+  is bounded by `telemetryWriter.maxInflightRequests`; raise pod resources
+  together with it. If individual telemetry rows are very large (multi-KB log
+  bodies), lower `worker.telemetryFanInMaxBatchRows` so a shipped batch stays
+  well under the 50 MB internal request-body limit.
 
 - [ ] **Put PgBouncer in front of PostgreSQL** if you autoscale workers (KEDA) or
   use a connection-limited managed/external PostgreSQL — it keeps a connection
@@ -106,10 +165,16 @@ Work through this list to make your OneUptime installation production-ready.
 
 ## Secrets
 
-- [ ] **Use static database passwords** for Redis, ClickHouse, and PostgreSQL.
+- [ ] **Use static database passwords** for Valkey, ClickHouse, and PostgreSQL.
 - [ ] **Set `oneuptimeSecret` and `encryptionSecret`** (or configure the
   `externalSecrets` section) to long random strings. Use a password generator.
 - [ ] **Set `probes.<key>.key`** to a long random string to secure your probes.
+- [ ] **Pin probe and Runner identity keys** if you deploy with Argo CD, Flux, or
+  anything else built on `helm template`. Set `probes.<key>.key` / `runner.key`, or
+  point `probes.<key>.existingSecret` / `runner.existingSecret` at Secrets you manage.
+  A chart-generated identity key is re-randomised on every render, which silently
+  re-registers the probe and leaves its monitors pointing at an orphan. See
+  [Configuration](configuration.md#probe-and-runner-identity-keys).
 
 ## Stay current
 

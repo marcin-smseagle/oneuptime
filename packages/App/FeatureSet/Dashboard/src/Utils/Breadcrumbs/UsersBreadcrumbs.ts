@@ -1,0 +1,77 @@
+import PageMap from "../PageMap";
+import { BuildBreadcrumbLinksByTitles } from "./Helper";
+import Dictionary from "Common/Types/Dictionary";
+import Link from "Common/Types/Link";
+
+export function getUsersBreadcrumbs(path: string): Array<Link> | undefined {
+  const breadcrumpLinksMap: Dictionary<Link[]> = {
+    ...BuildBreadcrumbLinksByTitles(PageMap.USERS, ["Project", "Users"]),
+    ...BuildBreadcrumbLinksByTitles(PageMap.USER_CUSTOM_FIELDS, [
+      "Project",
+      "Users",
+      "Custom Fields",
+    ]),
+    ...BuildBreadcrumbLinksByTitles(PageMap.USER_VIEW, [
+      "Project",
+      "Users",
+      "View User",
+    ]),
+    ...BuildBreadcrumbLinksByTitles(PageMap.USER_VIEW_TEAMS, [
+      "Project",
+      "Users",
+      "View User",
+      "Teams",
+    ]),
+    ...BuildBreadcrumbLinksByTitles(PageMap.USER_VIEW_NOTIFICATION_RULES, [
+      "Project",
+      "Users",
+      "View User",
+      "Notification Rules",
+    ]),
+    ...BuildBreadcrumbLinksByTitles(PageMap.USER_VIEW_ON_CALL_READINESS, [
+      "Project",
+      "Users",
+      "View User",
+      "On-Call Readiness",
+    ]),
+    ...BuildBreadcrumbLinksByTitles(PageMap.USER_VIEW_NOTIFICATION_METHODS, [
+      "Project",
+      "Users",
+      "View User",
+      "Notification Methods",
+    ]),
+    ...BuildBreadcrumbLinksByTitles(PageMap.USER_VIEW_INCIDENT_ON_CALL_RULES, [
+      "Project",
+      "Users",
+      "View User",
+      "Incident On-Call Rules",
+    ]),
+    ...BuildBreadcrumbLinksByTitles(
+      PageMap.USER_VIEW_INCIDENT_EPISODE_ON_CALL_RULES,
+      ["Project", "Users", "View User", "Incident Episode On-Call Rules"],
+    ),
+    ...BuildBreadcrumbLinksByTitles(PageMap.USER_VIEW_ALERT_ON_CALL_RULES, [
+      "Project",
+      "Users",
+      "View User",
+      "Alert On-Call Rules",
+    ]),
+    ...BuildBreadcrumbLinksByTitles(
+      PageMap.USER_VIEW_ALERT_EPISODE_ON_CALL_RULES,
+      ["Project", "Users", "View User", "Alert Episode On-Call Rules"],
+    ),
+    ...BuildBreadcrumbLinksByTitles(PageMap.USER_VIEW_CUSTOM_FIELDS, [
+      "Project",
+      "Users",
+      "View User",
+      "Custom Fields",
+    ]),
+    ...BuildBreadcrumbLinksByTitles(PageMap.USER_VIEW_DELETE, [
+      "Project",
+      "Users",
+      "View User",
+      "Remove",
+    ]),
+  };
+  return breadcrumpLinksMap[path];
+}

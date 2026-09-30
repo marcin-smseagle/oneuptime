@@ -1,0 +1,545 @@
+import { ContentPath, StaticPath, ViewsPath } from "./Utils/Config";
+import LlmsTxtUtil from "./Utils/LlmsTxt";
+import DocsNav, { NavGroup, NavLink } from "./Utils/Nav";
+import DocsRender from "./Utils/Render";
+import {
+  DEFAULT_DOCS_LANGUAGE,
+  SUPPORTED_DOCS_LANGUAGES,
+  getLocalizedNav,
+  isSupportedDocsLanguage,
+  localizeDocsUrl,
+  makeT,
+  TranslateFn,
+} from "./Utils/I18n";
+import FeatureSet from "Common/Server/Types/FeatureSet";
+import Express, {
+  ExpressApplication,
+  ExpressRequest,
+  ExpressResponse,
+  ExpressStatic,
+  NextFunction,
+} from "Common/Server/Utils/Express";
+import DocsPlaceholders from "./Utils/Placeholders";
+import Response from "Common/Server/Utils/Response";
+import LocalFile from "Common/Server/Utils/LocalFile";
+import logger from "Common/Server/Utils/Logger";
+import "ejs";
+import { GoogleTagManagerEnabled } from "Common/Server/EnvironmentConfig";
+
+/*
+ * Read a markdown file for the given language, falling back to English when
+ * the translated copy does not exist. Returns null when no copy can be found.
+ */
+async function readContent(
+  fullPath: string,
+  lang: string,
+): Promise<string | null> {
+  const candidates: Array<string> = [
+    `${ContentPath}/${lang}/${fullPath}.md`,
+    `${ContentPath}/${DEFAULT_DOCS_LANGUAGE}/${fullPath}.md`,
+    // Legacy layout before translations existed (Content/<path>.md)
+    `${ContentPath}/${fullPath}.md`,
+  ];
+
+  for (const candidate of candidates) {
+    if (await LocalFile.doesFileExist(candidate)) {
+      return LocalFile.read(candidate);
+    }
+  }
+  return null;
+}
+
+/*
+ * Pick the best language for a request based on the URL parameter, the
+ * Accept-Language header, or fall back to English.
+ */
+function pickLanguage(req: ExpressRequest): string {
+  const fromParam: string | undefined = req.params["lang"];
+  if (fromParam && isSupportedDocsLanguage(fromParam)) {
+    return fromParam;
+  }
+  const header: string | undefined = req.headers["accept-language"];
+  if (header) {
+    const codes: Array<string> = header
+      .split(",")
+      .map((part: string) => {
+        return part.split(";")[0]!.trim().toLowerCase();
+      })
+      .filter((code: string) => {
+        return code.length > 0;
+      });
+    for (const code of codes) {
+      const primary: string = code.split("-")[0]!;
+      if (isSupportedDocsLanguage(primary)) {
+        return primary;
+      }
+    }
+  }
+  return DEFAULT_DOCS_LANGUAGE;
+}
+
+const DocsFeatureSet: FeatureSet = {
+  init: async (): Promise<void> => {
+    const app: ExpressApplication = Express.getExpressApp();
+
+    // Root /docs — redirect to the best language's getting-started page.
+    app.get("/docs", (req: ExpressRequest, res: ExpressResponse) => {
+      const lang: string = pickLanguage(req);
+      res.redirect(`/docs/${lang}/introduction/getting-started`);
+    });
+
+    /*
+     * LLM / agent discovery endpoints (llms.txt convention). Registered
+     * before any parameterized /docs/:lang routes so they are never
+     * shadowed by language handling or 404 fallbacks.
+     */
+    app.get(
+      "/docs/llms.txt",
+      async (req: ExpressRequest, res: ExpressResponse, next: NextFunction) => {
+        try {
+          const content: string = await LlmsTxtUtil.getLlmsTxt();
+          res.setHeader("Content-Type", "text/plain; charset=utf-8");
+          res.setHeader("Cache-Control", "public, max-age=600");
+          return Response.sendTextResponse(req, res, content);
+        } catch (err) {
+          logger.error(err);
+          return next(err);
+        }
+      },
+    );
+
+    app.get(
+      "/docs/llms-full.txt",
+      async (req: ExpressRequest, res: ExpressResponse, next: NextFunction) => {
+        try {
+          const content: string = await LlmsTxtUtil.getLlmsFullTxt();
+          res.setHeader("Content-Type", "text/plain; charset=utf-8");
+          res.setHeader("Cache-Control", "public, max-age=600");
+          return Response.sendTextResponse(req, res, content);
+        } catch (err) {
+          logger.error(err);
+          return next(err);
+        }
+      },
+    );
+
+    /*
+     * Backward-compat: the legacy Chinese code "zh" was renamed to "zh-CN"
+     * when Traditional Chinese ("zh-TW") was added. Permanently redirect old
+     * URLs so existing search-indexed and bookmarked links keep working.
+     */
+    app.get("/docs/zh", (_req: ExpressRequest, res: ExpressResponse) => {
+      return res.redirect(301, "/docs/zh-CN");
+    });
+    app.get("/docs/zh/*", (req: ExpressRequest, res: ExpressResponse) => {
+      const rest: string = req.path.slice("/docs/zh/".length);
+      return res.redirect(301, `/docs/zh-CN/${rest}`);
+    });
+    app.get(
+      "/docs/as-markdown/zh/*",
+      (req: ExpressRequest, res: ExpressResponse) => {
+        const rest: string = req.path.slice("/docs/as-markdown/zh/".length);
+        return res.redirect(301, `/docs/as-markdown/zh-CN/${rest}`);
+      },
+    );
+
+    /*
+     * The former network guide now lives in each integration's setup page.
+     * Send old HTML and markdown URLs to the catalog that links those guides.
+     */
+    for (const prefix of ["/docs/as-markdown", "/docs"]) {
+      app.get(
+        `${prefix}/:lang/self-hosted/integration-network-access`,
+        (req: ExpressRequest, res: ExpressResponse, next: NextFunction) => {
+          const lang: string = req.params["lang"] || "";
+          if (!isSupportedDocsLanguage(lang)) {
+            return next();
+          }
+          return res.redirect(301, `${prefix}/${lang}/integrations/index`);
+        },
+      );
+      app.get(
+        `${prefix}/self-hosted/integration-network-access`,
+        (req: ExpressRequest, res: ExpressResponse) => {
+          if (prefix === "/docs") {
+            res.vary("Accept-Language");
+          }
+          const lang: string =
+            prefix === "/docs" ? pickLanguage(req) : DEFAULT_DOCS_LANGUAGE;
+          return res.redirect(301, `${prefix}/${lang}/integrations/index`);
+        },
+      );
+    }
+
+    /*
+     * Backward-compat: the AI SRE page shipped on 2026-07-10 at
+     * /docs/ai/sentinel, under the old "Sentinel" codename. The codename is
+     * retired and the page now lives at /docs/ai/ai-sre — permanently redirect
+     * the old URL (in every shape it was reachable: language-prefixed,
+     * language-less, and the raw-markdown endpoints) so inbound links,
+     * bookmarks and search-indexed results keep working instead of 404ing.
+     */
+    app.get(
+      "/docs/as-markdown/:lang/ai/sentinel",
+      (req: ExpressRequest, res: ExpressResponse) => {
+        const lang: string = req.params["lang"] || DEFAULT_DOCS_LANGUAGE;
+        return res.redirect(301, `/docs/as-markdown/${lang}/ai/ai-sre`);
+      },
+    );
+    app.get(
+      "/docs/as-markdown/ai/sentinel",
+      (_req: ExpressRequest, res: ExpressResponse) => {
+        return res.redirect(301, "/docs/as-markdown/ai/ai-sre");
+      },
+    );
+    app.get(
+      "/docs/:lang/ai/sentinel",
+      (req: ExpressRequest, res: ExpressResponse, next: NextFunction) => {
+        const lang: string = req.params["lang"] || "";
+        if (!isSupportedDocsLanguage(lang)) {
+          return next();
+        }
+        return res.redirect(301, `/docs/${lang}/ai/ai-sre`);
+      },
+    );
+    app.get(
+      "/docs/ai/sentinel",
+      (_req: ExpressRequest, res: ExpressResponse) => {
+        return res.redirect(301, "/docs/ai/ai-sre");
+      },
+    );
+
+    /*
+     * Backward-compat: the standalone SNMP Monitor guide was replaced by the
+     * Network Device Monitor guide (the SNMP monitor type folded into the
+     * Network Devices product). Permanently redirect the old URL in every
+     * shape it was reachable so inbound links, bookmarks and search-indexed
+     * results keep working instead of 404ing.
+     */
+    app.get(
+      "/docs/as-markdown/:lang/monitor/snmp-monitor",
+      (req: ExpressRequest, res: ExpressResponse) => {
+        const lang: string = req.params["lang"] || DEFAULT_DOCS_LANGUAGE;
+        return res.redirect(
+          301,
+          `/docs/as-markdown/${lang}/monitor/network-device-monitor`,
+        );
+      },
+    );
+    app.get(
+      "/docs/as-markdown/monitor/snmp-monitor",
+      (_req: ExpressRequest, res: ExpressResponse) => {
+        return res.redirect(
+          301,
+          "/docs/as-markdown/monitor/network-device-monitor",
+        );
+      },
+    );
+    app.get(
+      "/docs/:lang/monitor/snmp-monitor",
+      (req: ExpressRequest, res: ExpressResponse, next: NextFunction) => {
+        const lang: string = req.params["lang"] || "";
+        if (!isSupportedDocsLanguage(lang)) {
+          return next();
+        }
+        return res.redirect(
+          301,
+          `/docs/${lang}/monitor/network-device-monitor`,
+        );
+      },
+    );
+    app.get(
+      "/docs/monitor/snmp-monitor",
+      (_req: ExpressRequest, res: ExpressResponse) => {
+        return res.redirect(301, "/docs/monitor/network-device-monitor");
+      },
+    );
+
+    /*
+     * Backward-compat: RUM used to be a single page inside the Telemetry
+     * section. It is now its own docs section (/docs/rum/...), with the old
+     * page's content expanded across it. Permanently redirect the old URL in
+     * every shape it was reachable so inbound links, bookmarks and
+     * search-indexed results keep working instead of 404ing.
+     */
+    app.get(
+      "/docs/as-markdown/:lang/telemetry/real-user-monitoring",
+      (req: ExpressRequest, res: ExpressResponse) => {
+        const lang: string = req.params["lang"] || DEFAULT_DOCS_LANGUAGE;
+        return res.redirect(301, `/docs/as-markdown/${lang}/rum/index`);
+      },
+    );
+    app.get(
+      "/docs/as-markdown/telemetry/real-user-monitoring",
+      (_req: ExpressRequest, res: ExpressResponse) => {
+        return res.redirect(301, "/docs/as-markdown/rum/index");
+      },
+    );
+    app.get(
+      "/docs/:lang/telemetry/real-user-monitoring",
+      (req: ExpressRequest, res: ExpressResponse, next: NextFunction) => {
+        const lang: string = req.params["lang"] || "";
+        if (!isSupportedDocsLanguage(lang)) {
+          return next();
+        }
+        return res.redirect(301, `/docs/${lang}/rum/index`);
+      },
+    );
+    app.get(
+      "/docs/telemetry/real-user-monitoring",
+      (_req: ExpressRequest, res: ExpressResponse) => {
+        return res.redirect(301, "/docs/rum/index");
+      },
+    );
+
+    // /docs/:lang — redirect to that language's getting-started page.
+    app.get(
+      "/docs/:lang",
+      (req: ExpressRequest, res: ExpressResponse, next: NextFunction) => {
+        const lang: string = req.params["lang"] || "";
+        if (!isSupportedDocsLanguage(lang)) {
+          /*
+           * Not a known language — let the next handler (legacy two-segment URL)
+           * pick it up.
+           */
+          return next();
+        }
+        res.redirect(`/docs/${lang}/introduction/getting-started`);
+      },
+    );
+
+    // Raw markdown endpoint, language-aware.
+    app.get(
+      "/docs/as-markdown/:lang/:categorypath/:pagepath",
+      async (req: ExpressRequest, res: ExpressResponse, next: NextFunction) => {
+        try {
+          const lang: string = pickLanguage(req);
+          const fullPath: string =
+            `${req.params["categorypath"]}/${req.params["pagepath"]}`.toLowerCase();
+
+          const content: string | null = await readContent(fullPath, lang);
+          if (content === null) {
+            res.status(404);
+            return res.send("");
+          }
+          return Response.sendMarkdownResponse(
+            req,
+            res,
+            DocsPlaceholders.render(content, lang),
+          );
+        } catch (err) {
+          logger.error(err);
+          return next(err);
+        }
+      },
+    );
+
+    /*
+     * Legacy raw markdown endpoint without a language — keep working by
+     * assuming the default language.
+     */
+    app.get(
+      "/docs/as-markdown/:categorypath/:pagepath",
+      async (req: ExpressRequest, res: ExpressResponse, next: NextFunction) => {
+        try {
+          const fullPath: string =
+            `${req.params["categorypath"]}/${req.params["pagepath"]}`.toLowerCase();
+          const content: string | null = await readContent(
+            fullPath,
+            DEFAULT_DOCS_LANGUAGE,
+          );
+          if (content === null) {
+            res.status(404);
+            return res.send("");
+          }
+          return Response.sendMarkdownResponse(
+            req,
+            res,
+            DocsPlaceholders.render(content, DEFAULT_DOCS_LANGUAGE),
+          );
+        } catch (err) {
+          logger.error(err);
+          return next(err);
+        }
+      },
+    );
+
+    // Language-aware doc page: /docs/:lang/:category/:page
+    app.get(
+      "/docs/:lang/:categorypath/:pagepath",
+      async (req: ExpressRequest, res: ExpressResponse, next: NextFunction) => {
+        try {
+          const langParam: string = req.params["lang"] || "";
+
+          /*
+           * If :lang is not a known language code, this is probably a legacy
+           * 3-segment URL like /docs/introduction/getting-started/<something>
+           * which we no longer serve — render 404 in the default language.
+           */
+          if (!isSupportedDocsLanguage(langParam)) {
+            return next();
+          }
+
+          const lang: string = langParam;
+          const t: TranslateFn = makeT(lang);
+          const localizedNav: ReturnType<typeof getLocalizedNav> =
+            getLocalizedNav(lang);
+
+          const fullPath: string =
+            `${req.params["categorypath"]}/${req.params["pagepath"]}`.toLowerCase();
+
+          let contentInMarkdown: string | null = await readContent(
+            fullPath,
+            lang,
+          );
+
+          if (contentInMarkdown === null) {
+            res.status(404);
+            return res.render(`${ViewsPath}/NotFound`, {
+              nav: localizedNav,
+              t: t,
+              lang: lang,
+              supportedLanguages: SUPPORTED_DOCS_LANGUAGES,
+              enableGoogleTagManager: GoogleTagManagerEnabled,
+              link: null,
+              currentPath: req.originalUrl,
+            });
+          }
+
+          /*
+           * Strip the first line (title) — it already shows up in the page
+           * header chrome.
+           */
+          contentInMarkdown = contentInMarkdown.split("\n").slice(1).join("\n");
+
+          contentInMarkdown = DocsPlaceholders.render(contentInMarkdown, lang);
+
+          const renderedContent: string =
+            await DocsRender.render(contentInMarkdown);
+
+          /*
+           * Match against the canonical English nav so we can find the
+           * category/link regardless of which language is being rendered.
+           */
+          const currentCategory: NavGroup | undefined = DocsNav.find(
+            (category: NavGroup) => {
+              return category.links.find((link: NavLink) => {
+                return link.url.toLocaleLowerCase().includes(fullPath);
+              });
+            },
+          );
+
+          const currentNavLink: NavLink | undefined =
+            currentCategory?.links.find((link: NavLink) => {
+              return link.url.toLocaleLowerCase().includes(fullPath);
+            });
+
+          if (!currentCategory || !currentNavLink) {
+            res.status(404);
+            return res.render(`${ViewsPath}/NotFound`, {
+              nav: localizedNav,
+              t: t,
+              lang: lang,
+              supportedLanguages: SUPPORTED_DOCS_LANGUAGES,
+              enableGoogleTagManager: GoogleTagManagerEnabled,
+              link: null,
+              currentPath: req.originalUrl,
+            });
+          }
+
+          /*
+           * Build pagination over the canonical (English) nav, then translate
+           * the resulting prev/next links to the current language.
+           */
+          interface FlatLink {
+            link: NavLink;
+            category: NavGroup;
+          }
+          const flatLinks: FlatLink[] = [];
+          for (const cat of DocsNav) {
+            for (const navLink of cat.links) {
+              if (
+                navLink.url.startsWith("http") &&
+                !navLink.url.includes("/docs/")
+              ) {
+                continue;
+              }
+              flatLinks.push({ link: navLink, category: cat });
+            }
+          }
+
+          const currentIndex: number = flatLinks.findIndex((item: FlatLink) => {
+            return item.link.url.toLocaleLowerCase().includes(fullPath);
+          });
+
+          const prevRaw: FlatLink | null =
+            currentIndex > 0 ? flatLinks[currentIndex - 1]! : null;
+          const nextRaw: FlatLink | null =
+            currentIndex >= 0 && currentIndex < flatLinks.length - 1
+              ? flatLinks[currentIndex + 1]!
+              : null;
+
+          const translateFlatLink: (item: FlatLink) => {
+            link: { title: string; url: string };
+            category: { title: string };
+          } = (item: FlatLink) => {
+            return {
+              link: {
+                title: t(`navLinks.${item.link.title}`),
+                url: localizeDocsUrl(item.link.url, lang),
+              },
+              category: {
+                title: t(`navGroups.${item.category.title}`),
+              },
+            };
+          };
+
+          const localizedCategory: { title: string } = {
+            title: t(`navGroups.${currentCategory.title}`),
+          };
+          const localizedLink: { title: string; url: string } = {
+            title: t(`navLinks.${currentNavLink.title}`),
+            url: localizeDocsUrl(currentNavLink.url, lang),
+          };
+
+          return res.render(`${ViewsPath}/Index`, {
+            nav: localizedNav,
+            t: t,
+            lang: lang,
+            supportedLanguages: SUPPORTED_DOCS_LANGUAGES,
+            content: renderedContent,
+            category: localizedCategory,
+            link: localizedLink,
+            githubPath: fullPath,
+            enableGoogleTagManager: GoogleTagManagerEnabled,
+            prevLink: prevRaw ? translateFlatLink(prevRaw) : null,
+            nextLink: nextRaw ? translateFlatLink(nextRaw) : null,
+            currentPath: req.originalUrl,
+          });
+        } catch (err) {
+          logger.error(err);
+          return next(err);
+        }
+      },
+    );
+
+    /*
+     * Legacy URL without language prefix: /docs/:category/:page → redirect to
+     * the user's best-fit language so old links keep working and bookmarks
+     * upgrade naturally.
+     */
+    app.get(
+      "/docs/:categorypath/:pagepath",
+      (req: ExpressRequest, res: ExpressResponse) => {
+        const lang: string = pickLanguage(req);
+        const category: string = req.params["categorypath"]!;
+        const page: string = req.params["pagepath"]!;
+        return res.redirect(`/docs/${lang}/${category}/${page}`);
+      },
+    );
+
+    app.use("/docs/static", ExpressStatic(StaticPath));
+  },
+};
+
+export default DocsFeatureSet;

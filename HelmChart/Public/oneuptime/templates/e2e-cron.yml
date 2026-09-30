@@ -19,13 +19,8 @@ spec:
     spec:
       template:
         spec:
-          {{- if $.Values.cronJobs.e2e.nodeSelector }}
           nodeSelector:
-            {{- toYaml $.Values.cronJobs.e2e.nodeSelector | nindent 12 }}
-          {{- else if $.Values.nodeSelector }}
-          nodeSelector:
-            {{- toYaml $.Values.nodeSelector | nindent 12 }}
-          {{- end }}
+            {{- include "oneuptime.nodeSelector" ($.Values.cronJobs.e2e.nodeSelector | default $.Values.nodeSelector) | nindent 12 }}
           containers:
           - name: e2e-cron
             image: {{ include "oneuptime.image" (dict "Values" $.Values "ServiceName" "e2e") }}
@@ -42,6 +37,17 @@ spec:
                 value: {{ $.Values.cronJobs.e2e.statusPageUrl | quote }}
               - name: E2E_TESTS_FAILED_WEBHOOK_URL
                 value: {{ $.Values.cronJobs.e2e.failedWebhookUrl | quote }}
+              {{- with (default $.Values.extraEnv $.Values.cronJobs.e2e.extraEnv) }}
+              {{- toYaml . | nindent 14 }}
+              {{- end }}
+            {{- with (default $.Values.extraVolumeMounts $.Values.cronJobs.e2e.extraVolumeMounts) }}
+            volumeMounts:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
+          {{- with (default $.Values.extraVolumes $.Values.cronJobs.e2e.extraVolumes) }}
+          volumes:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           restartPolicy: Never
 
 {{- end }}

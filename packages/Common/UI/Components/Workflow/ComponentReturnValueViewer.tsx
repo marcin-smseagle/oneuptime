@@ -1,0 +1,130 @@
+import { ReturnValue } from "../../../Types/Workflow/Component";
+import { componentReturnValueReference } from "../../../Types/Workflow/TemplateSyntax";
+import React, { FunctionComponent, ReactElement } from "react";
+
+export interface ComponentProps {
+  returnValues: Array<ReturnValue>;
+  name: string;
+  description: string;
+  /*
+   * This step's identifier. When given, each return value also shows the exact
+   * reference another step would use to read it. That string was previously
+   * obtainable only by opening the value picker on some other component, so the
+   * syntax had no home on the component that owns the value.
+   */
+  componentId?: string | undefined;
+}
+
+const ComponentReturnValueViewer: FunctionComponent<ComponentProps> = (
+  props: ComponentProps,
+): ReactElement => {
+  return (
+    <div>
+      {props.name && (
+        <h2 className="text-sm font-semibold text-gray-600">{props.name}</h2>
+      )}
+      {props.description && (
+        <p className="text-xs text-gray-400 mb-2">{props.description}</p>
+      )}
+      {props.returnValues && props.returnValues.length === 0 && (
+        <p className="text-xs text-gray-400 italic">
+          This step does not return any data.
+        </p>
+      )}
+      <div>
+        {props.returnValues &&
+          props.returnValues.length > 0 &&
+          props.returnValues.map((returnValue: ReturnValue, i: number) => {
+            return (
+              <div
+                key={i}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "0.625rem",
+                  padding: "0.5rem 0.75rem",
+                  borderRadius: "8px",
+                  backgroundColor: "var(--ou-surface-secondary, #f8fafc)",
+                  border: "1px solid var(--ou-border-subtle, #f1f5f9)",
+                  marginBottom: "0.375rem",
+                }}
+              >
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <p
+                    style={{
+                      fontSize: "0.8125rem",
+                      fontWeight: 500,
+                      color: "var(--ou-text-secondary, #334155)",
+                      margin: 0,
+                      lineHeight: "1.25rem",
+                    }}
+                  >
+                    {returnValue.name}
+                    <span
+                      style={{
+                        color: "var(--ou-text-subtle, #94a3b8)",
+                        fontWeight: 400,
+                        fontSize: "0.6875rem",
+                        marginLeft: "0.375rem",
+                        fontFamily:
+                          'ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace',
+                      }}
+                    >
+                      {returnValue.id}
+                    </span>
+                  </p>
+                  {returnValue.description && (
+                    <p
+                      style={{
+                        fontSize: "0.75rem",
+                        color: "var(--ou-text-subtle, #94a3b8)",
+                        margin: 0,
+                        lineHeight: "1rem",
+                      }}
+                    >
+                      {returnValue.description}
+                    </p>
+                  )}
+                  {props.componentId && (
+                    <code
+                      style={{
+                        display: "block",
+                        marginTop: "0.25rem",
+                        fontSize: "0.6875rem",
+                        color: "var(--ou-text-subtle, #94a3b8)",
+                        fontFamily:
+                          'ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace',
+                        overflowWrap: "anywhere",
+                      }}
+                    >
+                      {componentReturnValueReference(
+                        props.componentId,
+                        returnValue.id,
+                      )}
+                    </code>
+                  )}
+                </div>
+                <span
+                  style={{
+                    fontSize: "0.6875rem",
+                    fontWeight: 500,
+                    color: "var(--ou-link, #6366f1)",
+                    backgroundColor: "var(--ou-accent-soft, #eef2ff)",
+                    padding: "0.125rem 0.5rem",
+                    borderRadius: "100px",
+                    whiteSpace: "nowrap",
+                    border: "1px solid var(--ou-accent-muted, #e0e7ff)",
+                  }}
+                >
+                  {returnValue.type}
+                </span>
+              </div>
+            );
+          })}
+      </div>
+    </div>
+  );
+};
+
+export default ComponentReturnValueViewer;

@@ -1,0 +1,549 @@
+import API from "Common/Utils/API";
+import HTTPResponse from "Common/Types/API/HTTPResponse";
+import HTTPErrorResponse from "Common/Types/API/HTTPErrorResponse";
+import URL from "Common/Types/API/URL";
+import { JSONObject, JSONArray, JSONValue } from "Common/Types/JSON";
+import logger from "Common/Server/Utils/Logger";
+import Headers from "Common/Types/API/Headers";
+import TaskLogger from "./TaskLogger";
+
+export interface PullRequestOptions {
+  token: string;
+  organizationName: string;
+  repositoryName: string;
+  baseBranch: string;
+  headBranch: string;
+  title: string;
+  body: string;
+  /*
+   * AI-authored fix PRs open READY FOR REVIEW by default: a draft is
+   * invisible to reviewers, review automation and CODEOWNERS, which buried
+   * the work rather than surfacing it. Human review is still mandatory —
+   * that boundary is the branch (we never write to the default or a
+   * protected branch) and the fact that nothing is ever merged
+   * automatically, not the draft flag.
+   *
+   * Pass true explicitly to opt back into a draft. Repositories where
+   * GitHub rejects drafts (private repos on plans without the feature)
+   * then fall back to a ready-for-review PR automatically.
+   */
+  draft?: boolean;
+}
+
+export interface PullRequestResult {
+  id: number;
+  number: number;
+  url: string;
+  htmlUrl: string;
+  state: string;
+  title: string;
+}
+
+export default class PullRequestCreator {
+  private static readonly GITHUB_API_BASE: string = "https://api.github.com";
+  private static readonly GITHUB_API_VERSION: string = "2022-11-28";
+
+  /*
+   * GitHub rejects a pull-request body over 65536 characters outright
+   * (422 "body is too long"). Everything that flows into the body is
+   * caller-supplied and unbounded from this class's point of view: the
+   * agent's own summary, the stack trace, the failing build output tail,
+   * and one repair summary per repair pass. That failure lands at the very
+   * last step of the pipeline — after the clone, the agent run, the
+   * verification loop, the commit and the push — so the branch is already
+   * on the customer's remote and the work is stranded with no pull request
+   * pointing at it.
+   *
+   * Truncating with an explicit marker is strictly better than losing the
+   * pull request: the reviewer still gets the change, the summary and the
+   * verdict, and is told plainly that the tail was cut.
+   */
+  public static readonly MAX_BODY_LENGTH: number = 65536;
+
+  private static readonly BODY_TRUNCATION_NOTICE: string =
+    "\n\n---\n\n> _This description was truncated because it exceeded GitHub's maximum pull request body length._";
+
+  // Bound a PR body to what GitHub will accept, marking any truncation.
+  public static truncateBody(body: string): string {
+    if (body.length <= this.MAX_BODY_LENGTH) {
+      return body;
+    }
+
+    return `${body.substring(
+      0,
+      this.MAX_BODY_LENGTH - this.BODY_TRUNCATION_NOTICE.length,
+    )}${this.BODY_TRUNCATION_NOTICE}`;
+  }
+
+  private logger: TaskLogger | null = null;
+
+  public constructor(taskLogger?: TaskLogger) {
+    if (taskLogger) {
+      this.logger = taskLogger;
+    }
+  }
+
+  /*
+   * Create a pull request on GitHub — READY FOR REVIEW by default, so it
+   * reaches reviewers, CODEOWNERS and review automation the moment it
+   * opens. Callers that explicitly ask for a draft still get the graceful
+   * fallback for repositories that do not support drafts (GitHub answers
+   * 422 on private repos without the feature).
+   */
+  public async createPullRequest(
+    options: PullRequestOptions,
+  ): Promise<PullRequestResult> {
+    const asDraft: boolean = options.draft === true;
+
+    await this.log(
+      `Creating ${asDraft ? "draft " : "ready-for-review "}pull request: ${options.title} (${options.headBranch} -> ${options.baseBranch})`,
+    );
+
+    const url: URL = URL.fromString(
+      `${PullRequestCreator.GITHUB_API_BASE}/repos/${options.organizationName}/${options.repositoryName}/pulls`,
+    );
+
+    const headers: Headers = this.getHeaders(options.token);
+
+    const requestBody: (draft: boolean) => JSONObject = (
+      draft: boolean,
+    ): JSONObject => {
+      return {
+        title: options.title,
+        body: PullRequestCreator.truncateBody(options.body),
+        head: options.headBranch,
+        base: options.baseBranch,
+        draft,
+      };
+    };
+
+    let response: HTTPResponse<JSONObject> | HTTPErrorResponse = await API.post(
+      {
+        url,
+        data: requestBody(asDraft),
+        headers,
+      },
+    );
+
+    /*
+     * A caller asked for a draft and this repository rejected it (422 naming
+     * drafts): retry once as a ready-for-review PR. Human review stays
+     * mandatory either way — the draft state is a review-pressure signal,
+     * not the safety boundary.
+     */
+    if (
+      response instanceof HTTPErrorResponse &&
+      asDraft &&
+      this.isDraftNotSupportedError(response)
+    ) {
+      const rejectionMessage: string =
+        response.message || "draft pull request rejected";
+
+      logger.warn(
+        `GitHub rejected the draft pull request for ${options.organizationName}/${options.repositoryName} (${rejectionMessage}); retrying as a ready-for-review pull request.`,
+      );
+      await this.log(
+        `This repository does not support draft pull requests — opening a ready-for-review pull request instead. Please treat it as unreviewed.`,
+      );
+
+      response = await API.post({
+        url,
+        data: requestBody(false),
+        headers,
+      });
+    }
+
+    if (response instanceof HTTPErrorResponse) {
+      const errorMessage: string =
+        PullRequestCreator.describeGitHubError(response);
+      logger.error(`GitHub API error: ${errorMessage}`);
+      throw new Error(`Failed to create pull request: ${errorMessage}`);
+    }
+
+    const data: JSONObject = response.data as JSONObject;
+
+    const result: PullRequestResult = {
+      id: data["id"] as number,
+      number: data["number"] as number,
+      url: data["url"] as string,
+      htmlUrl: data["html_url"] as string,
+      state: data["state"] as string,
+      title: data["title"] as string,
+    };
+
+    await this.log(`Pull request created: ${result.htmlUrl}`);
+
+    return result;
+  }
+
+  /*
+   * True when a failed create-PR response is GitHub refusing the DRAFT
+   * state specifically (HTTP 422 whose message/errors mention drafts) —
+   * e.g. "Draft pull requests are not supported in this repository."
+   * Anything else (bad branch, permissions, validation) must NOT trigger
+   * the ready-for-review retry.
+   */
+  private isDraftNotSupportedError(response: HTTPErrorResponse): boolean {
+    if (response.statusCode !== 422) {
+      return false;
+    }
+
+    const errorData: JSONObject = (response.data as JSONObject) || {};
+
+    const textParts: Array<string> = [
+      (errorData["message"] as string) || "",
+      JSON.stringify(errorData["errors"] || ""),
+    ];
+
+    return textParts.join(" ").toLowerCase().includes("draft");
+  }
+
+  /*
+   * GitHub's top-level `message` on a 422 is only ever "Validation Failed" —
+   * the actionable part ("A pull request already exists for...", an invalid
+   * `head`) lives in the `errors` array, so fold both into one line.
+   */
+  private static describeGitHubError(response: HTTPErrorResponse): string {
+    const parts: Array<string> = [];
+
+    if (response.message) {
+      parts.push(response.message);
+    }
+
+    const errors: JSONValue | undefined = (response.data as JSONObject)?.[
+      "errors"
+    ];
+
+    if (Array.isArray(errors) && errors.length > 0) {
+      const details: string = errors
+        .map((error: JSONValue) => {
+          if (typeof error === "string") {
+            return error;
+          }
+
+          const errorObject: JSONObject = error as JSONObject;
+
+          return (
+            (errorObject["message"] as string) ||
+            [errorObject["field"], errorObject["code"]]
+              .filter(Boolean)
+              .join(" ") ||
+            JSON.stringify(error)
+          );
+        })
+        .filter(Boolean)
+        .join("; ");
+
+      if (details) {
+        parts.push(`(${details})`);
+      }
+    }
+
+    return parts.join(" ") || `GitHub returned HTTP ${response.statusCode}`;
+  }
+
+  // Get an existing pull request by number
+  public async getPullRequest(
+    token: string,
+    organizationName: string,
+    repositoryName: string,
+    pullNumber: number,
+  ): Promise<PullRequestResult | null> {
+    const url: URL = URL.fromString(
+      `${PullRequestCreator.GITHUB_API_BASE}/repos/${organizationName}/${repositoryName}/pulls/${pullNumber}`,
+    );
+
+    const headers: Headers = this.getHeaders(token);
+
+    const response: HTTPResponse<JSONObject> | HTTPErrorResponse =
+      await API.get({
+        url,
+        headers,
+      });
+
+    if (response instanceof HTTPErrorResponse) {
+      return null;
+    }
+
+    const data: JSONObject = response.data as JSONObject;
+
+    return {
+      id: data["id"] as number,
+      number: data["number"] as number,
+      url: data["url"] as string,
+      htmlUrl: data["html_url"] as string,
+      state: data["state"] as string,
+      title: data["title"] as string,
+    };
+  }
+
+  // Check if a pull request already exists for a branch
+  public async findExistingPullRequest(
+    token: string,
+    organizationName: string,
+    repositoryName: string,
+    headBranch: string,
+    baseBranch: string,
+  ): Promise<PullRequestResult | null> {
+    const url: URL = URL.fromString(
+      `${PullRequestCreator.GITHUB_API_BASE}/repos/${organizationName}/${repositoryName}/pulls`,
+    );
+
+    const headers: Headers = this.getHeaders(token);
+
+    const response: HTTPResponse<JSONArray> | HTTPErrorResponse = await API.get(
+      {
+        url,
+        headers,
+        params: {
+          head: `${organizationName}:${headBranch}`,
+          base: baseBranch,
+          state: "open",
+        },
+      },
+    );
+
+    if (response instanceof HTTPErrorResponse) {
+      return null;
+    }
+
+    const pulls: JSONArray = response.data as JSONArray;
+
+    if (pulls.length > 0) {
+      const data: JSONObject = pulls[0] as JSONObject;
+      return {
+        id: data["id"] as number,
+        number: data["number"] as number,
+        url: data["url"] as string,
+        htmlUrl: data["html_url"] as string,
+        state: data["state"] as string,
+        title: data["title"] as string,
+      };
+    }
+
+    return null;
+  }
+
+  // Update an existing pull request
+  public async updatePullRequest(
+    token: string,
+    organizationName: string,
+    repositoryName: string,
+    pullNumber: number,
+    updates: { title?: string; body?: string; state?: "open" | "closed" },
+  ): Promise<PullRequestResult> {
+    const url: URL = URL.fromString(
+      `${PullRequestCreator.GITHUB_API_BASE}/repos/${organizationName}/${repositoryName}/pulls/${pullNumber}`,
+    );
+
+    const headers: Headers = this.getHeaders(token);
+
+    const response: HTTPResponse<JSONObject> | HTTPErrorResponse =
+      await API.patch({
+        url,
+        data: updates,
+        headers,
+      });
+
+    if (response instanceof HTTPErrorResponse) {
+      throw new Error(
+        `Failed to update pull request: ${PullRequestCreator.describeGitHubError(response)}`,
+      );
+    }
+
+    const data: JSONObject = response.data as JSONObject;
+
+    return {
+      id: data["id"] as number,
+      number: data["number"] as number,
+      url: data["url"] as string,
+      htmlUrl: data["html_url"] as string,
+      state: data["state"] as string,
+      title: data["title"] as string,
+    };
+  }
+
+  // Add labels to a pull request
+  public async addLabels(
+    token: string,
+    organizationName: string,
+    repositoryName: string,
+    issueNumber: number,
+    labels: Array<string>,
+  ): Promise<void> {
+    await this.log(`Adding labels to PR #${issueNumber}: ${labels.join(", ")}`);
+
+    const url: URL = URL.fromString(
+      `${PullRequestCreator.GITHUB_API_BASE}/repos/${organizationName}/${repositoryName}/issues/${issueNumber}/labels`,
+    );
+
+    const headers: Headers = this.getHeaders(token);
+
+    const response: HTTPResponse<JSONObject> | HTTPErrorResponse =
+      await API.post({
+        url,
+        data: { labels },
+        headers,
+      });
+
+    if (response instanceof HTTPErrorResponse) {
+      logger.warn(
+        `Failed to add labels to PR #${issueNumber}: ${PullRequestCreator.describeGitHubError(response)}`,
+      );
+    }
+  }
+
+  // Add reviewers to a pull request
+  public async requestReviewers(
+    token: string,
+    organizationName: string,
+    repositoryName: string,
+    pullNumber: number,
+    reviewers: Array<string>,
+    teamReviewers?: Array<string>,
+  ): Promise<void> {
+    await this.log(`Requesting reviewers for PR #${pullNumber}`);
+
+    const url: URL = URL.fromString(
+      `${PullRequestCreator.GITHUB_API_BASE}/repos/${organizationName}/${repositoryName}/pulls/${pullNumber}/requested_reviewers`,
+    );
+
+    const headers: Headers = this.getHeaders(token);
+
+    const data: JSONObject = {
+      reviewers,
+    };
+
+    if (teamReviewers && teamReviewers.length > 0) {
+      data["team_reviewers"] = teamReviewers;
+    }
+
+    const response: HTTPResponse<JSONObject> | HTTPErrorResponse =
+      await API.post({
+        url,
+        data,
+        headers,
+      });
+
+    if (response instanceof HTTPErrorResponse) {
+      logger.warn(
+        `Failed to request reviewers for PR #${pullNumber}: ${PullRequestCreator.describeGitHubError(response)}`,
+      );
+    }
+  }
+
+  // Add a comment to a pull request
+  public async addComment(
+    token: string,
+    organizationName: string,
+    repositoryName: string,
+    issueNumber: number,
+    comment: string,
+  ): Promise<void> {
+    await this.log(`Adding comment to PR #${issueNumber}`);
+
+    const url: URL = URL.fromString(
+      `${PullRequestCreator.GITHUB_API_BASE}/repos/${organizationName}/${repositoryName}/issues/${issueNumber}/comments`,
+    );
+
+    const headers: Headers = this.getHeaders(token);
+
+    const response: HTTPResponse<JSONObject> | HTTPErrorResponse =
+      await API.post({
+        url,
+        data: { body: comment },
+        headers,
+      });
+
+    if (response instanceof HTTPErrorResponse) {
+      logger.warn(
+        `Failed to add comment to PR #${issueNumber}: ${PullRequestCreator.describeGitHubError(response)}`,
+      );
+    }
+  }
+
+  // Generate PR body from exception details
+  public static generatePRBody(data: {
+    exceptionMessage: string;
+    exceptionType: string;
+    stackTrace: string;
+    serviceName: string;
+    summary: string;
+  }): string {
+    return `## Exception Fix
+
+This pull request was automatically generated by OneUptime AI Agent to fix an exception.
+
+### Exception Details
+
+**Service:** ${data.serviceName}
+**Type:** ${data.exceptionType}
+**Message (dynamic values and secrets redacted):** ${data.exceptionMessage}
+
+### Stack Trace
+
+\`\`\`
+${data.stackTrace.substring(0, 2000)}${data.stackTrace.length > 2000 ? "\n...(truncated)" : ""}
+\`\`\`
+
+### Summary of Changes
+
+${data.summary}
+
+---
+
+> **Review before merging.** The fix is AI-authored: verify it actually addresses the exception before approving. Nothing is merged automatically.
+
+*This PR was automatically generated by [OneUptime AI Agent](https://oneuptime.com)*`;
+  }
+
+  /*
+   * Generate PR title from exception metadata. Deliberately built from
+   * the exception TYPE and service name — never the exception message.
+   * Raw messages interpolate user data (emails, customer domains, IDs)
+   * and PR titles are the most public surface an exception can leak to.
+   */
+  public static generatePRTitle(data: {
+    exceptionType: string;
+    serviceName: string;
+    prefix?: string;
+  }): string {
+    const prefix: string = data.prefix || "fix: resolve";
+    // Legacy exceptions can carry a NULL type despite the string typing.
+    const exceptionType: string =
+      (data.exceptionType || "").replace(/\s+/g, " ").trim() || "exception";
+    const serviceName: string = (data.serviceName || "")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    const title: string = serviceName
+      ? `${prefix} ${exceptionType} in ${serviceName}`
+      : `${prefix} ${exceptionType}`;
+
+    const maxLength: number = 70;
+    if (title.length <= maxLength) {
+      return title;
+    }
+
+    return `${title.substring(0, maxLength - 3)}...`;
+  }
+
+  // Helper method to get GitHub API headers
+  private getHeaders(token: string): Headers {
+    return {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": PullRequestCreator.GITHUB_API_VERSION,
+      "Content-Type": "application/json",
+    };
+  }
+
+  // Helper method for logging
+  private async log(message: string): Promise<void> {
+    if (this.logger) {
+      await this.logger.info(message);
+    } else {
+      logger.debug(message);
+    }
+  }
+}

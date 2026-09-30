@@ -1,0 +1,181 @@
+import API from "../../Utils/API/API";
+import ModelAPI from "../../Utils/ModelAPI/ModelAPI";
+import { ButtonStyleType } from "../Button/Button";
+import PermissionGate, {
+  ModelAction,
+  PermissionGateResult,
+} from "../../Utils/PermissionGate";
+import Card from "../Card/Card";
+import ConfirmModal from "../Modal/ConfirmModal";
+import BaseModel from "../../../Models/DatabaseModels/DatabaseBaseModel/DatabaseBaseModel";
+import { TableColumnMetadata } from "../../../Types/Database/TableColumn";
+import { PromiseVoidFunction } from "../../../Types/FunctionTypes";
+import IconProp from "../../../Types/Icon/IconProp";
+import ObjectID from "../../../Types/ObjectID";
+import React, { ReactElement, useState } from "react";
+
+export interface ComponentProps<TBaseModel extends BaseModel> {
+  modelType: { new (): TBaseModel };
+  fieldName: keyof TBaseModel;
+  title: string;
+  description: string | ReactElement;
+  modelId: ObjectID;
+  onUpdateComplete?: undefined | ((updatedValue: ObjectID) => void);
+  /*
+   * The reset button's text, when the card is about more than the reset -
+   * a "Share Link" card showing the link, whose button is "Reset Link".
+   * Defaults to the card's title.
+   */
+  buttonTitle?: string | undefined;
+  // Shown in the card, under its title: the value the button replaces, say.
+  children?: ReactElement | Array<ReactElement> | undefined;
+  /*
+   * What the confirmation and the result say. By default they only name the
+   * column ("Reset Share Key", "Your new Share Key is ..."), which tells the
+   * reader nothing about what the reset does to whoever relies on the old
+   * value - a link that stops working, for example. Each defaults to that
+   * generic wording.
+   */
+  confirmTitle?: string | undefined;
+  confirmDescription?: string | undefined;
+  confirmButtonText?: string | undefined;
+  resultTitle?: string | undefined;
+  resultDescription?: string | undefined;
+}
+
+const ResetObjectID: <TBaseModel extends BaseModel>(
+  props: ComponentProps<TBaseModel>,
+) => ReactElement = <TBaseModel extends BaseModel>(
+  props: ComponentProps<TBaseModel>,
+): ReactElement => {
+  const model: TBaseModel = new props.modelType();
+  const [showModal, setShowModal] = useState<boolean>(false);
+  const [isLoading, setIsLoading] = useState<boolean>(false);
+  const [error, setError] = useState<string>("");
+  const [showErrorModal, setShowErrorModal] = useState<boolean>(false);
+  const [showResultModal, setShowResultModal] = useState<boolean>(false);
+
+  const [newId, setNewId] = useState<ObjectID | null>(null);
+
+  const resetKey: PromiseVoidFunction = async (): Promise<void> => {
+    setIsLoading(true);
+    try {
+      const resetIdTo: ObjectID = ObjectID.generate();
+      setNewId(resetIdTo);
+      await ModelAPI.updateById<TBaseModel>({
+        modelType: props.modelType,
+        id: props.modelId,
+        data: {
+          [props.fieldName]: resetIdTo.toString(),
+        },
+      });
+      setNewId(resetIdTo);
+      setShowModal(false);
+      setShowResultModal(true);
+    } catch (err) {
+      setError(API.getFriendlyMessage(err));
+      setShowErrorModal(true);
+    }
+
+    setIsLoading(false);
+  };
+
+  const tableColumn: TableColumnMetadata | undefined = props.fieldName
+    ? model.getTableColumnMetadata(props.fieldName as string)
+    : undefined;
+  const tableColumnName: string =
+    tableColumn?.title || (props.fieldName as string);
+
+  /* Resetting the id writes to the record, so it is an update. */
+  const updateGate: PermissionGateResult = PermissionGate.check(
+    model,
+    ModelAction.Update,
+  );
+
+  return (
+    <>
+      <Card
+        title={`${props.title}`}
+        description={props.description}
+        buttons={[
+          {
+            title: props.buttonTitle || `${props.title}`,
+            buttonStyle: ButtonStyleType.NORMAL,
+            disabled: !updateGate.isAllowed,
+            tooltip: updateGate.disabledReason,
+            onClick: () => {
+              if (!updateGate.isAllowed) {
+                return;
+              }
+
+              setShowModal(true);
+            },
+            isLoading: isLoading,
+            icon: IconProp.Reload,
+          },
+        ]}
+      >
+        {props.children}
+      </Card>
+
+      {showModal ? (
+        <ConfirmModal
+          description={
+            props.confirmDescription ||
+            `Are you sure you want to reset ${tableColumnName}?`
+          }
+          title={props.confirmTitle || `Reset ${tableColumnName}`}
+          onSubmit={async () => {
+            await resetKey();
+          }}
+          isLoading={isLoading}
+          onClose={() => {
+            setShowModal(false);
+          }}
+          submitButtonText={props.confirmButtonText || `Reset`}
+          submitButtonType={ButtonStyleType.DANGER}
+        />
+      ) : (
+        <></>
+      )}
+
+      {showErrorModal ? (
+        <ConfirmModal
+          description={error}
+          title={`Reset Error`}
+          onSubmit={() => {
+            setShowErrorModal(false);
+            setError("");
+          }}
+          submitButtonText={`Close`}
+          submitButtonType={ButtonStyleType.NORMAL}
+        />
+      ) : (
+        <></>
+      )}
+
+      {showResultModal ? (
+        <ConfirmModal
+          description={
+            props.resultDescription ||
+            `Your new ${tableColumnName} is ${newId?.toString() || ""}`
+          }
+          title={props.resultTitle || `New ${tableColumnName}`}
+          onSubmit={() => {
+            if (props.onUpdateComplete && newId) {
+              props.onUpdateComplete(newId);
+            }
+            setShowResultModal(false);
+            setError("");
+          }}
+          submitButtonText={`Close`}
+          submitButtonType={ButtonStyleType.NORMAL}
+        />
+      ) : (
+        <></>
+      )}
+    </>
+  );
+};
+
+export default ResetObjectID;

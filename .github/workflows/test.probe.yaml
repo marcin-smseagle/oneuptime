@@ -1,11 +1,15 @@
 name: Probe Test
 
+# Supersede in-flight runs for the same branch/PR: only the newest commit needs CI.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 on:
-  pull_request: 
+  pull_request:
   push:
-    branches-ignore:
-      - 'hotfix-*'   # excludes hotfix branches
-      - 'release'
+    branches:
+      - master
 
 jobs:
   test:
@@ -17,7 +21,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 26
-      - run: cd Common && npm install
-      - run: cd Probe && npm install
-      - run: cd Probe && npm run test
-  
+          # Restores ~/.npm so the npm install below resolves from cache
+          # instead of re-downloading the tree from the registry every run.
+          cache: npm
+          cache-dependency-path: '**/package-lock.json'
+      - run: cd packages/Common && npm install
+      - run: cd packages/Probe && npm install
+      - run: cd packages/Probe && npx playwright install --with-deps chromium firefox
+      # SyntheticBrowserSlowStorage.test.ts runs Chromium under strace to make
+      # its storage slow, and FirefoxNoSyncLibrary.test.ts compiles the no-sync
+      # shim with gcc and runs Firefox under strace; on CI both fail rather
+      # than skip without these tools.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends strace gcc
+      - run: cd packages/Probe && npm run test

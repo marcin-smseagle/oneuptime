@@ -1,12 +1,19 @@
 name: Build
 
+# Supersede in-flight runs for the same branch/PR: only the newest commit needs CI.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 on:
   pull_request:
   push:
-    branches-ignore:
-      - 'hotfix-*'   
-      - 'release'
+    branches:
+      - master
 
+# Every job checks out and runs `docker build`; none pushes or calls the API.
+permissions:
+  contents: read
 
 jobs:
 
@@ -18,12 +25,28 @@ jobs:
       - name: Checkout 
         uses: actions/checkout@v4
 
+      # The pinned, cached gomplate, so prerun's configure.sh does not download
+      # it from GitHub's release CDN (see .github/actions/setup-gomplate).
+      - name: Set up gomplate
+        uses: ./.github/actions/setup-gomplate
+
       - name: Preinstall 
         uses: nick-fields/retry@v3
         with:
           timeout_minutes: 10
           max_attempts: 3
           command: npm run prerun
+
+      # public.ecr.aws mirrors Docker's official images, and serves anonymous
+      # pullers from one shared data quota that a busy CI window exhausts. When
+      # it does, `docker build` dies on "429 Too Many Requests ... Data limit
+      # exceeded" before it has read an instruction, and the three attempts above
+      # all burn inside the same exhausted window — that is runs 36338348855 and
+      # 36315910324, both red on an image nobody touched. So seed the base images
+      # into the local store first, from Docker Hub if ECR will not serve them;
+      # BuildKit then resolves FROM locally and never asks ECR about it.
+      - name: Warm base images
+        run: bash ./Scripts/GHA/warm_base_images.sh ./packages/Home/Dockerfile
       
       # build image for accounts service
       - name: build docker image
@@ -31,7 +54,7 @@ jobs:
         with:
           timeout_minutes: 45
           max_attempts: 3
-          command: sudo docker build --no-cache -f ./Home/Dockerfile .
+          command: sudo docker build --no-cache -f ./packages/Home/Dockerfile .
 
 
   docker-build-app:
@@ -42,6 +65,11 @@ jobs:
       - name: Checkout 
         uses: actions/checkout@v4
 
+      # The pinned, cached gomplate, so prerun's configure.sh does not download
+      # it from GitHub's release CDN (see .github/actions/setup-gomplate).
+      - name: Set up gomplate
+        uses: ./.github/actions/setup-gomplate
+
       - name: Preinstall 
         uses: nick-fields/retry@v3
         with:
@@ -49,14 +77,43 @@ jobs:
           max_attempts: 3
           command: npm run prerun
 
-        
-      # build image for accounts service
-      - name: build docker image
+      # public.ecr.aws mirrors Docker's official images, and serves anonymous
+      # pullers from one shared data quota that a busy CI window exhausts. When
+      # it does, `docker build` dies on "429 Too Many Requests ... Data limit
+      # exceeded" before it has read an instruction, and the three attempts above
+      # all burn inside the same exhausted window — that is runs 36338348855 and
+      # 36315910324, both red on an image nobody touched. So seed the base images
+      # into the local store first, from Docker Hub if ECR will not serve them;
+      # BuildKit then resolves FROM locally and never asks ECR about it.
+      - name: Warm base images
+        run: bash ./Scripts/GHA/warm_base_images.sh ./packages/App/Dockerfile
+
+      # The App Dockerfile builds both editions (packages/App/Dockerfile.tpl):
+      # --target community is the Community Edition and --target enterprise is
+      # the same build plus ee/. Community first and from scratch, like every
+      # other image here; the enterprise build then reuses its cached layers,
+      # so it only pays for ee/ and the two rebuilt frontend bundles.
+      - name: build the Community Edition image
         uses: nick-fields/retry@v3
         with:
           timeout_minutes: 45
           max_attempts: 3
-          command: sudo docker build --no-cache -f ./App/Dockerfile .
+          command: sudo docker build --no-cache --target community -t oneuptime-app:community -f ./packages/App/Dockerfile .
+
+      - name: build the Enterprise Edition image
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 45
+          max_attempts: 3
+          command: sudo docker build --target enterprise -t oneuptime-app:enterprise -f ./packages/App/Dockerfile .
+
+      # Nothing else would notice a Community image that picked up ee/, or an
+      # Enterprise image whose Dashboard quietly fell back to the Community UI.
+      - name: check the Community Edition image
+        run: sudo bash ./Scripts/GHA/check_app_image_edition.sh --image oneuptime-app:community --edition community
+
+      - name: check the Enterprise Edition image
+        run: sudo bash ./Scripts/GHA/check_app_image_edition.sh --image oneuptime-app:enterprise --edition enterprise
 
 
   docker-build-e2e:
@@ -67,12 +124,28 @@ jobs:
       - name: Checkout 
         uses: actions/checkout@v4
 
+      # The pinned, cached gomplate, so prerun's configure.sh does not download
+      # it from GitHub's release CDN (see .github/actions/setup-gomplate).
+      - name: Set up gomplate
+        uses: ./.github/actions/setup-gomplate
+
       - name: Preinstall 
         uses: nick-fields/retry@v3
         with:
           timeout_minutes: 10
           max_attempts: 3
           command: npm run prerun
+
+      # public.ecr.aws mirrors Docker's official images, and serves anonymous
+      # pullers from one shared data quota that a busy CI window exhausts. When
+      # it does, `docker build` dies on "429 Too Many Requests ... Data limit
+      # exceeded" before it has read an instruction, and the three attempts above
+      # all burn inside the same exhausted window — that is runs 36338348855 and
+      # 36315910324, both red on an image nobody touched. So seed the base images
+      # into the local store first, from Docker Hub if ECR will not serve them;
+      # BuildKit then resolves FROM locally and never asks ECR about it.
+      - name: Warm base images
+        run: bash ./Scripts/GHA/warm_base_images.sh ./packages/E2E/Dockerfile
 
         
       # build image for accounts service
@@ -81,7 +154,7 @@ jobs:
         with:
           timeout_minutes: 45
           max_attempts: 3
-          command: sudo docker build --no-cache -f ./E2E/Dockerfile .
+          command: sudo docker build --no-cache -f ./packages/E2E/Dockerfile .
 
   docker-build-probe:
     runs-on: ubuntu-latest
@@ -91,12 +164,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # The pinned, cached gomplate, so prerun's configure.sh does not download
+      # it from GitHub's release CDN (see .github/actions/setup-gomplate).
+      - name: Set up gomplate
+        uses: ./.github/actions/setup-gomplate
+
       - name: Preinstall
         uses: nick-fields/retry@v3
         with:
           timeout_minutes: 10
           max_attempts: 3
           command: npm run prerun
+
+      # public.ecr.aws mirrors Docker's official images, and serves anonymous
+      # pullers from one shared data quota that a busy CI window exhausts. When
+      # it does, `docker build` dies on "429 Too Many Requests ... Data limit
+      # exceeded" before it has read an instruction, and the three attempts above
+      # all burn inside the same exhausted window — that is runs 36338348855 and
+      # 36315910324, both red on an image nobody touched. So seed the base images
+      # into the local store first, from Docker Hub if ECR will not serve them;
+      # BuildKit then resolves FROM locally and never asks ECR about it.
+      - name: Warm base images
+        run: bash ./Scripts/GHA/warm_base_images.sh ./packages/Probe/Dockerfile
 
       # build image probe api
       - name: build docker image
@@ -104,15 +193,20 @@ jobs:
         with:
           timeout_minutes: 45
           max_attempts: 3
-          command: sudo docker build --no-cache -f ./Probe/Dockerfile .
+          command: sudo docker build --no-cache -f ./packages/Probe/Dockerfile .
 
-  docker-build-runbook-agent:
+  docker-build-runner:
     runs-on: ubuntu-latest
     env:
       CI_PIPELINE_ID: ${{github.run_number}}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # The pinned, cached gomplate, so prerun's configure.sh does not download
+      # it from GitHub's release CDN (see .github/actions/setup-gomplate).
+      - name: Set up gomplate
+        uses: ./.github/actions/setup-gomplate
 
       - name: Preinstall
         uses: nick-fields/retry@v3
@@ -121,13 +215,109 @@ jobs:
           max_attempts: 3
           command: npm run prerun
 
-      # build runbook agent image
+      # public.ecr.aws mirrors Docker's official images, and serves anonymous
+      # pullers from one shared data quota that a busy CI window exhausts. When
+      # it does, `docker build` dies on "429 Too Many Requests ... Data limit
+      # exceeded" before it has read an instruction, and the three attempts above
+      # all burn inside the same exhausted window — that is runs 36338348855 and
+      # 36315910324, both red on an image nobody touched. So seed the base images
+      # into the local store first, from Docker Hub if ECR will not serve them;
+      # BuildKit then resolves FROM locally and never asks ECR about it.
+      - name: Warm base images
+        run: bash ./Scripts/GHA/warm_base_images.sh ./packages/Runner/Dockerfile
+
+      # build runner image (the merged Runbook Agent + AI Agent)
       - name: build docker image
         uses: nick-fields/retry@v3
         with:
-          timeout_minutes: 30
+          timeout_minutes: 45
           max_attempts: 3
-          command: sudo docker build --no-cache -f ./RunbookAgent/Dockerfile .
+          command: sudo docker build --no-cache -f ./packages/Runner/Dockerfile .
+
+  # The Kubernetes AI agent image (agents/KubernetesAIAgent), which the
+  # kubernetes-agent chart installs by default. Built on every pull request
+  # so a broken kubectl download or digest, or an agent that does not compile
+  # inside the image, fails here rather than in the release. This builds the
+  # runner's architecture (amd64) only; test-release.yaml builds both on every
+  # push to master.
+  docker-build-kubernetes-ai-agent:
+    runs-on: ubuntu-latest
+    env:
+      CI_PIPELINE_ID: ${{github.run_number}}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The pinned, cached gomplate, so prerun's configure.sh does not download
+      # it from GitHub's release CDN (see .github/actions/setup-gomplate).
+      - name: Set up gomplate
+        uses: ./.github/actions/setup-gomplate
+
+      - name: Preinstall
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          command: npm run prerun
+
+      # public.ecr.aws mirrors Docker's official images, and serves anonymous
+      # pullers from one shared data quota that a busy CI window exhausts. When
+      # it does, `docker build` dies on "429 Too Many Requests ... Data limit
+      # exceeded" before it has read an instruction, and the three attempts above
+      # all burn inside the same exhausted window — that is runs 36338348855 and
+      # 36315910324, both red on an image nobody touched. So seed the base images
+      # into the local store first, from Docker Hub if ECR will not serve them;
+      # BuildKit then resolves FROM locally and never asks ECR about it.
+      - name: Warm base images
+        run: bash ./Scripts/GHA/warm_base_images.sh ./agents/KubernetesAIAgent/Dockerfile
+
+      - name: build docker image
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 45
+          max_attempts: 3
+          command: sudo docker build --no-cache -f ./agents/KubernetesAIAgent/Dockerfile .
+
+  # The resource AI agent image (agents/ResourceAIAgent), which the Docker,
+  # Podman, Swarm, Proxmox, VMware, Ceph, database and host agents run as
+  # their "ai-agent" service. Built on every pull request so an Alpine
+  # package that is renamed or dropped (docker-cli, govc, ceph19-common,
+  # util-linux-misc), or an agent that does not compile inside the image,
+  # fails here rather than in the release. This builds the runner's
+  # architecture (amd64) only; test-release.yaml builds both on every push to
+  # master.
+  docker-build-resource-ai-agent:
+    runs-on: ubuntu-latest
+    env:
+      CI_PIPELINE_ID: ${{github.run_number}}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The pinned, cached gomplate, so prerun's configure.sh does not download
+      # it from GitHub's release CDN (see .github/actions/setup-gomplate).
+      - name: Set up gomplate
+        uses: ./.github/actions/setup-gomplate
+
+      - name: Preinstall
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          command: npm run prerun
+
+      # Seeds the base image into the local store first, from Docker Hub if
+      # public.ecr.aws will not serve it (its shared anonymous quota runs out
+      # in a busy CI window); see docker-build-kubernetes-ai-agent above.
+      - name: Warm base images
+        run: bash ./Scripts/GHA/warm_base_images.sh ./agents/ResourceAIAgent/Dockerfile
+
+      - name: build docker image
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 45
+          max_attempts: 3
+          command: sudo docker build --no-cache -f ./agents/ResourceAIAgent/Dockerfile .
 
   docker-build-test-server:
     runs-on: ubuntu-latest
@@ -137,12 +327,28 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # The pinned, cached gomplate, so prerun's configure.sh does not download
+      # it from GitHub's release CDN (see .github/actions/setup-gomplate).
+      - name: Set up gomplate
+        uses: ./.github/actions/setup-gomplate
+
       - name: Preinstall
         uses: nick-fields/retry@v3
         with:
           timeout_minutes: 10
           max_attempts: 3
           command: npm run prerun
+
+      # public.ecr.aws mirrors Docker's official images, and serves anonymous
+      # pullers from one shared data quota that a busy CI window exhausts. When
+      # it does, `docker build` dies on "429 Too Many Requests ... Data limit
+      # exceeded" before it has read an instruction, and the three attempts above
+      # all burn inside the same exhausted window — that is runs 36338348855 and
+      # 36315910324, both red on an image nobody touched. So seed the base images
+      # into the local store first, from Docker Hub if ECR will not serve them;
+      # BuildKit then resolves FROM locally and never asks ECR about it.
+      - name: Warm base images
+        run: bash ./Scripts/GHA/warm_base_images.sh ./packages/TestServer/Dockerfile
 
       # build image for mail service
       - name: build docker image
@@ -150,27 +356,4 @@ jobs:
         with:
           timeout_minutes: 45
           max_attempts: 3
-          command: sudo docker build --no-cache -f ./TestServer/Dockerfile .
-
-  docker-build-ai-agent:
-    runs-on: ubuntu-latest
-    env:
-      CI_PIPELINE_ID: ${{github.run_number}}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Preinstall
-        uses: nick-fields/retry@v3
-        with:
-          timeout_minutes: 10
-          max_attempts: 3
-          command: npm run prerun
-
-      # build image for ai agent service
-      - name: build docker image
-        uses: nick-fields/retry@v3
-        with:
-          timeout_minutes: 45
-          max_attempts: 3
-          command: sudo docker build --no-cache -f ./AIAgent/Dockerfile .
+          command: sudo docker build --no-cache -f ./packages/TestServer/Dockerfile .

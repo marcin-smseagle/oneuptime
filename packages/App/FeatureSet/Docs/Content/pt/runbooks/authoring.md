@@ -1,0 +1,99 @@
+# Escrever um runbook
+
+Crie um runbook em **Runbooks → Criar Runbook**, abra-o e vá na aba **Etapas**.
+
+## Anatomia de um passo
+
+Todo passo tem:
+
+| Campo                          | Propósito                                                                                        |
+| ------------------------------ | ------------------------------------------------------------------------------------------------ |
+| **Título**                     | Rótulo curto mostrado na UI de checklist. Obrigatório.                                           |
+| **Descrição**                  | Contexto opcional para quem responde. Texto seguro para Markdown.                                |
+| **Continuar em caso de falha** | Se ligado, um passo que falha não interrompe a execução — o próximo roda mesmo assim.            |
+| **Requer aprovação**           | Se ligado, o runbook pausa após este passo e espera um usuário aprovar antes de rodar o próximo. |
+| **Config específica do tipo**  | Script, URL, agente, etc. — veja abaixo.                                                         |
+
+Passos rodam **em ordem**. Reordene com as setas para cima/baixo no editor de Passos.
+
+## Tipos de passo
+
+### Manual
+
+Uma checkbox que quem responde marca. A execução do runbook pausa ao chegar num passo Manual e fica em `WaitingForManualStep` até alguém marcar como concluído (ou pular).
+
+Use para coisas que só um humano pode verificar: "Confirmado que o tráfego foi para a região secundária no painel do balanceador."
+
+### JavaScript
+
+Um trecho de JavaScript rodado em um sandbox `isolated-vm`. O sandbox vive em um [Agente de Runbook](/docs/runbooks/agents) dentro da sua própria infraestrutura — não no Worker do OneUptime.
+
+Configure o seguinte em um passo JavaScript:
+
+- **Agente de Runbook** — escolha no dropdown o agente que deve rodar este passo. Só o agente selecionado pode reivindicar o job.
+- **Script** — o JavaScript a ser executado.
+- **Execution timeout** — por quanto tempo o agente deixa o trecho rodar antes de destruir o isolate. Padrão: 30 segundos.
+- **Claim timeout** — por quanto tempo o Worker espera o agente pegar o job. Padrão: 2 minutos.
+
+```js
+const start = Date.now();
+// ... sua lógica ...
+return { durationMs: Date.now() - start };
+```
+
+O valor retornado é capturado na execução do passo. A saída do `console.log` é capturada como linhas de log. Timeout de execução padrão: 30 segundos. Claim timeout padrão (por quanto tempo o Worker espera o agente pegar o job): 2 minutos. Os dois são editáveis no passo — veja **Execution timeout** e **Claim timeout** abaixo do script.
+
+### Requisição HTTP
+
+Faz uma chamada HTTP de saída. Configure método (GET/POST/PUT/PATCH/DELETE/HEAD), URL, cabeçalhos JSON opcionais, corpo opcional e um **Request timeout** (padrão 30 segundos). Status, cabeçalhos e corpo da resposta são capturados (até 50KB no total).
+
+Útil para: abrir um incidente no PagerDuty, postar no Slack, chamar sua própria API admin, etc. Passos HTTP rodam direto no Worker do OneUptime; não exigem agente.
+
+### Bash
+
+Um script bash (`bash -c <script>`) rodado em um [Agente de Runbook](/docs/runbooks/agents) na sua própria infraestrutura. Bash nunca roda no Worker do OneUptime.
+
+Configure o seguinte em um passo Bash:
+
+- **Agente de Runbook** — escolha no dropdown o agente que deve rodar este passo. Só o agente selecionado pode reivindicar o job.
+- **Script** — o bash a executar. A saída (stdout + stderr) é capturada até 50&nbsp;KB; o processo é morto no timeout.
+- **Execution timeout** — por quanto tempo o agente deixa o script rodar antes de matá-lo com `SIGKILL`. Padrão: 30 segundos; aumente para passos que legitimamente levam minutos.
+- **Claim timeout** — por quanto tempo o Worker espera o agente pegar o job. Padrão: 2 minutos.
+
+Se o agente selecionado estiver offline quando o runbook chega neste passo, ele espera até o **claim timeout** (padrão 2 minutos) e depois falha com `TimedOut`. Adicione um agente em **Runbooks → Configurações → Agentes** antes de depender de um passo Bash.
+
+### AI
+
+Peça à IA para analisar, resumir ou decidir algo no meio da execução. O prompt é enviado ao provedor de LLM do seu projeto (**Configurações → AI → Provedores LLM**) e a resposta do modelo vira a saída do passo na linha do tempo da execução. Passos AI rodam no Worker do OneUptime; não exigem agente.
+
+Configure em um passo AI:
+
+- **Prompt** — o que a IA deve fazer. Por exemplo: "Revise a saída dos passos anteriores e diga se é seguro prosseguir com a remediação."
+- **Incluir contexto dos passos anteriores** — se ligado, a IA vê tudo sobre os passos que rodaram antes deste: título, tipo, status, saída e mensagens de erro.
+- **Incluir contexto do disparo** — se ligado, a IA vê o que iniciou a execução: o incidente, alerta ou evento de manutenção programada vinculado (sua descrição, severidade, estado atual, monitores afetados, causa raiz, linha do tempo de estados e notas públicas), ou quem executou o runbook manualmente.
+
+Combine um passo AI com **Requer aprovação** para manter um humano no circuito: a IA analisa, quem responde lê a resposta e aprova, e só então o próximo passo (de remediação) roda.
+
+**O que a IA nunca vê.** A resposta de um passo AI é armazenada como saída do passo na execução, e execuções podem ser lidas por qualquer pessoa com permissão de leitura de runbooks — um público mais amplo que a ACL do incidente. Por isso, o contexto do disparo exclui deliberadamente **notas internas privadas** e **mensagens de canais do Slack/Teams**: elas ficam dentro do incidente, onde os geradores existentes de postmortem e de notas mantêm seu texto derivado. A saída dos passos anteriores é escaneada em busca de segredos (tokens, chaves, credenciais) e redigida antes de ser enviada ao modelo.
+
+Passos AI são medidos e cobrados como qualquer outro recurso de IA. Se não houver provedor de LLM configurado para o projeto, o passo falha com um erro claro (ative **Continuar em caso de falha** se o resto do runbook ainda deve rodar).
+
+## Salvar e editar
+
+Clique **Salvar passos** para persistir. Execuções em andamento de versões anteriores do runbook não são afetadas — continuam usando seu snapshot.
+
+## Múltiplos passos e tratamento de falhas
+
+Por padrão, um passo que falha interrompe a execução e a marca como `Failed`. Se você ativar **Continuar em caso de falha** em um passo, a falha é registrada mas o próximo passo roda. Útil para padrões "tente estas três coisas, depois notifique".
+
+## Um exemplo trabalhado
+
+Um runbook simples para "DB primary inalcançável":
+
+1. **JavaScript** — busque o host primary atual no seu serviço de configuração e registre.
+2. **Manual** — "Confirmar lag de replicação na secundária abaixo de 5 segundos."
+3. **Requisição HTTP** — POST para a API do seu orquestrador de failover.
+4. **Manual** — "Verificar que as escritas estão indo para o novo primary."
+5. **Requisição HTTP** — POST para o Slack com mensagem de "tudo certo".
+
+Quem responde vê um passo automatizado rodando, marca um manual, vê o próximo automatizado rodar, e assim por diante. A saída de cada passo é capturada para o post-mortem.

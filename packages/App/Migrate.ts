@@ -1,0 +1,109 @@
+import PostgresAppInstance from "Common/Server/Infrastructure/PostgresDatabase";
+import Redis from "Common/Server/Infrastructure/Redis";
+import {
+  ClickhouseAppInstance,
+  ClickhouseIngestInstance,
+  ClickhouseMigrationInstance,
+} from "Common/Server/Infrastructure/ClickhouseDatabase";
+import RunDatabaseMigrations from "./FeatureSet/Workers/Utils/DataMigration";
+import RunStartupMigrations from "./FeatureSet/Workers/Utils/StartupMigration";
+import AnalyticsTableManagement from "./FeatureSet/Workers/Utils/AnalyticsDatabase/TableManegement";
+import logger from "Common/Server/Utils/Logger";
+import { PromiseVoidFunction } from "Common/Types/FunctionTypes";
+
+/*
+ * One-shot migration runner. Runs the SAME schema + data migrations the app
+ * normally runs on boot, but as a single dedicated process (a Helm
+ * pre-upgrade / post-install Job) instead of on every replica. This is what
+ * lets the runtime pods be gated off (RUN_DATABASE_MIGRATIONS_ON_BOOT=false),
+ * which keeps boot DDL off the pooled runtime connections and is now the ONLY
+ * thing standing between two replicas and a concurrently-run data migration —
+ * the runner itself no longer takes a lock (see Workers/Utils/DataMigration.ts).
+ *
+ * Connect to the backend DIRECTLY (the chart points this Job at the real
+ * database, bypassing PgBouncer) so migrations never depend on the pooler.
+ */
+
+const APP_NAME: string = "migrate";
+
+const migrate: PromiseVoidFunction = async (): Promise<void> => {
+  logger.debug(
+    `${APP_NAME}: connecting to Postgres (applies schema migrations)`,
+  );
+  /*
+   * migrationsRun on this DataSource applies all pending TypeORM schema
+   * migrations during initialize(). RUN_DATABASE_MIGRATIONS_ON_BOOT is left
+   * unset (true) for this process, so schema migrations run here.
+   */
+  await PostgresAppInstance.connect();
+
+  /*
+   * Data migrations write through the Service layer, which emits realtime
+   * events (Redis) and reads/writes ClickHouse — connect the same datastores a
+   * normal app boot would, so migrations behave identically.
+   */
+  await Redis.connect();
+  await ClickhouseAppInstance.connect(
+    ClickhouseAppInstance.getDatasourceOptions(),
+  );
+  await ClickhouseIngestInstance.connect(
+    ClickhouseIngestInstance.getDatasourceOptions(),
+  );
+  /*
+   * Migration pool (higher socket-idle timeout) — the schema sync and data
+   * migrations below route through this so long DDL/mutations are not
+   * destroyed at the App pool's 58s idle timeout.
+   */
+  await ClickhouseMigrationInstance.connect(
+    ClickhouseMigrationInstance.getDatasourceOptions(),
+  );
+
+  /*
+   * Ensure the ClickHouse analytics tables + materialized views exist BEFORE
+   * running data migrations — mirrors the worker boot order (Workers/Index.ts).
+   * Several data migrations ALTER ClickHouse tables and would throw
+   * UNKNOWN_TABLE on a fresh ClickHouse if the tables aren't created first.
+   * Both are idempotent (CREATE ... IF NOT EXISTS), so this is safe on upgrades.
+   */
+  logger.debug(`${APP_NAME}: ensuring ClickHouse tables + materialized views`);
+  await AnalyticsTableManagement.createTables();
+  await AnalyticsTableManagement.createMaterializedViews();
+
+  logger.debug(`${APP_NAME}: running data migrations`);
+  await RunDatabaseMigrations();
+
+  /*
+   * ON CLUSTER DDL above is confirmed best-effort (null_status_on_timeout):
+   * a slow host degrades to background execution instead of failing the run.
+   * Loudly report anything still unfinished so a wedged DDL queue can't hide
+   * behind a green Job. Advisory only — never fails the migration.
+   */
+  await AnalyticsTableManagement.warnOnUnfinishedDistributedDdl();
+
+  /*
+   * Startup migrations (run on every boot AND on every migrate Job) sync
+   * env-driven state such as the GLOBAL_LLM_PROVIDER_* seeded provider, so a
+   * deploy applies the desired state even before app pods restart. They are
+   * non-fatal by design (runtime pods only log failures), so never fail the
+   * migrate Job / deploy over them either.
+   */
+  logger.debug(`${APP_NAME}: running startup migrations`);
+  try {
+    await RunStartupMigrations();
+  } catch (err) {
+    logger.error(`${APP_NAME}: startup migrations failed (non-fatal):`);
+    logger.error(err);
+  }
+
+  logger.debug(`${APP_NAME}: migrations complete`);
+};
+
+migrate()
+  .then(() => {
+    return process.exit(0);
+  })
+  .catch((err: Error) => {
+    logger.error("Migrate failed:");
+    logger.error(err);
+    return process.exit(1);
+  });

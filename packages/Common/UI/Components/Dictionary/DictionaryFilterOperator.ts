@@ -1,0 +1,592 @@
+import EqualTo from "../../../Types/BaseDatabase/EqualTo";
+import NotEqual from "../../../Types/BaseDatabase/NotEqual";
+import Search from "../../../Types/BaseDatabase/Search";
+import NotContains from "../../../Types/BaseDatabase/NotContains";
+import StartsWith from "../../../Types/BaseDatabase/StartsWith";
+import EndsWith from "../../../Types/BaseDatabase/EndsWith";
+import Wildcard from "../../../Types/BaseDatabase/Wildcard";
+import NotWildcard from "../../../Types/BaseDatabase/NotWildcard";
+import GreaterThan from "../../../Types/BaseDatabase/GreaterThan";
+import GreaterThanOrEqual from "../../../Types/BaseDatabase/GreaterThanOrEqual";
+import LessThan from "../../../Types/BaseDatabase/LessThan";
+import LessThanOrEqual from "../../../Types/BaseDatabase/LessThanOrEqual";
+import IsNull from "../../../Types/BaseDatabase/IsNull";
+import NotNull from "../../../Types/BaseDatabase/NotNull";
+import Includes from "../../../Types/BaseDatabase/Includes";
+import IncludesNone from "../../../Types/BaseDatabase/IncludesNone";
+import { ObjectType } from "../../../Types/JSON";
+
+/*
+ * UI-facing operator identifiers. We store these in the Dictionary form
+ * state and translate to the corresponding backend operator wrapper at
+ * the API boundary so the existing serialization pipeline works.
+ */
+export enum DictionaryFilterOperator {
+  EqualTo = "EqualTo",
+  NotEqual = "NotEqual",
+  IsAnyOf = "IsAnyOf",
+  IsNoneOf = "IsNoneOf",
+  Contains = "Contains",
+  NotContains = "NotContains",
+  StartsWith = "StartsWith",
+  EndsWith = "EndsWith",
+  Matches = "Matches",
+  NotMatches = "NotMatches",
+  GreaterThan = "GreaterThan",
+  LessThan = "LessThan",
+  GreaterThanOrEqual = "GreaterThanOrEqual",
+  LessThanOrEqual = "LessThanOrEqual",
+  IsEmpty = "IsEmpty",
+  IsNotEmpty = "IsNotEmpty",
+}
+
+export interface DictionaryFilterOperatorOption {
+  operator: DictionaryFilterOperator;
+  label: string;
+  symbol: string;
+  // Operators like IsEmpty/IsNotEmpty don't take a user-supplied value.
+  hidesValueInput?: boolean | undefined;
+  // Numeric operators force a numeric value input.
+  expectsNumericValue?: boolean | undefined;
+  /*
+   * Multi-value operators (IsAnyOf) take an array of values and render a
+   * multi-select instead of a single value input.
+   */
+  expectsMultiValue?: boolean | undefined;
+}
+
+export const DICTIONARY_FILTER_OPERATOR_OPTIONS: ReadonlyArray<DictionaryFilterOperatorOption> =
+  [
+    {
+      operator: DictionaryFilterOperator.EqualTo,
+      label: "equals",
+      symbol: "=",
+    },
+    {
+      operator: DictionaryFilterOperator.NotEqual,
+      label: "does not equal",
+      symbol: "!=",
+    },
+    {
+      operator: DictionaryFilterOperator.IsAnyOf,
+      label: "is any of",
+      symbol: "is any of",
+      expectsMultiValue: true,
+    },
+    {
+      operator: DictionaryFilterOperator.IsNoneOf,
+      label: "is none of",
+      symbol: "is none of",
+      expectsMultiValue: true,
+    },
+    {
+      operator: DictionaryFilterOperator.Contains,
+      label: "contains",
+      symbol: "contains",
+    },
+    {
+      operator: DictionaryFilterOperator.NotContains,
+      label: "does not contain",
+      symbol: "does not contain",
+    },
+    {
+      operator: DictionaryFilterOperator.StartsWith,
+      label: "starts with",
+      symbol: "starts with",
+    },
+    {
+      operator: DictionaryFilterOperator.EndsWith,
+      label: "ends with",
+      symbol: "ends with",
+    },
+    {
+      operator: DictionaryFilterOperator.Matches,
+      label: "matches",
+      symbol: "matches",
+    },
+    {
+      operator: DictionaryFilterOperator.NotMatches,
+      label: "does not match",
+      symbol: "does not match",
+    },
+    {
+      operator: DictionaryFilterOperator.GreaterThan,
+      label: "greater than",
+      symbol: ">",
+      expectsNumericValue: true,
+    },
+    {
+      operator: DictionaryFilterOperator.GreaterThanOrEqual,
+      label: "greater than or equal",
+      symbol: ">=",
+      expectsNumericValue: true,
+    },
+    {
+      operator: DictionaryFilterOperator.LessThan,
+      label: "less than",
+      symbol: "<",
+      expectsNumericValue: true,
+    },
+    {
+      operator: DictionaryFilterOperator.LessThanOrEqual,
+      label: "less than or equal",
+      symbol: "<=",
+      expectsNumericValue: true,
+    },
+    {
+      operator: DictionaryFilterOperator.IsEmpty,
+      label: "is empty",
+      symbol: "is empty",
+      hidesValueInput: true,
+    },
+    {
+      operator: DictionaryFilterOperator.IsNotEmpty,
+      label: "is not empty",
+      symbol: "is not empty",
+      hidesValueInput: true,
+    },
+  ];
+
+export type DictionaryEntryValue =
+  | string
+  | number
+  | boolean
+  | EqualTo<string>
+  | NotEqual<string>
+  | Search<string>
+  | NotContains<string>
+  | StartsWith<string>
+  | EndsWith<string>
+  | Wildcard<string>
+  | NotWildcard<string>
+  | GreaterThan<number>
+  | GreaterThanOrEqual<number>
+  | LessThan<number>
+  | LessThanOrEqual<number>
+  | IsNull
+  | NotNull
+  | Includes
+  | IncludesNone;
+
+const GLOB_SEPARATOR: string = " OR ";
+
+type JoinGlobsFunction = (value: unknown) => string;
+
+const joinGlobs: JoinGlobsFunction = (value: unknown): string => {
+  const raw: unknown =
+    value instanceof Wildcard || value instanceof NotWildcard
+      ? value.values
+      : (value as { value?: unknown }).value;
+
+  if (Array.isArray(raw)) {
+    return raw
+      .map((glob: unknown) => {
+        return String(glob ?? "");
+      })
+      .join(GLOB_SEPARATOR);
+  }
+
+  return String(raw ?? "");
+};
+
+type SplitGlobsFunction = (value: string) => Array<string>;
+
+const splitGlobs: SplitGlobsFunction = (value: string): Array<string> => {
+  return value
+    .split(GLOB_SEPARATOR)
+    .map((glob: string) => {
+      return glob.trim();
+    })
+    .filter((glob: string) => {
+      return glob.length > 0;
+    });
+};
+
+export const getOperatorOption: (
+  operator: DictionaryFilterOperator,
+) => DictionaryFilterOperatorOption = (
+  operator: DictionaryFilterOperator,
+): DictionaryFilterOperatorOption => {
+  return (
+    DICTIONARY_FILTER_OPERATOR_OPTIONS.find(
+      (option: DictionaryFilterOperatorOption) => {
+        return option.operator === operator;
+      },
+    ) ?? DICTIONARY_FILTER_OPERATOR_OPTIONS[0]!
+  );
+};
+
+/*
+ * Detect operator wrapper instances or `_type`-tagged plain objects
+ * (already-deserialized vs raw-from-storage).
+ */
+type ObjectTypeLike = { _type?: string };
+
+const matchesObjectType: (value: unknown, type: ObjectType) => boolean = (
+  value: unknown,
+  type: ObjectType,
+): boolean => {
+  return Boolean(
+    value &&
+      typeof value === "object" &&
+      (value as ObjectTypeLike)._type === type,
+  );
+};
+
+interface RawValueAndOperator {
+  operator: DictionaryFilterOperator;
+  /*
+   * For multi-value operators (IsAnyOf) this is a display-friendly joined
+   * string (e.g. "system, user") so existing chip/viewer consumers render
+   * it without changes; `rawValues` carries the structured array.
+   */
+  rawValue: string;
+  rawValues?: Array<string> | undefined;
+}
+
+/**
+ * Inspect a stored dictionary entry value (which may be a plain string,
+ * a hydrated operator instance, or a raw `{_type, value}` JSON shape)
+ * and recover the operator + display value used to populate the form.
+ */
+export const detectOperatorFromValue: (
+  value: unknown,
+) => RawValueAndOperator = (value: unknown): RawValueAndOperator => {
+  if (value === null || value === undefined) {
+    return {
+      operator: DictionaryFilterOperator.EqualTo,
+      rawValue: "",
+    };
+  }
+
+  if (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
+    return {
+      operator: DictionaryFilterOperator.EqualTo,
+      rawValue: String(value),
+    };
+  }
+
+  if (value instanceof IsNull || matchesObjectType(value, ObjectType.IsNull)) {
+    return { operator: DictionaryFilterOperator.IsEmpty, rawValue: "" };
+  }
+  if (
+    value instanceof NotNull ||
+    matchesObjectType(value, ObjectType.NotNull)
+  ) {
+    return { operator: DictionaryFilterOperator.IsNotEmpty, rawValue: "" };
+  }
+
+  if (
+    value instanceof Includes ||
+    matchesObjectType(value, ObjectType.Includes)
+  ) {
+    const rawArray: unknown =
+      value instanceof Includes
+        ? value.values
+        : (value as { value?: unknown }).value;
+    const values: Array<string> = Array.isArray(rawArray)
+      ? rawArray.map((entry: unknown) => {
+          return String(entry);
+        })
+      : [];
+    return {
+      operator: DictionaryFilterOperator.IsAnyOf,
+      rawValue: values.join(", "),
+      rawValues: values,
+    };
+  }
+
+  if (
+    value instanceof IncludesNone ||
+    matchesObjectType(value, ObjectType.IncludesNone)
+  ) {
+    const rawArray: unknown =
+      value instanceof IncludesNone
+        ? value.values
+        : (value as { value?: unknown }).value;
+    const values: Array<string> = Array.isArray(rawArray)
+      ? rawArray.map((entry: unknown) => {
+          return String(entry);
+        })
+      : [];
+    return {
+      operator: DictionaryFilterOperator.IsNoneOf,
+      rawValue: values.join(", "),
+      rawValues: values,
+    };
+  }
+
+  const wrapperValue: string =
+    value instanceof Object && "value" in value
+      ? String(
+          (value as { value?: unknown }).value === undefined ||
+            (value as { value?: unknown }).value === null
+            ? ""
+            : (value as { value?: unknown }).value,
+        )
+      : "";
+
+  if (
+    value instanceof NotEqual ||
+    matchesObjectType(value, ObjectType.NotEqual)
+  ) {
+    return {
+      operator: DictionaryFilterOperator.NotEqual,
+      rawValue: wrapperValue,
+    };
+  }
+  if (
+    value instanceof EqualTo ||
+    matchesObjectType(value, ObjectType.EqualTo)
+  ) {
+    return {
+      operator: DictionaryFilterOperator.EqualTo,
+      rawValue: wrapperValue,
+    };
+  }
+  if (value instanceof Search || matchesObjectType(value, ObjectType.Search)) {
+    return {
+      operator: DictionaryFilterOperator.Contains,
+      rawValue: wrapperValue,
+    };
+  }
+  if (
+    value instanceof NotContains ||
+    matchesObjectType(value, ObjectType.NotContains)
+  ) {
+    return {
+      operator: DictionaryFilterOperator.NotContains,
+      rawValue: wrapperValue,
+    };
+  }
+  if (
+    value instanceof StartsWith ||
+    matchesObjectType(value, ObjectType.StartsWith)
+  ) {
+    return {
+      operator: DictionaryFilterOperator.StartsWith,
+      rawValue: wrapperValue,
+    };
+  }
+  if (
+    value instanceof EndsWith ||
+    matchesObjectType(value, ObjectType.EndsWith)
+  ) {
+    return {
+      operator: DictionaryFilterOperator.EndsWith,
+      rawValue: wrapperValue,
+    };
+  }
+  /*
+   * A wildcard carries an ARRAY of globs (one operator can express an OR),
+   * so its payload is joined for the single-value input the form renders.
+   * Round-tripping through that input keeps the disjunction: the builder
+   * splits on the same separator.
+   */
+  if (
+    value instanceof Wildcard ||
+    matchesObjectType(value, ObjectType.Wildcard)
+  ) {
+    return {
+      operator: DictionaryFilterOperator.Matches,
+      rawValue: joinGlobs(value),
+    };
+  }
+  if (
+    value instanceof NotWildcard ||
+    matchesObjectType(value, ObjectType.NotWildcard)
+  ) {
+    return {
+      operator: DictionaryFilterOperator.NotMatches,
+      rawValue: joinGlobs(value),
+    };
+  }
+  if (
+    value instanceof GreaterThan ||
+    matchesObjectType(value, ObjectType.GreaterThan)
+  ) {
+    return {
+      operator: DictionaryFilterOperator.GreaterThan,
+      rawValue: wrapperValue,
+    };
+  }
+  if (
+    value instanceof GreaterThanOrEqual ||
+    matchesObjectType(value, ObjectType.GreaterThanOrEqual)
+  ) {
+    return {
+      operator: DictionaryFilterOperator.GreaterThanOrEqual,
+      rawValue: wrapperValue,
+    };
+  }
+  if (
+    value instanceof LessThan ||
+    matchesObjectType(value, ObjectType.LessThan)
+  ) {
+    return {
+      operator: DictionaryFilterOperator.LessThan,
+      rawValue: wrapperValue,
+    };
+  }
+  if (
+    value instanceof LessThanOrEqual ||
+    matchesObjectType(value, ObjectType.LessThanOrEqual)
+  ) {
+    return {
+      operator: DictionaryFilterOperator.LessThanOrEqual,
+      rawValue: wrapperValue,
+    };
+  }
+
+  // Unknown structure — fall back to bare equality with stringified value.
+  return {
+    operator: DictionaryFilterOperator.EqualTo,
+    rawValue: wrapperValue,
+  };
+};
+
+/**
+ * Build the actual stored dictionary value for an operator + raw value.
+ * `EqualTo` produces a bare string for backwards compatibility with
+ * existing saved filters; everything else produces an operator wrapper
+ * instance.
+ */
+export const buildDictionaryValue: (input: {
+  operator: DictionaryFilterOperator;
+  rawValue: string;
+  rawValues?: Array<string> | undefined;
+}) => DictionaryEntryValue = (input: {
+  operator: DictionaryFilterOperator;
+  rawValue: string;
+  rawValues?: Array<string> | undefined;
+}): DictionaryEntryValue => {
+  const { operator, rawValue } = input;
+  const trimmed: string = rawValue ?? "";
+
+  switch (operator) {
+    case DictionaryFilterOperator.EqualTo:
+      return trimmed;
+    case DictionaryFilterOperator.NotEqual:
+      return new NotEqual<string>(trimmed);
+    case DictionaryFilterOperator.IsAnyOf:
+      /*
+       * Multi-value membership → SQL `attributes['k'] IN (...)`. Drop empty
+       * entries; an empty Includes is treated as "All" downstream
+       * (sanitizeAttributeFilters drops it and StatementGenerator skips the
+       * predicate rather than emitting `IN ()`).
+       */
+      return new Includes(
+        (input.rawValues ?? []).filter((entry: string) => {
+          return entry !== "";
+        }),
+      );
+    case DictionaryFilterOperator.IsNoneOf:
+      /*
+       * Multi-value exclusion → SQL `attributes['k'] NOT IN (...)`. Drop
+       * empty entries; an empty IncludesNone is treated as "All" downstream
+       * (sanitizeAttributeFilters drops it and StatementGenerator skips the
+       * predicate rather than emitting `NOT IN ()`).
+       */
+      return new IncludesNone(
+        (input.rawValues ?? []).filter((entry: string) => {
+          return entry !== "";
+        }),
+      );
+    case DictionaryFilterOperator.Contains:
+      /*
+       * Statement.serialize already wraps Search instances with `%...%`,
+       * so pass the bare needle here.
+       */
+      return new Search<string>(trimmed);
+    case DictionaryFilterOperator.NotContains:
+      return new NotContains<string>(trimmed);
+    case DictionaryFilterOperator.StartsWith:
+      return new StartsWith<string>(trimmed);
+    case DictionaryFilterOperator.EndsWith:
+      return new EndsWith<string>(trimmed);
+    /*
+     * A glob, e.g. `api-*`. The pattern translation happens at compile time
+     * (Wildcard.toPatterns), so what is stored stays readable and can be
+     * re-rendered into this same input.
+     */
+    case DictionaryFilterOperator.Matches:
+      return new Wildcard<string>(splitGlobs(trimmed));
+    case DictionaryFilterOperator.NotMatches:
+      return new NotWildcard<string>(splitGlobs(trimmed));
+    case DictionaryFilterOperator.GreaterThan:
+      return new GreaterThan<number>(Number(trimmed));
+    case DictionaryFilterOperator.GreaterThanOrEqual:
+      return new GreaterThanOrEqual<number>(Number(trimmed));
+    case DictionaryFilterOperator.LessThan:
+      return new LessThan<number>(Number(trimmed));
+    case DictionaryFilterOperator.LessThanOrEqual:
+      return new LessThanOrEqual<number>(Number(trimmed));
+    case DictionaryFilterOperator.IsEmpty:
+      return new IsNull();
+    case DictionaryFilterOperator.IsNotEmpty:
+      return new NotNull();
+    default:
+      return trimmed;
+  }
+};
+
+/**
+ * Render a stored dictionary entry value as plain text, for the places that
+ * show a filter rather than edit it (the log viewer's filter chips, tooltips,
+ * summaries).
+ *
+ * Every operator other than `EqualTo` is stored as an operator *instance*
+ * (`Includes`, `Search`, `NotEqual`, ...) — see `buildDictionaryValue`. Those
+ * are objects, and handing one to React as a child throws "Objects are not
+ * valid as a React child (found: object with keys {_values})", which took the
+ * whole monitoring-criteria modal down with it and left no way to reach Save.
+ * Anything that renders an attribute filter as a React child has to come
+ * through here.
+ *
+ * Equality renders bare (`web`) because that is the implicit operator and how
+ * these filters have always read; every other operator is prefixed with its
+ * label so the chip says what it actually matches (`contains web`,
+ * `is any of web, api`, `is not empty`).
+ */
+export const formatDictionaryValueForDisplay: (value: unknown) => string = (
+  value: unknown,
+): string => {
+  if (value === null || value === undefined) {
+    return "";
+  }
+
+  const detected: RawValueAndOperator = detectOperatorFromValue(value);
+  const option: DictionaryFilterOperatorOption = getOperatorOption(
+    detected.operator,
+  );
+
+  // IsEmpty / IsNotEmpty carry no value — the label is the whole filter.
+  if (option.hidesValueInput) {
+    return option.label;
+  }
+
+  if (option.expectsMultiValue) {
+    const values: Array<string> = detected.rawValues ?? [];
+
+    /*
+     * An empty membership list is a no-op downstream (StatementGenerator
+     * skips the predicate rather than emitting `IN ()`), so there are no
+     * values to name — show the operator alone rather than a dangling label.
+     */
+    return values.length > 0
+      ? `${option.label} ${values.join(", ")}`
+      : option.label;
+  }
+
+  if (detected.operator === DictionaryFilterOperator.EqualTo) {
+    return detected.rawValue;
+  }
+
+  return detected.rawValue === ""
+    ? option.label
+    : `${option.label} ${detected.rawValue}`;
+};

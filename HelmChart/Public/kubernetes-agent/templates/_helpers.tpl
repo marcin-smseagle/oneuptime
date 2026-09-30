@@ -6,6 +6,25 @@ Expand the name of the chart.
 {{- end }}
 
 {{/*
+The cluster name, refusing to render if it is missing.
+
+This is not merely a label. OneUptime folds `k8s.cluster.name` into the identity
+of every Kubernetes entity it derives, so it is the only thing separating this
+cluster's `worker-1` and `default` namespace from every other cluster's. Ship
+without it and two clusters reporting into one project silently become one
+estate -- nodes, namespaces, pods and deployments merged pairwise by name, with
+no error anywhere to say so.
+
+`required` is deliberate: values.schema.json already lists clusterName in its
+`required` set, but JSON Schema `required` only checks that the key is PRESENT,
+and the chart's default value is the empty string, so it passes. Failing at
+render is the only place this can be caught before the data is wrong.
+*/}}
+{{- define "kubernetes-agent.clusterName" -}}
+{{- required "clusterName is required: it identifies this cluster's nodes, namespaces, pods and deployments in OneUptime, and two clusters installed without it will be merged into one. Set it with --set clusterName=<name>." (.Values.clusterName | trim) -}}
+{{- end }}
+
+{{/*
 Create a default fully qualified app name.
 */}}
 {{- define "kubernetes-agent.fullname" -}}
@@ -56,6 +75,32 @@ Service account name
 {{- else }}
 {{- include "kubernetes-agent.fullname" . }}
 {{- end }}
+{{- end }}
+
+{{/*
+Pod nodeSelector with the Linux-only pin merged in.
+
+Every image this chart deploys — the OTel collectors, OBI, the profiler,
+OpenCost, Prometheus, kube-state-metrics, the cost and log agents — is built
+for linux only. On mixed-OS clusters (e.g. AKS with Windows node pools) an
+unpinned pod spec can be scheduled onto a Windows node, where the image pull
+can never succeed and the pod sits in ImagePullBackOff forever; the
+DaemonSets are guaranteed to hit this because they tolerate every taint.
+The kubelet labels every node with kubernetes.io/os (stable since
+Kubernetes 1.14), so requiring "linux" is always safe.
+
+Takes the workload's user-configured nodeSelector map (or an empty dict when
+the workload has no such knob). User-supplied keys win on conflict.
+
+Usage (the include is nindent-ed under the `nodeSelector:` key):
+  nodeSelector:
+    {{`{{- include "kubernetes-agent.nodeSelector" .Values.ebpf.nodeSelector | nindent 8 }}`}}
+*/}}
+{{- define "kubernetes-agent.nodeSelector" -}}
+{{- /* mergeOverwrite, not merge: sprig merge won't let a zero value ("")
+     in the user map displace the pin, breaking last-writer-wins. The
+     dest dict is a fresh literal, so .Values is never mutated. */ -}}
+{{- toYaml (mergeOverwrite (dict "kubernetes.io/os" "linux") (. | default dict)) -}}
 {{- end }}
 
 {{/*
@@ -242,3 +287,455 @@ daemonset
 {{- end -}}
 {{- end -}}
 {{- end }}
+
+{{/*
+Hybrid log collection for mixed-OS clusters. The DaemonSet collector is
+pinned to Linux nodes (its images are linux-only), so in daemonset log mode
+pods on Windows nodes have no log collection at all. When
+`logs.windowsPods.enabled` is set, the API log tailer runs ALONGSIDE the
+DaemonSet, restricted via NODE_OS_INCLUDE=windows to exactly the pods the
+DaemonSet cannot reach — the two collectors partition pods by node OS, so no
+log line ships twice. Only meaningful in daemonset mode: full api mode
+already tails every pod, and disabled mode collects nothing.
+Usage: {{- if eq (include "kubernetes-agent.windowsPodLogsEnabled" .) "true" }}
+*/}}
+{{- define "kubernetes-agent.windowsPodLogsEnabled" -}}
+{{- if and .Values.logs.enabled (((.Values.logs).windowsPods).enabled) (eq (include "kubernetes-agent.logMode" .) "daemonset") -}}
+true
+{{- else -}}
+false
+{{- end -}}
+{{- end -}}
+
+{{/*
+Whether the log-tailer Deployment exists at all — full api mode, or the
+Windows-only hybrid above. The pods/log RBAC grant is keyed on this same
+helper so the tailer and its permissions can never drift apart.
+*/}}
+{{- define "kubernetes-agent.logTailerEnabled" -}}
+{{- if and .Values.logs.enabled (or (eq (include "kubernetes-agent.logMode" .) "api") (eq (include "kubernetes-agent.windowsPodLogsEnabled" .) "true")) -}}
+true
+{{- else -}}
+false
+{{- end -}}
+{{- end -}}
+
+{{/*
+Platform capabilities, derived from the preset.
+
+hostPath is what separates the presets: GKE Autopilot and EKS Fargate reject it,
+which is why they collect pod logs through the Kubernetes API instead. But only
+SOME of the node collector needs hostPath — filelog needs /var/log/pods and
+hostmetrics needs /proc and /sys, while kubeletstats and the cAdvisor scrape
+just talk to the kubelet over the network. Modelling the capability instead of
+the log mode is what lets those clusters keep their node metrics.
+Usage: {{- if eq (include "kubernetes-agent.hostPathAvailable" .) "true" }}
+*/}}
+{{- define "kubernetes-agent.hostPathAvailable" -}}
+{{- $preset := default "" .Values.preset -}}
+{{- if or (eq $preset "gke-autopilot") (eq $preset "eks-fargate") -}}
+false
+{{- else -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
+Whether a DaemonSet can run at all. EKS Fargate schedules each pod onto its own
+micro-VM and has no notion of a node you can place one pod per — DaemonSets are
+silently never scheduled there. Everywhere else, including Autopilot, they run.
+*/}}
+{{- define "kubernetes-agent.daemonSetSchedulable" -}}
+{{- if eq (default "" .Values.preset) "eks-fargate" -}}
+false
+{{- else -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
+Does the node collector DaemonSet need to exist?
+
+It carries two independent jobs, and either one is reason enough to run it:
+  - pod logs, when logs are on AND the resolved mode is daemonset, and
+  - node metrics: kubeletstats (no off switch), the cAdvisor scrape, hostmetrics.
+
+These used to share one gate keyed on logs alone, so `logs.enabled=false` — or
+any preset that resolved the log mode to `api` — silently took every node, pod
+and container metric with it, along with the OOM-kill, CPU-throttling and
+PVC-low-disk monitors.
+*/}}
+{{- define "kubernetes-agent.daemonSetLogsEnabled" -}}
+{{- if and .Values.logs.enabled (eq (include "kubernetes-agent.logMode" .) "daemonset") (eq (include "kubernetes-agent.hostPathAvailable" .) "true") -}}
+true
+{{- else -}}
+false
+{{- end -}}
+{{- end -}}
+
+{{/*
+Node metrics are wanted whenever a DaemonSet can run and at least one node-local
+metric source is on. kubeletstats has no enable flag — it is the core node / pod
+/ container metric source — so this is true unless the platform cannot schedule
+a DaemonSet.
+*/}}
+{{- define "kubernetes-agent.daemonSetMetricsEnabled" -}}
+{{- if eq (include "kubernetes-agent.daemonSetSchedulable" .) "true" -}}
+true
+{{- else -}}
+false
+{{- end -}}
+{{- end -}}
+
+{{- define "kubernetes-agent.daemonSetEnabled" -}}
+{{- if and (eq (include "kubernetes-agent.daemonSetSchedulable" .) "true") (or (eq (include "kubernetes-agent.daemonSetLogsEnabled" .) "true") (eq (include "kubernetes-agent.daemonSetMetricsEnabled" .) "true")) -}}
+true
+{{- else -}}
+false
+{{- end -}}
+{{- end -}}
+
+{{/*
+hostmetrics reads the host's /proc and /sys through hostPath, so it needs both
+the flag and a platform that allows the mount.
+*/}}
+{{- define "kubernetes-agent.hostMetricsEnabled" -}}
+{{- if and .Values.hostMetrics.enabled (eq (include "kubernetes-agent.hostPathAvailable" .) "true") -}}
+true
+{{- else -}}
+false
+{{- end -}}
+{{- end -}}
+
+{{/*
+Telemetry filters — the OTTL conditions behind the `filter/telemetry` processor.
+
+The filter processor DROPS a record when a condition matches, and its
+conditions are OR'ed together. Every helper below is written from that
+angle: an allowlist is expressed as `not (<matches>)`, a denylist as
+`<matches>` directly. Because they OR, listing an include condition and
+an exclude condition together yields "drop unless included, and also drop
+if excluded" — i.e. exclude wins, which is the precedence documented by
+`namespaceFilters.rules`.
+
+Every namespace condition is guarded with `!= nil`. Node- and
+cluster-level series carry no namespace at all, and in OTTL
+`nil != "production"` is TRUE — so an unguarded allowlist would silently
+delete every node metric. The guard also decides the tie-break for
+records we cannot classify: they are KEPT, never dropped.
+
+Metric name matching targets otel-collector-contrib 0.96.0 (see
+.Values.image.tag): `IsMatch` and the `metric` / `datapoint` OTTL
+contexts all exist there. Keep this file in step with that pin.
+*/}}
+
+{{/*
+OTTL disjunction over metric names: `name == "a" or IsMatch(name, "b")`.
+%q emits a Go-quoted string, so a regexp written as `^system\.cpu` in
+values.yaml reaches RE2 as `\.` (a literal dot) rather than an invalid
+OTTL escape.
+Args: dict "names" (list) "matchType" ("strict" | "regexp")
+*/}}
+{{- define "kubernetes-agent.metricNameDisjunction" -}}
+{{- $matchType := .matchType | default "strict" -}}
+{{- $parts := list -}}
+{{- range .names -}}
+{{- if eq $matchType "regexp" -}}
+{{- $parts = append $parts (printf "IsMatch(name, %q)" .) -}}
+{{- else -}}
+{{- $parts = append $parts (printf "name == %q" .) -}}
+{{- end -}}
+{{- end -}}
+{{- join " or " $parts -}}
+{{- end -}}
+
+{{/*
+Collect and de-duplicate namespace patterns for one action/scope pair.
+Args: dict "root" $ "action" ("include" | "exclude")
+           "scope" ("podLogs" | "ebpfDiscovery" | "metrics" | "traces")
+*/}}
+{{- define "kubernetes-agent.namespaceRulePatterns" -}}
+{{- $root := .root -}}
+{{- $action := .action -}}
+{{- $scope := .scope -}}
+{{- $patterns := list -}}
+{{- range (($root.Values.namespaceFilters).rules) | default list -}}
+{{- if and (eq (.action | default "") $action) (has $scope (.scopes | default list)) -}}
+{{- $patterns = concat $patterns (.namespaces | default list | compact) -}}
+{{- end -}}
+{{- end -}}
+{{- toJson (uniq $patterns) -}}
+{{- end -}}
+
+{{/*
+OTTL disjunction over namespace patterns at a given path. Namespace patterns
+match the full value and use `*` as their only wildcard. Splitting on `*`,
+quoting each literal segment, then joining with `.*` gives the collector the
+same semantics as filelog, OBI discovery and the API log tailer.
+Args: dict "patterns" (list) "path" (OTTL path expression)
+*/}}
+{{- define "kubernetes-agent.namespacePatternDisjunction" -}}
+{{- $path := .path -}}
+{{- $parts := list -}}
+{{- range .patterns -}}
+{{- $segments := list -}}
+{{- range (splitList "*" .) -}}
+{{- $segments = append $segments (regexQuoteMeta .) -}}
+{{- end -}}
+{{- $pattern := printf "^(?:%s)$" (join ".*" $segments) -}}
+{{- $parts = append $parts (printf "IsMatch(%s, %q)" $path $pattern) -}}
+{{- end -}}
+{{- join " or " $parts -}}
+{{- end -}}
+
+{{/*
+Log-record conditions. Severity only — pod logs are already scoped by
+namespace at the receiver (filelog path globs / the API tailer), so
+re-filtering them here would cost CPU to drop nothing.
+*/}}
+{{- define "kubernetes-agent.filterLogConditions" -}}
+{{- $sev := (((.Values.filters).logs).minSeverity) | default "" -}}
+{{- $conds := list -}}
+{{- if $sev -}}
+{{- $conds = append $conds (printf "severity_number != SEVERITY_NUMBER_UNSPECIFIED and severity_number < SEVERITY_NUMBER_%s" (upper $sev)) -}}
+{{- end -}}
+{{- toJson $conds -}}
+{{- end -}}
+
+{{/*
+Metric-context conditions: metric-name allow/deny, plus namespace for
+receivers that put the namespace on the RESOURCE (kubeletstats,
+k8s_cluster).
+*/}}
+{{- define "kubernetes-agent.filterMetricConditions" -}}
+{{- $fm := (.Values.filters).metrics | default dict -}}
+{{- $mt := $fm.matchType | default "strict" -}}
+{{- $inc := $fm.include | default list | compact -}}
+{{- $exc := $fm.exclude | default list | compact -}}
+{{- $nsInc := include "kubernetes-agent.namespaceRulePatterns" (dict "root" . "action" "include" "scope" "metrics") | fromJsonArray -}}
+{{- $nsExc := include "kubernetes-agent.namespaceRulePatterns" (dict "root" . "action" "exclude" "scope" "metrics") | fromJsonArray -}}
+{{- $conds := list -}}
+{{- if $inc -}}
+{{- $conds = append $conds (printf "not (%s)" (include "kubernetes-agent.metricNameDisjunction" (dict "names" $inc "matchType" $mt))) -}}
+{{- end -}}
+{{- if $exc -}}
+{{- $conds = append $conds (include "kubernetes-agent.metricNameDisjunction" (dict "names" $exc "matchType" $mt)) -}}
+{{- end -}}
+{{- $p := "resource.attributes[\"k8s.namespace.name\"]" -}}
+{{- if $nsExc -}}
+{{- $conds = append $conds (printf "%s != nil and (%s)" $p (include "kubernetes-agent.namespacePatternDisjunction" (dict "patterns" $nsExc "path" $p))) -}}
+{{- end -}}
+{{- if $nsInc -}}
+{{- $conds = append $conds (printf "%s != nil and not (%s)" $p (include "kubernetes-agent.namespacePatternDisjunction" (dict "patterns" $nsInc "path" $p))) -}}
+{{- end -}}
+{{- toJson $conds -}}
+{{- end -}}
+
+{{/*
+Datapoint-context conditions: namespace only, for Prometheus-scraped
+metrics (cAdvisor, kube-state-metrics, CoreDNS, mesh, CSI). Those arrive
+under a single scrape-target resource with the namespace as a DATAPOINT
+label, so the metric-context conditions above never see them — this is
+why namespace filtering needs both contexts to actually cover the cluster.
+*/}}
+{{- define "kubernetes-agent.filterDatapointConditions" -}}
+{{- $nsInc := include "kubernetes-agent.namespaceRulePatterns" (dict "root" . "action" "include" "scope" "metrics") | fromJsonArray -}}
+{{- $nsExc := include "kubernetes-agent.namespaceRulePatterns" (dict "root" . "action" "exclude" "scope" "metrics") | fromJsonArray -}}
+{{- $conds := list -}}
+{{- $p := "attributes[\"namespace\"]" -}}
+{{- if $nsExc -}}
+{{- $conds = append $conds (printf "%s != nil and (%s)" $p (include "kubernetes-agent.namespacePatternDisjunction" (dict "patterns" $nsExc "path" $p))) -}}
+{{- end -}}
+{{- if $nsInc -}}
+{{- $conds = append $conds (printf "%s != nil and not (%s)" $p (include "kubernetes-agent.namespacePatternDisjunction" (dict "patterns" $nsInc "path" $p))) -}}
+{{- end -}}
+{{- toJson $conds -}}
+{{- end -}}
+
+{{/*
+Span-context namespace conditions. These run after metadata enrichment and can
+filter both eBPF and application-pushed OTLP spans independently of whether OBI
+still instruments the namespace.
+*/}}
+{{- define "kubernetes-agent.filterSpanConditions" -}}
+{{- $nsInc := include "kubernetes-agent.namespaceRulePatterns" (dict "root" . "action" "include" "scope" "traces") | fromJsonArray -}}
+{{- $nsExc := include "kubernetes-agent.namespaceRulePatterns" (dict "root" . "action" "exclude" "scope" "traces") | fromJsonArray -}}
+{{- $conds := list -}}
+{{- $p := "resource.attributes[\"k8s.namespace.name\"]" -}}
+{{- if $nsExc -}}
+{{- $conds = append $conds (printf "%s != nil and (%s)" $p (include "kubernetes-agent.namespacePatternDisjunction" (dict "patterns" $nsExc "path" $p))) -}}
+{{- end -}}
+{{- if $nsInc -}}
+{{- $conds = append $conds (printf "%s != nil and not (%s)" $p (include "kubernetes-agent.namespacePatternDisjunction" (dict "patterns" $nsInc "path" $p))) -}}
+{{- end -}}
+{{- toJson $conds -}}
+{{- end -}}
+
+{{/*
+Per-signal predicates. A pipeline must only reference `filter/telemetry`
+when that signal actually has conditions: the filter processor rejects a
+config where it is wired into a pipeline whose signal it has no rules for.
+Usage: {{- if eq (include "kubernetes-agent.logFiltersEnabled" .) "true" }}
+*/}}
+{{- define "kubernetes-agent.logFiltersEnabled" -}}
+{{- gt (len (include "kubernetes-agent.filterLogConditions" . | fromJsonArray)) 0 -}}
+{{- end -}}
+
+{{- define "kubernetes-agent.metricFiltersEnabled" -}}
+{{- or (gt (len (include "kubernetes-agent.filterMetricConditions" . | fromJsonArray)) 0) (gt (len (include "kubernetes-agent.filterDatapointConditions" . | fromJsonArray)) 0) -}}
+{{- end -}}
+
+{{- define "kubernetes-agent.traceFiltersEnabled" -}}
+{{- gt (len (include "kubernetes-agent.filterSpanConditions" . | fromJsonArray)) 0 -}}
+{{- end -}}
+
+{{/*
+The `filter/telemetry` processor block itself. Emitted only for the
+signals that have conditions AND that the calling collector actually runs
+a pipeline for — the DaemonSet has no traces pipeline, so emitting span
+rules there would be config that can never fire.
+Single-quoted YAML keeps OTTL's own double quotes literal; internal single
+quotes are doubled per the YAML spec.
+Args: dict "root" $ "signals" (list "logs" "metrics" "traces")
+*/}}
+{{- define "kubernetes-agent.filterProcessor" -}}
+{{- $root := .root -}}
+{{- $signals := .signals -}}
+{{- $logConds := list -}}
+{{- if has "logs" $signals -}}
+{{- $logConds = include "kubernetes-agent.filterLogConditions" $root | fromJsonArray -}}
+{{- end -}}
+{{- $metricConds := list -}}
+{{- $dpConds := list -}}
+{{- if has "metrics" $signals -}}
+{{- $metricConds = include "kubernetes-agent.filterMetricConditions" $root | fromJsonArray -}}
+{{- $dpConds = include "kubernetes-agent.filterDatapointConditions" $root | fromJsonArray -}}
+{{- end -}}
+{{- $spanConds := list -}}
+{{- if has "traces" $signals -}}
+{{- $spanConds = include "kubernetes-agent.filterSpanConditions" $root | fromJsonArray -}}
+{{- end -}}
+filter/telemetry:
+  # Drops records matching any condition below, before `batch` — so
+  # filtered telemetry costs no egress and never reaches OneUptime.
+  # Generated from .Values.filters and .Values.namespaceFilters.
+  error_mode: ignore
+{{- if $logConds }}
+  logs:
+    log_record:
+{{- range $logConds }}
+      - '{{ . | replace "'" "''" }}'
+{{- end }}
+{{- end }}
+{{- if or $metricConds $dpConds }}
+  metrics:
+{{- if $metricConds }}
+    metric:
+{{- range $metricConds }}
+      - '{{ . | replace "'" "''" }}'
+{{- end }}
+{{- end }}
+{{- if $dpConds }}
+    datapoint:
+{{- range $dpConds }}
+      - '{{ . | replace "'" "''" }}'
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if $spanConds }}
+  traces:
+    span:
+{{- range $spanConds }}
+      - '{{ . | replace "'" "''" }}'
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/*
+Trace sampling. Reads .Values.sampling.traces.
+
+These deliberately test for nil with `kindIs "invalid"` rather than piping
+through `default`: 0 is empty to Go templates, so `percentage | default 100`
+would silently rewrite an explicit `percentage: 0` ("keep no traces") into
+100 ("keep every trace") — the exact opposite of what was asked for, on the
+one setting where being wrong is unrecoverable. Same for `hashSeed: 0`.
+*/}}
+{{- define "kubernetes-agent.traceSamplingPercentage" -}}
+{{- $pct := (((.Values.sampling).traces).percentage) -}}
+{{- if kindIs "invalid" $pct -}}
+100
+{{- else -}}
+{{- $pct -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "kubernetes-agent.traceSamplingHashSeed" -}}
+{{- $seed := (((.Values.sampling).traces).hashSeed) -}}
+{{- if kindIs "invalid" $seed -}}
+22
+{{- else -}}
+{{- $seed -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Whether to emit `probabilistic_sampler` at all.
+
+At 100 the sampler is a no-op, so we leave it out entirely and render the
+same config as an install that has never heard of sampling. Gated on
+ebpf.enabled too: the traces pipeline only exists there, and a processor
+configured but referenced by no pipeline is config the collector can never
+run — the same reason `filter/telemetry` is gated this way.
+Usage: {{- if eq (include "kubernetes-agent.traceSamplingEnabled" .) "true" }}
+*/}}
+{{- define "kubernetes-agent.traceSamplingEnabled" -}}
+{{- $pct := float64 (include "kubernetes-agent.traceSamplingPercentage" .) -}}
+{{- and (.Values.ebpf.enabled | default false) (lt $pct 100.0) -}}
+{{- end -}}
+
+{{/*
+Whether the chart bundles its own cost engine (OpenCost + a minimal
+Prometheus). Bundling is the default when cost is enabled; providing
+`cost.engine.url` means "use my existing OpenCost / Kubecost" and turns
+the bundle off. Usage:
+  {{- if eq (include "kubernetes-agent.costEngineBundled" .) "true" }}
+*/}}
+{{- define "kubernetes-agent.costEngineBundled" -}}
+{{- and .Values.cost.enabled (not .Values.cost.engine.url) -}}
+{{- end -}}
+
+{{/*
+Resolved base URL of the cost engine the poller and the metrics scrape
+talk to: the operator-provided external engine when `cost.engine.url` is
+set, else the bundled OpenCost Service.
+*/}}
+{{- define "kubernetes-agent.costEngineUrl" -}}
+{{- if .Values.cost.engine.url -}}
+{{- .Values.cost.engine.url -}}
+{{- else -}}
+http://{{ include "kubernetes-agent.fullname" . }}-opencost.{{ .Release.Namespace }}.svc.cluster.local:9003
+{{- end -}}
+{{- end -}}
+
+{{/*
+Resolved Prometheus URL for the cost pipeline, or EMPTY when there is none.
+
+The cost agent reads per-container memory PEAKS from here. The Allocation
+API only reports averages over the window, and an hourly mean hides the
+burst that OOMKills a container — so a memory right-sizing recommendation
+built on the average is actively dangerous. CPU needs no such help
+(overshoot throttles rather than kills), which is why this is optional.
+
+Empty is a legitimate, supported answer: an install pointing at an external
+cost engine gets no bundled Prometheus, and the agent treats an empty value
+as "ship allocations without peaks". Never default this to the bundled
+Service name unconditionally — on an external-engine install that name
+resolves to nothing and every poll would fail against it.
+*/}}
+{{- define "kubernetes-agent.costPrometheusUrl" -}}
+{{- if .Values.cost.engine.prometheusUrl -}}
+{{- .Values.cost.engine.prometheusUrl -}}
+{{- else if eq (include "kubernetes-agent.costEngineBundled" .) "true" -}}
+http://{{ include "kubernetes-agent.fullname" . }}-cost-prometheus.{{ .Release.Namespace }}.svc.cluster.local:9090
+{{- end -}}
+{{- end -}}

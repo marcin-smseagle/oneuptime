@@ -1,0 +1,1083 @@
+import { PROBE_INGEST_URL, PROBE_MONITOR_RETRY_LIMIT } from "../../Config";
+import ProbeUtil from "../Probe";
+import ProbeAPIRequest from "../ProbeAPIRequest";
+import ApiMonitor, { APIResponse } from "./MonitorTypes/ApiMonitor";
+import CustomCodeMonitor from "./MonitorTypes/CustomCodeMonitor";
+import NetworkPathMonitor from "./MonitorTypes/NetworkPathMonitor";
+import PingMonitor, { PingResponse } from "./MonitorTypes/PingMonitor";
+import PortMonitor, { PortMonitorResponse } from "./MonitorTypes/PortMonitor";
+import SSLMonitor, { SslResponse } from "./MonitorTypes/SslMonitor";
+import SyntheticMonitor from "./MonitorTypes/SyntheticMonitor";
+import WebsiteMonitor, {
+  ProbeWebsiteResponse,
+} from "./MonitorTypes/WebsiteMonitor";
+import SnmpMonitor from "./MonitorTypes/SnmpMonitor";
+import SnmpMonitorResponse from "Common/Types/Monitor/SnmpMonitor/SnmpMonitorResponse";
+import MonitorStepSnmpMonitor from "Common/Types/Monitor/MonitorStepSnmpMonitor";
+import DnsMonitorUtil from "./MonitorTypes/DnsMonitor";
+import DnsMonitorResponse from "Common/Types/Monitor/DnsMonitor/DnsMonitorResponse";
+import MonitorStepDnsMonitor from "Common/Types/Monitor/MonitorStepDnsMonitor";
+import DomainMonitorUtil from "./MonitorTypes/DomainMonitor";
+import DomainMonitorResponse from "Common/Types/Monitor/DomainMonitor/DomainMonitorResponse";
+import MonitorStepDomainMonitor from "Common/Types/Monitor/MonitorStepDomainMonitor";
+import DnssecMonitorUtil from "./MonitorTypes/DnssecMonitor";
+import DnssecMonitorResponse from "Common/Types/Monitor/DnssecMonitor/DnssecMonitorResponse";
+import MonitorStepDnssecMonitor from "Common/Types/Monitor/MonitorStepDnssecMonitor";
+import SqlMonitor from "./MonitorTypes/SqlMonitor";
+import SqlMonitorResponse from "Common/Types/Monitor/SqlMonitor/SqlMonitorResponse";
+import MonitorStepSqlMonitor from "Common/Types/Monitor/MonitorStepSqlMonitor";
+import DatabaseMonitor from "./MonitorTypes/DatabaseMonitor";
+import DatabaseMonitorResponse from "Common/Types/Monitor/DatabaseMonitor/DatabaseMonitorResponse";
+import MonitorStepDatabaseMonitor from "Common/Types/Monitor/MonitorStepDatabaseMonitor";
+import ExternalStatusPageMonitorUtil from "./MonitorTypes/ExternalStatusPageMonitor";
+import ExternalStatusPageMonitorResponse from "Common/Types/Monitor/ExternalStatusPageMonitor/ExternalStatusPageMonitorResponse";
+import MonitorStepExternalStatusPageMonitor from "Common/Types/Monitor/MonitorStepExternalStatusPageMonitor";
+import HTTPMethod from "Common/Types/API/HTTPMethod";
+import URL from "Common/Types/API/URL";
+import OneUptimeDate from "Common/Types/Date";
+import { JSONObject } from "Common/Types/JSON";
+import JSONFunctions from "Common/Types/JSONFunctions";
+import { CheckOn, CriteriaFilter } from "Common/Types/Monitor/CriteriaFilter";
+import CustomCodeMonitorResponse from "Common/Types/Monitor/CustomCodeMonitor/CustomCodeMonitorResponse";
+import MonitorCriteriaInstance from "Common/Types/Monitor/MonitorCriteriaInstance";
+import MonitorStep, {
+  clampMonitorRequestTimeoutInMs,
+  clampMonitorRetryCount,
+  DEFAULT_MONITOR_REQUEST_TIMEOUT_IN_MS,
+} from "Common/Types/Monitor/MonitorStep";
+import MonitorType from "Common/Types/Monitor/MonitorType";
+import BrowserType from "Common/Types/Monitor/SyntheticMonitors/BrowserType";
+import SyntheticMonitorResponse from "Common/Types/Monitor/SyntheticMonitors/SyntheticMonitorResponse";
+import Port from "Common/Types/Port";
+import ProbeMonitorResponse from "Common/Types/Probe/ProbeMonitorResponse";
+import ScreenSizeType from "Common/Types/ScreenSizeType";
+import API from "Common/Utils/API";
+import LocalCache from "Common/Server/Infrastructure/LocalCache";
+import logger from "Common/Server/Utils/Logger";
+import AppMetrics from "Common/Server/Utils/Telemetry/AppMetrics";
+import TelemetryContext from "Common/Server/Utils/Telemetry/TelemetryContext";
+import {
+  COMPONENT_ATTRIBUTE_KEY,
+  TelemetryComponent,
+  UNIT_OF_WORK_ATTRIBUTE_KEY,
+  UnitOfWork,
+} from "Common/Types/Telemetry/UnitOfWork";
+import Monitor from "Common/Models/DatabaseModels/Monitor";
+import PositiveNumber from "Common/Types/PositiveNumber";
+import ObjectID from "Common/Types/ObjectID";
+import MonitorTest from "Common/Models/DatabaseModels/MonitorTest";
+
+export default class MonitorUtil {
+  // Replace dynamic URL placeholders like {{timestamp}} and {{random}} with actual values.
+  public static resolveUrlPlaceholders(url: URL): URL {
+    let urlString: string = url.toString();
+
+    if (
+      !urlString.includes("{{timestamp}}") &&
+      !urlString.includes("{{random}}")
+    ) {
+      return url;
+    }
+
+    const timestamp: string = Math.floor(Date.now() / 1000).toString();
+    const random: string = ObjectID.generate().toString().replace(/-/g, "");
+
+    urlString = urlString.replace(/\{\{timestamp\}\}/g, timestamp);
+    urlString = urlString.replace(/\{\{random\}\}/g, random);
+
+    return URL.fromString(urlString);
+  }
+
+  /*
+   * DNS, DNSSEC, Domain, SNMP and External Status Page steps carry their own
+   * timeout/retries in their type-specific config - that is what their form
+   * exposes - while every other type uses the step-level settings. So the
+   * resolution order is: what the user set on the step, then what they set on
+   * the type-specific config, then the probe-wide default. Passing
+   * PROBE_MONITOR_RETRY_LIMIT straight through (as these branches used to)
+   * discarded BOTH user settings, because the monitor utils treat a supplied
+   * options.retry as the winner.
+   */
+  public static resolveRetryCount(data: {
+    stepRetryCount: number | undefined | null;
+    monitorConfigRetries: number | undefined | null;
+  }): number {
+    if (data.stepRetryCount !== undefined && data.stepRetryCount !== null) {
+      return clampMonitorRetryCount(data.stepRetryCount);
+    }
+
+    if (
+      data.monitorConfigRetries !== undefined &&
+      data.monitorConfigRetries !== null
+    ) {
+      return data.monitorConfigRetries;
+    }
+
+    return PROBE_MONITOR_RETRY_LIMIT;
+  }
+
+  // Same precedence as resolveRetryCount, for the request timeout.
+  public static resolveTimeoutInMs(data: {
+    stepRequestTimeoutInMs: number | undefined | null;
+    monitorConfigTimeoutInMs: number | undefined | null;
+    defaultTimeoutInMs: number;
+  }): number {
+    if (
+      data.stepRequestTimeoutInMs !== undefined &&
+      data.stepRequestTimeoutInMs !== null
+    ) {
+      return clampMonitorRequestTimeoutInMs(data.stepRequestTimeoutInMs);
+    }
+
+    if (data.monitorConfigTimeoutInMs) {
+      return data.monitorConfigTimeoutInMs;
+    }
+
+    return data.defaultTimeoutInMs;
+  }
+
+  public static async probeMonitorTest(
+    monitorTest: MonitorTest,
+  ): Promise<Array<ProbeMonitorResponse | null>> {
+    /*
+     * Seed telemetry context so every span/log for this test check carries the
+     * monitor + project identity.
+     */
+    return TelemetryContext.runWithContext(
+      {
+        monitorId: monitorTest.id?.toString(),
+        projectId: monitorTest.projectId?.toString(),
+        monitorType: monitorTest.monitorType?.toString(),
+        /*
+         * A probe check has no client to blame: if this code throws a
+         * user-error class, WE produced the bad input, so ErrorClassResolver
+         * promotes it back to code-fault. Set explicitly — runWithContext
+         * inherits the enclosing scope.
+         */
+        [UNIT_OF_WORK_ATTRIBUTE_KEY]: UnitOfWork.ProbeCheck,
+        [COMPONENT_ATTRIBUTE_KEY]: TelemetryComponent.Probe,
+      },
+      () => {
+        return this.probeMonitorTestInternal(monitorTest);
+      },
+    );
+  }
+
+  private static async probeMonitorTestInternal(
+    monitorTest: MonitorTest,
+  ): Promise<Array<ProbeMonitorResponse | null>> {
+    const results: Array<ProbeMonitorResponse | null> = [];
+
+    if (
+      !monitorTest.monitorSteps ||
+      monitorTest.monitorSteps.data?.monitorStepsInstanceArray.length === 0
+    ) {
+      logger.debug("No monitor steps found");
+      return [];
+    }
+
+    for (const monitorStep of monitorTest.monitorSteps.data
+      ?.monitorStepsInstanceArray || []) {
+      if (!monitorStep) {
+        continue;
+      }
+
+      const result: ProbeMonitorResponse | null = await this.probeMonitorStep({
+        monitorType: monitorTest.monitorType!,
+        monitorId: monitorTest.id!,
+        monitorStep: monitorStep,
+        projectId: monitorTest.projectId!,
+      });
+
+      if (result) {
+        // report this back to Probe API.
+        const monitorTestIngestUrl: URL = URL.fromString(
+          PROBE_INGEST_URL.toString(),
+        ).addRoute(
+          "/probe/response/monitor-test-ingest/" + monitorTest.id?.toString(),
+        );
+
+        await API.fetch<JSONObject>({
+          method: HTTPMethod.POST,
+          url: monitorTestIngestUrl,
+          data: {
+            ...ProbeAPIRequest.getDefaultRequestBody(),
+            probeMonitorResponse: result as any,
+          },
+          headers: {},
+          options:
+            ProbeAPIRequest.getDefaultRequestOptions(monitorTestIngestUrl),
+        });
+      }
+
+      results.push(result);
+    }
+
+    return results;
+  }
+
+  public static async probeMonitor(monitor: Monitor): Promise<void> {
+    /*
+     * Seed telemetry context so every span/log for this check carries the
+     * monitor + project identity.
+     */
+    return TelemetryContext.runWithContext(
+      {
+        monitorId: monitor.id?.toString(),
+        projectId: monitor.projectId?.toString(),
+        monitorType: monitor.monitorType?.toString(),
+        /*
+         * A probe check has no client to blame: if this code throws a
+         * user-error class, WE produced the bad input, so ErrorClassResolver
+         * promotes it back to code-fault. Set explicitly — runWithContext
+         * inherits the enclosing scope.
+         */
+        [UNIT_OF_WORK_ATTRIBUTE_KEY]: UnitOfWork.ProbeCheck,
+        [COMPONENT_ATTRIBUTE_KEY]: TelemetryComponent.Probe,
+      },
+      () => {
+        return this.probeMonitorInternal(monitor);
+      },
+    );
+  }
+
+  private static async probeMonitorInternal(monitor: Monitor): Promise<void> {
+    if (
+      !monitor.monitorSteps ||
+      monitor.monitorSteps.data?.monitorStepsInstanceArray.length === 0
+    ) {
+      logger.debug("No monitor steps found");
+      return;
+    }
+
+    for (const monitorStep of monitor.monitorSteps.data
+      ?.monitorStepsInstanceArray || []) {
+      if (!monitorStep) {
+        continue;
+      }
+
+      /*
+       * A throw from any monitor-type handler used to escape all the way to
+       * Promise.allSettled in the FetchList job, where it was logged and
+       * dropped - BEFORE the ingest POST below. The monitor then produced no
+       * result at all, on every cycle, and the only symptom was a monitor
+       * that silently never changed state.
+       *
+       * Converting the throw into a reportable offline result keeps that
+       * class of bug visible: the check is recorded as failed, with the
+       * error as its cause, and criteria can act on it.
+       */
+      let result: ProbeMonitorResponse | null = null;
+
+      try {
+        result = await this.probeMonitorStep({
+          monitorType: monitor.monitorType!,
+          monitorId: monitor.id!,
+          monitorStep: monitorStep,
+          projectId: monitor.projectId!,
+        });
+      } catch (err) {
+        logger.error(
+          `Monitor ${monitor.id?.toString()} (${monitor.monitorType}) step ${monitorStep.id?.toString()} threw while probing:`,
+        );
+        logger.error(err);
+
+        result = {
+          monitorStepId: monitorStep.id,
+          projectId: monitor.projectId!,
+          monitorId: monitor.id!,
+          probeId: ProbeUtil.getProbeId(),
+          isOnline: false,
+          failureCause: API.getFriendlyErrorMessage(err as Error),
+          monitoredAt: OneUptimeDate.getCurrentDate(),
+        };
+      }
+
+      if (result) {
+        // report this back to Probe API.
+        const monitorIngestUrl: URL = URL.fromString(
+          PROBE_INGEST_URL.toString(),
+        ).addRoute("/probe/response/ingest");
+
+        await API.fetch<JSONObject>({
+          method: HTTPMethod.POST,
+          url: monitorIngestUrl,
+          data: {
+            ...ProbeAPIRequest.getDefaultRequestBody(),
+            probeMonitorResponse: result as any,
+          },
+          headers: {},
+          options: ProbeAPIRequest.getDefaultRequestOptions(monitorIngestUrl),
+        });
+      }
+
+      /*
+       * The response has already been ingested. Log it now and release it
+       * before the next step, rather than keeping every body/screenshot in
+       * an array until the slowest monitor in the worker's batch finishes.
+       */
+      logger.debug("Probed monitor step:");
+      logger.debug(result);
+    }
+  }
+
+  public static isHeadRequest(monitorStep: MonitorStep): boolean {
+    // If its not GET requestm it cannot be a head request
+    if (
+      monitorStep.data?.requestType &&
+      monitorStep.data?.requestType !== HTTPMethod.GET
+    ) {
+      return false;
+    }
+
+    // check if monitor step has any criteria with needs request body. If no, then return true otherwise return false.
+
+    if (
+      monitorStep.data?.monitorCriteria.data?.monitorCriteriaInstanceArray &&
+      monitorStep.data?.monitorCriteria.data?.monitorCriteriaInstanceArray
+        .length > 0
+    ) {
+      const criteriaArray: Array<MonitorCriteriaInstance> =
+        monitorStep.data?.monitorCriteria.data?.monitorCriteriaInstanceArray;
+
+      for (const criteria of criteriaArray) {
+        if (criteria.data?.filters && criteria.data?.filters.length > 0) {
+          const filters: Array<CriteriaFilter> = criteria.data?.filters;
+
+          for (const filter of filters) {
+            if (
+              filter.checkOn === CheckOn.ResponseBody ||
+              filter.checkOn === CheckOn.JavaScriptExpression
+            ) {
+              return false;
+            }
+          }
+        }
+      }
+    }
+
+    return true;
+  }
+
+  public static async probeMonitorStep(data: {
+    monitorStep: MonitorStep;
+    monitorType: MonitorType;
+    monitorId: ObjectID;
+    projectId: ObjectID;
+  }): Promise<ProbeMonitorResponse | null> {
+    const startNs: bigint = process.hrtime.bigint();
+    const monitorTypeAttr: string = data.monitorType?.toString() || "unknown";
+    let outcome:
+      | "online"
+      | "offline"
+      | "timeout"
+      | "no_step"
+      | "error"
+      | "skipped" = "online";
+
+    try {
+      const result: ProbeMonitorResponse | null =
+        await this.probeMonitorStepInternal(data);
+
+      if (!result) {
+        outcome = "skipped";
+      } else if (result.isTimeout) {
+        outcome = "timeout";
+      } else if (result.isOnline === false) {
+        outcome = "offline";
+      } else if (result.isOnline === true) {
+        outcome = "online";
+      } else {
+        /*
+         * No isOnline determined (e.g. monitor types that report a value
+         * but no boolean status — synthetic, custom code).
+         */
+        outcome = "online";
+      }
+
+      return result;
+    } catch (err) {
+      outcome = "error";
+      throw err;
+    } finally {
+      const elapsedNs: bigint = process.hrtime.bigint() - startNs;
+      const durationMs: number = Number(elapsedNs) / 1e6;
+      const attributes: Record<string, string> = {
+        "monitor.type": monitorTypeAttr,
+        outcome,
+      };
+
+      AppMetrics.getProbeCheckCounter().add(1, attributes);
+      AppMetrics.getProbeCheckDuration().record(durationMs, attributes);
+    }
+  }
+
+  private static async probeMonitorStepInternal(data: {
+    monitorStep: MonitorStep;
+    monitorType: MonitorType;
+    monitorId: ObjectID;
+    projectId: ObjectID;
+  }): Promise<ProbeMonitorResponse | null> {
+    const monitorStep: MonitorStep = data.monitorStep;
+    const monitorType: MonitorType = data.monitorType;
+    const monitorId: ObjectID = data.monitorId;
+
+    const result: ProbeMonitorResponse = {
+      monitorStepId: monitorStep.id,
+      projectId: data.projectId,
+      monitorId: monitorId!,
+      probeId: ProbeUtil.getProbeId(),
+      failureCause: "",
+      monitoredAt: OneUptimeDate.getCurrentDate(),
+    };
+
+    if (!monitorStep.data) {
+      return result;
+    }
+
+    /*
+     * Per-step request timeout (capped at the user-facing max). Falls back
+     * to the global default when the user hasn't configured one.
+     */
+    const requestTimeoutInMs: number = MonitorUtil.resolveTimeoutInMs({
+      stepRequestTimeoutInMs: monitorStep.data.requestTimeoutInMs,
+      monitorConfigTimeoutInMs: undefined,
+      defaultTimeoutInMs: DEFAULT_MONITOR_REQUEST_TIMEOUT_IN_MS,
+    });
+
+    /*
+     * Per-step retry count (capped at the user-facing max). Falls back to
+     * the probe-wide default (env var) when the user hasn't configured one.
+     */
+    const retryCount: number = MonitorUtil.resolveRetryCount({
+      stepRetryCount: monitorStep.data.retryCount,
+      monitorConfigRetries: undefined,
+    });
+
+    if (monitorType === MonitorType.Ping || monitorType === MonitorType.IP) {
+      if (!monitorStep.data?.monitorDestination) {
+        return result;
+      }
+
+      result.monitorDestination = monitorStep.data.monitorDestination;
+
+      if (LocalCache.getString("PROBE", "PING_MONITORING") === "PORT") {
+        // probe is online but ping monitoring is blocked by the cloud provider. Fallback to port monitoring.
+
+        const response: PortMonitorResponse | null = await PortMonitor.ping(
+          monitorStep.data?.monitorDestination,
+          new Port(80), // use port 80 by default.
+          {
+            retry: retryCount,
+            monitorId: monitorId,
+            timeout: new PositiveNumber(requestTimeoutInMs),
+          },
+        );
+
+        if (!response) {
+          return null;
+        }
+
+        result.isOnline = response.isOnline;
+        result.isTimeout = response.isTimeout;
+        result.responseTimeInMs = response.responseTimeInMS?.toNumber();
+        result.failureCause = response.failureCause;
+        result.probeAttempts = response.probeAttempts;
+        result.totalAttempts = response.totalAttempts;
+        result.portTimings = response.portTimings;
+        result.requestFailedDetails = response.requestFailedDetails;
+      } else {
+        const response: PingResponse | null = await PingMonitor.ping(
+          monitorStep.data?.monitorDestination,
+          {
+            retry: retryCount,
+            monitorId: monitorId,
+            timeout: new PositiveNumber(requestTimeoutInMs),
+          },
+        );
+
+        if (!response) {
+          return null;
+        }
+
+        result.isOnline = response.isOnline;
+        result.isTimeout = response.isTimeout;
+        result.responseTimeInMs = response.responseTimeInMS?.toNumber();
+        result.failureCause = response.failureCause;
+        result.probeAttempts = response.probeAttempts;
+        result.totalAttempts = response.totalAttempts;
+        result.pingResponse = response.pingResponse;
+      }
+    }
+
+    if (monitorType === MonitorType.Port) {
+      if (!monitorStep.data?.monitorDestination) {
+        return result;
+      }
+
+      result.monitorDestination = monitorStep.data.monitorDestination;
+
+      if (!monitorStep.data?.monitorDestinationPort) {
+        result.isOnline = false;
+        result.responseTimeInMs = 0;
+        result.failureCause = "Port is not specified";
+
+        return result;
+      }
+
+      result.monitorDestinationPort = monitorStep.data.monitorDestinationPort;
+
+      const response: PortMonitorResponse | null = await PortMonitor.ping(
+        monitorStep.data?.monitorDestination,
+        monitorStep.data.monitorDestinationPort,
+        {
+          retry: retryCount,
+          monitorId: monitorId,
+          timeout: new PositiveNumber(requestTimeoutInMs),
+        },
+      );
+
+      if (!response) {
+        return null;
+      }
+
+      result.isOnline = response.isOnline;
+      result.responseTimeInMs = response.responseTimeInMS?.toNumber();
+      result.failureCause = response.failureCause;
+      result.isTimeout = response.isTimeout;
+      result.probeAttempts = response.probeAttempts;
+      result.totalAttempts = response.totalAttempts;
+      result.portTimings = response.portTimings;
+      result.requestFailedDetails = response.requestFailedDetails;
+    }
+
+    /*
+     * When a network check fails, capture the path (traceroute + DNS lookup)
+     * at the moment of failure. It is attached to the response as diagnostic
+     * evidence, so whoever gets paged sees where the route broke — not just
+     * that the target is down.
+     */
+    if (
+      (monitorType === MonitorType.Ping ||
+        monitorType === MonitorType.IP ||
+        monitorType === MonitorType.Port) &&
+      result.isOnline === false &&
+      monitorStep.data?.monitorDestination
+    ) {
+      try {
+        result.networkPathTrace = await NetworkPathMonitor.trace(
+          monitorStep.data.monitorDestination,
+          {
+            timeout: 20000,
+            maxHops: 20,
+          },
+        );
+      } catch (err) {
+        // Diagnostics must never turn a completed check into a failed one.
+        logger.error(
+          `Failed to capture network path for monitor ${monitorId.toString()}: ${err}`,
+        );
+      }
+    }
+
+    if (monitorType === MonitorType.SyntheticMonitor) {
+      if (!monitorStep.data?.customCode) {
+        result.failureCause =
+          "Code not specified. Please add playwright script.";
+        return result;
+      }
+
+      const response: Array<SyntheticMonitorResponse> | null =
+        await SyntheticMonitor.execute({
+          script: monitorStep.data.customCode,
+          monitorId: monitorId,
+          screenSizeTypes: monitorStep.data
+            .screenSizeTypes as Array<ScreenSizeType>,
+          browserTypes: monitorStep.data.browserTypes as Array<BrowserType>,
+          retryCountOnError: monitorStep.data.retryCountOnError || 0,
+        });
+
+      if (!response) {
+        return null;
+      }
+
+      result.syntheticMonitorResponse = response;
+    }
+
+    if (monitorType === MonitorType.CustomJavaScriptCode) {
+      if (!monitorStep.data?.customCode) {
+        result.failureCause =
+          "Code not specified. Please add playwright script.";
+        return result;
+      }
+
+      const response: CustomCodeMonitorResponse | null =
+        await CustomCodeMonitor.execute({
+          script: monitorStep.data.customCode,
+          monitorId: monitorId,
+        });
+
+      if (!response) {
+        return null;
+      }
+
+      result.customCodeMonitorResponse = response;
+    }
+
+    if (monitorType === MonitorType.SSLCertificate) {
+      /*
+       * A step with no destination is a misconfiguration, and it has to
+       * produce a verdict criteria can act on. Returning a bare result left
+       * isOnline undefined, which matches nothing and reads as "healthy".
+       */
+      if (!monitorStep.data?.monitorDestination) {
+        result.isOnline = false;
+        result.failureCause =
+          "SSL Certificate Monitor - destination URL is not specified.";
+
+        return result;
+      }
+
+      result.monitorDestination = monitorStep.data.monitorDestination;
+
+      const response: SslResponse | null = await SSLMonitor.ping(
+        monitorStep.data?.monitorDestination as URL,
+        {
+          retry: retryCount,
+          monitorId: monitorId,
+          timeout: new PositiveNumber(requestTimeoutInMs),
+        },
+      );
+
+      if (!response) {
+        return null;
+      }
+
+      result.isOnline = response.isOnline;
+      result.failureCause = response.failureCause;
+      result.isTimeout = response.isTimeout;
+      /*
+       * Without this the ResponseTime metric is never written for SSL
+       * monitors, so their metrics chart stays permanently empty.
+       */
+      result.responseTimeInMs = response.responseTimeInMs;
+      result.sslResponse = {
+        ...response,
+      };
+      result.probeAttempts = response.probeAttempts;
+      result.totalAttempts = response.totalAttempts;
+    }
+
+    if (monitorType === MonitorType.Website) {
+      if (!monitorStep.data?.monitorDestination) {
+        return result;
+      }
+
+      result.monitorDestination = monitorStep.data.monitorDestination;
+
+      const websiteUrl: URL = MonitorUtil.resolveUrlPlaceholders(
+        monitorStep.data?.monitorDestination as URL,
+      );
+
+      const response: ProbeWebsiteResponse | null = await WebsiteMonitor.ping(
+        websiteUrl,
+        {
+          isHeadRequest: MonitorUtil.isHeadRequest(monitorStep),
+          monitorId: monitorId,
+          retry: retryCount,
+          timeout: new PositiveNumber(requestTimeoutInMs),
+          doNotFollowRedirects: monitorStep.data?.doNotFollowRedirects || false,
+          allowSelfSignedCertificates:
+            monitorStep.data?.allowSelfSignedCertificates || false,
+          tlsClientCertificate:
+            monitorStep.data?.tlsClientCertificate || undefined,
+          tlsClientKey: monitorStep.data?.tlsClientKey || undefined,
+          tlsClientKeyPassphrase:
+            monitorStep.data?.tlsClientKeyPassphrase || undefined,
+        },
+      );
+
+      if (!response) {
+        return null;
+      }
+
+      result.isOnline = response.isOnline;
+      result.responseTimeInMs = response.responseTimeInMS?.toNumber();
+      result.responseBody = response.responseBody?.toString();
+      result.responseHeaders = response.responseHeaders;
+      result.responseCode = response.statusCode;
+      result.failureCause = response.failureCause;
+      result.isTimeout = response.isTimeout;
+      result.requestFailedDetails = response.requestFailedDetails;
+      result.probeAttempts = response.probeAttempts;
+      result.totalAttempts = response.totalAttempts;
+      result.httpTimings = response.httpTimings;
+    }
+
+    if (monitorType === MonitorType.API) {
+      if (!monitorStep.data?.monitorDestination) {
+        return result;
+      }
+
+      result.monitorDestination = monitorStep.data.monitorDestination;
+
+      const apiUrl: URL = MonitorUtil.resolveUrlPlaceholders(
+        monitorStep.data?.monitorDestination as URL,
+      );
+
+      let requestBody: JSONObject | undefined = undefined;
+      if (
+        monitorStep.data?.requestBody &&
+        typeof monitorStep.data?.requestBody === "string"
+      ) {
+        requestBody = JSONFunctions.parseJSONObject(
+          monitorStep.data?.requestBody,
+        );
+      }
+
+      const response: APIResponse | null = await ApiMonitor.ping(apiUrl, {
+        requestHeaders: monitorStep.data?.requestHeaders || {},
+        requestBody: requestBody || undefined,
+        monitorId: monitorId,
+        requestType: monitorStep.data?.requestType || HTTPMethod.GET,
+        retry: retryCount,
+        timeout: new PositiveNumber(requestTimeoutInMs),
+        doNotFollowRedirects: monitorStep.data?.doNotFollowRedirects || false,
+        allowSelfSignedCertificates:
+          monitorStep.data?.allowSelfSignedCertificates || false,
+        tlsClientCertificate:
+          monitorStep.data?.tlsClientCertificate || undefined,
+        tlsClientKey: monitorStep.data?.tlsClientKey || undefined,
+        tlsClientKeyPassphrase:
+          monitorStep.data?.tlsClientKeyPassphrase || undefined,
+      });
+
+      if (!response) {
+        return null;
+      }
+
+      result.isOnline = response.isOnline;
+      result.isTimeout = response.isTimeout;
+      result.responseTimeInMs = response.responseTimeInMS?.toNumber();
+      result.responseBody = response.responseBody;
+      result.responseHeaders = response.responseHeaders;
+      result.responseCode = response.statusCode;
+      result.failureCause = response.failureCause;
+      result.requestFailedDetails = response.requestFailedDetails;
+      result.probeAttempts = response.probeAttempts;
+      result.totalAttempts = response.totalAttempts;
+      result.httpTimings = response.httpTimings;
+    }
+
+    if (monitorType === MonitorType.NetworkDevice) {
+      /*
+       * The server hydrates the referenced NetworkDevice's SNMP config into
+       * snmpMonitor before handing out work; if it's absent the device was
+       * deleted or the reference is broken.
+       */
+      if (!monitorStep.data?.snmpMonitor) {
+        result.failureCause =
+          "Network Device configuration not available. The referenced device may have been deleted.";
+        return result;
+      }
+
+      const snmpConfig: MonitorStepSnmpMonitor = monitorStep.data.snmpMonitor;
+
+      if (!snmpConfig.hostname) {
+        result.failureCause = "SNMP hostname not specified";
+        return result;
+      }
+
+      if (
+        (!snmpConfig.oids || snmpConfig.oids.length === 0) &&
+        !snmpConfig.monitorInterfaces
+      ) {
+        result.failureCause =
+          "No OIDs configured for SNMP monitor. Configure OIDs or enable interface monitoring.";
+        return result;
+      }
+
+      const response: SnmpMonitorResponse | null = await SnmpMonitor.query(
+        snmpConfig,
+        {
+          retry: MonitorUtil.resolveRetryCount({
+            stepRetryCount: monitorStep.data.retryCount,
+            monitorConfigRetries: snmpConfig.retries,
+          }),
+          monitorId: monitorId,
+          timeout: MonitorUtil.resolveTimeoutInMs({
+            stepRequestTimeoutInMs: monitorStep.data.requestTimeoutInMs,
+            monitorConfigTimeoutInMs: snmpConfig.timeout,
+            defaultTimeoutInMs: 5000,
+          }),
+          /*
+           * ARP/FDB endpoint collection rides the interface walk. Strictly
+           * OPT-IN: it adds SNMP table walks per poll and an endpoint write
+           * per discovered MAC, so a step that never asked for it — every
+           * step saved before the flag existed included — must not start
+           * paying for it on upgrade. Only an explicit true enables it.
+           */
+          collectEndpoints:
+            monitorStep.data?.networkDeviceMonitor?.collectEndpoints === true,
+        },
+      );
+
+      if (!response) {
+        return null;
+      }
+
+      result.isOnline = response.isOnline;
+      result.isTimeout = response.isTimeout;
+      result.responseTimeInMs = response.responseTimeInMs;
+      result.failureCause = response.failureCause;
+      result.snmpResponse = response;
+      result.probeAttempts = response.probeAttempts;
+      result.totalAttempts = response.totalAttempts;
+    }
+
+    if (monitorType === MonitorType.DNS) {
+      if (!monitorStep.data?.dnsMonitor) {
+        result.failureCause = "DNS configuration not specified";
+        return result;
+      }
+
+      const dnsConfig: MonitorStepDnsMonitor = monitorStep.data.dnsMonitor;
+
+      if (!dnsConfig.queryName) {
+        result.failureCause = "DNS query name (domain) not specified";
+        return result;
+      }
+
+      const response: DnsMonitorResponse | null = await DnsMonitorUtil.query(
+        dnsConfig,
+        {
+          retry: MonitorUtil.resolveRetryCount({
+            stepRetryCount: monitorStep.data.retryCount,
+            monitorConfigRetries: dnsConfig.retries,
+          }),
+          monitorId: monitorId,
+          timeout: MonitorUtil.resolveTimeoutInMs({
+            stepRequestTimeoutInMs: monitorStep.data.requestTimeoutInMs,
+            monitorConfigTimeoutInMs: dnsConfig.timeout,
+            defaultTimeoutInMs: 5000,
+          }),
+        },
+      );
+
+      if (!response) {
+        return null;
+      }
+
+      result.isOnline = response.isOnline;
+      result.isTimeout = response.isTimeout;
+      result.responseTimeInMs = response.responseTimeInMs;
+      result.failureCause = response.failureCause;
+      result.dnsResponse = response;
+      result.probeAttempts = response.probeAttempts;
+      result.totalAttempts = response.totalAttempts;
+    }
+
+    if (monitorType === MonitorType.Domain) {
+      if (!monitorStep.data?.domainMonitor) {
+        result.failureCause = "Domain configuration not specified";
+        return result;
+      }
+
+      const domainConfig: MonitorStepDomainMonitor =
+        monitorStep.data.domainMonitor;
+
+      if (!domainConfig.domainName) {
+        result.failureCause = "Domain name not specified";
+        return result;
+      }
+
+      const response: DomainMonitorResponse | null =
+        await DomainMonitorUtil.query(domainConfig, {
+          retry: MonitorUtil.resolveRetryCount({
+            stepRetryCount: monitorStep.data.retryCount,
+            monitorConfigRetries: domainConfig.retries,
+          }),
+          monitorId: monitorId,
+          timeout: MonitorUtil.resolveTimeoutInMs({
+            stepRequestTimeoutInMs: monitorStep.data.requestTimeoutInMs,
+            monitorConfigTimeoutInMs: domainConfig.timeout,
+            defaultTimeoutInMs: 10000,
+          }),
+        });
+
+      if (!response) {
+        return null;
+      }
+
+      result.isOnline = response.isOnline;
+      result.isTimeout = response.isTimeout;
+      result.responseTimeInMs = response.responseTimeInMs;
+      result.failureCause = response.failureCause;
+      result.domainResponse = response;
+      result.probeAttempts = response.probeAttempts;
+      result.totalAttempts = response.totalAttempts;
+    }
+
+    if (monitorType === MonitorType.DNSSEC) {
+      if (!monitorStep.data?.dnssecMonitor) {
+        result.failureCause = "DNSSEC configuration not specified";
+        return result;
+      }
+
+      const dnssecConfig: MonitorStepDnssecMonitor =
+        monitorStep.data.dnssecMonitor;
+
+      if (!dnssecConfig.domainName) {
+        result.failureCause = "DNSSEC domain name not specified";
+        return result;
+      }
+
+      const response: DnssecMonitorResponse | null =
+        await DnssecMonitorUtil.query(dnssecConfig, {
+          retry: MonitorUtil.resolveRetryCount({
+            stepRetryCount: monitorStep.data.retryCount,
+            monitorConfigRetries: dnssecConfig.retries,
+          }),
+          monitorId: monitorId,
+          timeout: MonitorUtil.resolveTimeoutInMs({
+            stepRequestTimeoutInMs: monitorStep.data.requestTimeoutInMs,
+            monitorConfigTimeoutInMs: dnssecConfig.timeout,
+            defaultTimeoutInMs: 10000,
+          }),
+        });
+
+      if (!response) {
+        return null;
+      }
+
+      result.isOnline = response.isOnline;
+      result.isTimeout = response.isTimeout;
+      result.responseTimeInMs = response.responseTimeInMs;
+      result.failureCause = response.failureCause;
+      result.dnssecResponse = response;
+      result.probeAttempts = response.probeAttempts;
+      result.totalAttempts = response.totalAttempts;
+    }
+
+    if (monitorType === MonitorType.SQLQuery) {
+      if (!monitorStep.data?.sqlMonitor) {
+        result.failureCause = "SQL monitor configuration not specified";
+        return result;
+      }
+
+      const sqlConfig: MonitorStepSqlMonitor = monitorStep.data.sqlMonitor;
+
+      if (!sqlConfig.host) {
+        result.failureCause = "Database host not specified";
+        return result;
+      }
+
+      if (!sqlConfig.query) {
+        result.failureCause = "SQL query not specified";
+        return result;
+      }
+
+      const response: SqlMonitorResponse | null = await SqlMonitor.execute(
+        sqlConfig,
+        {
+          retry: retryCount,
+          monitorId: monitorId,
+          timeout: requestTimeoutInMs,
+        },
+      );
+
+      if (!response) {
+        return null;
+      }
+
+      result.isOnline = response.isOnline;
+      result.isTimeout = response.isTimeout;
+      result.responseTimeInMs = response.responseTimeInMs;
+      result.failureCause = response.failureCause;
+      result.sqlQueryMonitorResponse = response;
+      result.probeAttempts = response.probeAttempts;
+      result.totalAttempts = response.totalAttempts;
+    }
+
+    if (monitorType === MonitorType.Database) {
+      if (!monitorStep.data?.databaseMonitor) {
+        result.failureCause = "Database monitor configuration not specified";
+        return result;
+      }
+
+      const databaseConfig: MonitorStepDatabaseMonitor =
+        monitorStep.data.databaseMonitor;
+
+      if (!databaseConfig.host) {
+        result.failureCause = "Database host not specified";
+        return result;
+      }
+
+      const response: DatabaseMonitorResponse | null =
+        await DatabaseMonitor.execute(databaseConfig, {
+          retry: retryCount,
+          monitorId: monitorId,
+          timeout: requestTimeoutInMs,
+        });
+
+      if (!response) {
+        return null;
+      }
+
+      result.isOnline = response.isOnline;
+      result.isTimeout = response.isTimeout;
+      result.responseTimeInMs = response.responseTimeInMs;
+      result.failureCause = response.failureCause;
+      result.databaseMonitorResponse = response;
+      result.probeAttempts = response.probeAttempts;
+      result.totalAttempts = response.totalAttempts;
+    }
+
+    if (monitorType === MonitorType.ExternalStatusPage) {
+      if (!monitorStep.data?.externalStatusPageMonitor) {
+        result.failureCause =
+          "External status page configuration not specified";
+        return result;
+      }
+
+      const externalStatusPageConfig: MonitorStepExternalStatusPageMonitor =
+        monitorStep.data.externalStatusPageMonitor;
+
+      if (!externalStatusPageConfig.statusPageUrl) {
+        result.failureCause = "Status page URL not specified";
+        return result;
+      }
+
+      const response: ExternalStatusPageMonitorResponse | null =
+        await ExternalStatusPageMonitorUtil.fetch(externalStatusPageConfig, {
+          retry: MonitorUtil.resolveRetryCount({
+            stepRetryCount: monitorStep.data.retryCount,
+            monitorConfigRetries: externalStatusPageConfig.retries,
+          }),
+          monitorId: monitorId,
+          timeout: MonitorUtil.resolveTimeoutInMs({
+            stepRequestTimeoutInMs: monitorStep.data.requestTimeoutInMs,
+            monitorConfigTimeoutInMs: externalStatusPageConfig.timeout,
+            defaultTimeoutInMs: 10000,
+          }),
+        });
+
+      if (!response) {
+        return null;
+      }
+
+      result.isOnline = response.isOnline;
+      result.isTimeout = response.isTimeout;
+      result.responseTimeInMs = response.responseTimeInMs;
+      result.failureCause = response.failureCause;
+      result.externalStatusPageResponse = response;
+      result.probeAttempts = response.probeAttempts;
+      result.totalAttempts = response.totalAttempts;
+    }
+
+    // update the monitoredAt time to the current time.
+    result.monitoredAt = OneUptimeDate.getCurrentDate();
+
+    return result;
+  }
+}

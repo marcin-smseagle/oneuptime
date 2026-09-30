@@ -1,0 +1,69 @@
+# IP Monitor
+
+IP-monitoring stelt u in staat de beschikbaarheid en reactiesnelheid van elk IPv4- of IPv6-adres te bewaken. OneUptime test periodiek de connectiviteit naar het doel-IP-adres en rapporteert de status ervan.
+
+## Overzicht
+
+IP-monitors verifiëren dat een specifiek IP-adres bereikbaar en responsief is. Hiermee kunt u:
+
+- Beschikbaarheid van IPv4- en IPv6-adressen bewaken
+- Responstijden en latentie bijhouden
+- Netwerkconnectiviteitsproblemen detecteren
+- Verifiëren dat infrastructuur-eindpunten bereikbaar zijn
+
+## Een IP Monitor aanmaken
+
+1. Ga naar **Monitoren** in het OneUptime-dashboard
+2. Klik op **Monitor maken**
+3. Selecteer **IP** als het monitortype
+4. Voer het IP-adres in dat u wilt bewaken
+5. Configureer monitoringcriteria naar wens
+
+## Configuratie-opties
+
+### IP-adres
+
+Voer het IPv4- of IPv6-adres in dat u wilt bewaken (bijv. `192.168.1.1` of `2001:db8::1`). De waarde moet een geldig IP-adresformaat zijn.
+
+## Monitoringcriteria
+
+U kunt criteria configureren om te bepalen wanneer uw IP-adres als online, gedegradeerd of offline wordt beschouwd op basis van:
+
+### Beschikbare controletypen
+
+| Controletype         | Beschrijving                                                      |
+| -------------------- | ----------------------------------------------------------------- |
+| Is online            | Of het IP-adres bereikbaar is                                     |
+| Responstijd (in ms)  | Responstijd in milliseconden                                      |
+| Pakketverlies (in %) | Percentage ICMP echo-verzoeken zonder antwoord                    |
+| Jitter (in ms)       | Standaarddeviatie van de retourtijden over de verzonden pakketten |
+| Is verzoek time-out  | Of het verzoek een time-out heeft                                 |
+
+### Filtertypen
+
+Voor **Is online** en **Is verzoek time-out**:
+
+- **True** — Voorwaarde is waar
+- **False** — Voorwaarde is onwaar
+
+Voor **Responstijd**, **Pakketverlies** en **Jitter**:
+
+- **Groter dan** — Responstijd overschrijdt een drempelwaarde
+- **Kleiner dan** — Responstijd is onder een drempelwaarde
+- **Groter dan of gelijk aan** — Responstijd is op of boven een drempelwaarde
+- **Kleiner dan of gelijk aan** — Responstijd is op of onder een drempelwaarde
+
+**Dit criterium over een periode evalueren** is een selectievakje op het criteriaformulier, geen filtervoorwaarde. Zet het aan om een aggregatie — gekozen onder **Evalueren** (Gemiddelde, Som, Maximum, Minimum, Alle waarden, Elke waarde) over het venster dat is ingesteld bij **Voor de laatste (in minuten)** — te vergelijken in plaats van de waarde van de laatste controle.
+
+### Voorbeeldcriteria
+
+#### Als offline markeren als IP onbereikbaar is
+
+- **Controleer op**: Is online
+- **Filtertype**: False
+
+#### Melding als latentie 100 ms overschrijdt
+
+- **Controleer op**: Responstijd (in ms)
+- **Filtertype**: Groter dan
+- **Waarde**: 100

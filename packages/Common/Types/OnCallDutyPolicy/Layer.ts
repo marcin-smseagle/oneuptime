@@ -1,0 +1,1952 @@
+import UserModel from "../../Models/DatabaseModels/User";
+import CalendarEvent from "../Calendar/CalendarEvent";
+import OneUptimeDate from "../Date";
+import EventInterval from "../Events/EventInterval";
+import Recurring from "../Events/Recurring";
+import StartAndEndTime from "../Time/StartAndEndTime";
+import Typeof from "../Typeof";
+import RestrictionTimes, {
+  RestrictionType,
+  WeeklyResctriction,
+} from "./RestrictionTimes";
+
+export interface LayerProps {
+  users: Array<UserModel>;
+  startDateTimeOfLayer: Date;
+  restrictionTimes: RestrictionTimes;
+  handOffTime: Date;
+  rotation: Recurring;
+  /*
+   * IANA timezone (e.g. "America/New_York") the schedule's wall-clock
+   * restriction/handoff times are authored in. When omitted (existing
+   * schedules), restriction windows are reconstructed in the server's local
+   * time exactly as before — fully backward compatible.
+   */
+  timezone?: string | undefined;
+  /*
+   * Identity of the layer these props were built from. Optional and purely
+   * informational: the engine never reads them, it only stamps them onto every
+   * event it emits for this layer (see PriorityCalendarEvents) so consumers
+   * that render or group by layer — the on-call calendar feed — can tell which
+   * layer a merged segment came from without re-deriving it from priority.
+   */
+  layerId?: string;
+  layerName?: string;
+}
+
+export interface EventProps extends LayerProps {
+  calendarStartDate: Date;
+  calendarEndDate: Date;
+}
+
+export interface MultiLayerProps {
+  layers: Array<LayerProps>;
+  calendarStartDate: Date;
+  calendarEndDate: Date;
+}
+
+/*
+ * Key stamped on every event getEvents emits, holding the epoch milliseconds
+ * of the TRUE (un-clamped) start of the rotation period the event belongs to.
+ *
+ * Two consecutive rotation periods held by the SAME user (a single-user layer,
+ * or any rotation where one person holds two turns in a row) are otherwise
+ * indistinguishable once expanded: the engine's 1 s seam makes them contiguous
+ * and every other property matches, so a consumer that groups contiguous
+ * same-user segments folds them into one block whose start and end depend on
+ * how far the expansion window reached — an unstable identity for anything
+ * that must be the same object across two different windows (the calendar
+ * feed's UID/DTSTART). The period start is window-independent, so grouping on
+ * it keeps one shift per rotation turn.
+ *
+ * Read it through ScheduleShiftUtil.getEventRotationPeriodStart, which
+ * tolerates events that never carried it (hand-built fixtures, JSON round
+ * trips) rather than reaching into the index signature here.
+ */
+export const ROTATION_PERIOD_START_KEY: string = "rotationPeriodStartsAt";
+
+export interface PriorityCalendarEvents extends CalendarEvent {
+  priority: number;
+  /*
+   * Copied from LayerProps.layerId / layerName when the caller supplied them.
+   * Absent (not undefined) otherwise, so callers that never set them see
+   * exactly the events they always did.
+   */
+  layerId?: string;
+  layerName?: string;
+}
+
+export interface LayerExpansionOptions {
+  getNumberOfEvents?: number;
+  /*
+   * Upper bound on the number of rotation periods the engine will step
+   * through for ONE layer, both while locating the rotation position at the
+   * window start (the per-period simulation restricted layers need) and while
+   * expanding periods inside the window. Defaults to the engine's own caps
+   * (5,000,000 / 1,000,000), so omitting it changes nothing. When the bound is
+   * hit the expansion stops and the result is flagged `truncated`: a
+   * pre-window hit contributes NO events for that layer (its rotation
+   * position is unknown, and emitting the wrong person is worse than emitting
+   * nobody), an in-window hit keeps the events produced so far.
+   */
+  maxSimulationIterations?: number;
+}
+
+export interface LayerEventsResult {
+  events: Array<CalendarEvent>;
+  /*
+   * True when any expansion stopped at maxSimulationIterations (or the
+   * engine's own ceiling) before reaching the end of the window, i.e. the
+   * events may be incomplete.
+   */
+  truncated: boolean;
+}
+
+export default class LayerUtil {
+  /*
+   * The timezone of the layer currently being expanded. Set at the start of
+   * getEvents and read by the restriction-trimming helpers so wall-clock
+   * restriction windows resolve in the schedule's zone. undefined => local
+   * time (legacy behavior). getEvents runs synchronously, so this per-call
+   * field is not subject to interleaving.
+   */
+  private timezone: string | undefined = undefined;
+
+  public getEvents(
+    data: EventProps,
+    options?: LayerExpansionOptions | undefined,
+  ): Array<CalendarEvent> {
+    return this.getEventsWithMeta(data, options).events;
+  }
+
+  /*
+   * Same expansion as getEvents, plus a `truncated` flag telling the caller
+   * whether an iteration cap cut the expansion short. getEvents discards the
+   * flag so its existing callers are untouched.
+   */
+  public getEventsWithMeta(
+    data: EventProps,
+    options?: LayerExpansionOptions | undefined,
+  ): LayerEventsResult {
+    let events: Array<CalendarEvent> = [];
+
+    if (!this.isDataValid(data)) {
+      return { events: [], truncated: false };
+    }
+
+    data = this.sanitizeData(data);
+
+    this.timezone = data.timezone;
+
+    let start: Date = data.calendarStartDate;
+    const end: Date = data.calendarEndDate;
+
+    // start time of the layer is after the start time of the calendar, so we need to update the start time of the calendar
+    if (OneUptimeDate.isAfter(data.startDateTimeOfLayer, start)) {
+      start = data.startDateTimeOfLayer;
+    }
+
+    // split events by rotation.
+
+    const rotation: Recurring = data.rotation;
+
+    let hasReachedTheEndOfTheCalendar: boolean = false;
+
+    let handOffTime: Date = data.handOffTime;
+
+    if (!handOffTime) {
+      return { events: [], truncated: false };
+    }
+
+    const maxSimulationIterations: number | undefined =
+      options?.maxSimulationIterations !== undefined &&
+      Number.isFinite(options.maxSimulationIterations) &&
+      options.maxSimulationIterations > 0
+        ? Math.floor(options.maxSimulationIterations)
+        : undefined;
+
+    // Looop vars
+    let currentUserIndex: number = 0;
+    let currentEventStartTime: Date = start;
+
+    // bring handoff time to the same day as the currentStartTime.
+
+    // before we do this, we need to update the user index.
+
+    const currentUserResolution: {
+      currentUserIndex: number;
+      currentPeriodStart: Date;
+      truncated: boolean;
+    } = this.getCurrentUserIndexBasedOnHandoffTime({
+      rotation,
+      handOffTime,
+      currentUserIndex,
+      startDateTimeOfLayer: data.startDateTimeOfLayer,
+      users: data.users,
+      currentEventStartTime,
+      restrictionTimes: data.restrictionTimes,
+      maxSimulationIterations,
+    });
+
+    /*
+     * The pre-window simulation gave up before reaching the window start, so
+     * the rotation position is unknown. Emit nothing for this layer rather
+     * than shifts attributed to the wrong person, and tell the caller.
+     */
+    if (currentUserResolution.truncated) {
+      return { events: [], truncated: true };
+    }
+
+    currentUserIndex = currentUserResolution.currentUserIndex;
+
+    /*
+     * True (un-clamped) start of the first rotation period we are about to
+     * expand. When the calendar window starts partway through a period (the
+     * live "who is on call now" path always starts its window at the current
+     * instant), currentEventStartTime is clamped to that instant. The advance
+     * guard in the loop below uses this to decide whether the first period
+     * consumed a rotation turn based on its FULL-span coverage (audit F2).
+     */
+    const firstPeriodTrueStart: Date = currentUserResolution.currentPeriodStart;
+
+    // update handoff time to the same day as current start time
+
+    handOffTime = this.moveHandsOffTimeAfterCurrentEventStartTime({
+      handOffTime,
+      currentEventStartTime,
+      rotation: data.rotation,
+    });
+
+    let currentEventEndTime: Date = OneUptimeDate.getCurrentDate(); // temporary set to current time to avoid typescript error
+
+    // check if calendar end is before the handoff time. if it is, then we need to return the event with the current user index as no handoff is needed.
+
+    if (OneUptimeDate.isBefore(end, handOffTime)) {
+      const trimmedStartAndEndTimes: Array<StartAndEndTime> =
+        this.trimStartAndEndTimesBasedOnRestrictionTimes({
+          eventStartTime: currentEventStartTime,
+          eventEndTime: end,
+          restrictionTimes: data.restrictionTimes,
+        });
+
+      events = [
+        ...events,
+        ...this.getCalendarEventsFromStartAndEndDates(
+          trimmedStartAndEndTimes,
+          data.users,
+          currentUserIndex,
+          firstPeriodTrueStart,
+        ),
+      ];
+
+      return { events, truncated: false };
+    }
+
+    /*
+     * Bound the loop by the actual calendar window instead of a fixed count.
+     * Each iteration advances currentEventStartTime by at least one rotation
+     * period (fully-restricted periods produce no event but still advance the
+     * handoff), so at most ~windowUnits/periodUnits periods can fall inside
+     * [start, end]. A fixed cap of 100 silently truncated long windows for short
+     * rotations (audit F1) and could even return ZERO events — the schedule
+     * reporting nobody on-call and no next user — when "now" sat in a restriction
+     * gap longer than 100 periods (audit F8, e.g. an hourly rotation with a
+     * weekend-only restriction). Scale the cap to the window with a generous
+     * margin, keeping a hard ceiling to bound pathological inputs.
+     */
+    const rawRotationCount: number = rotation.intervalCount.toNumber();
+    const periodUnitsForBound: number =
+      Number.isFinite(rawRotationCount) && rawRotationCount >= 1
+        ? Math.floor(rawRotationCount)
+        : 1;
+    const windowUnits: number = this.getUnitsBetweenDates(
+      start,
+      end,
+      rotation.intervalType,
+    );
+    const maxLoopCount: number = Math.min(
+      maxSimulationIterations ?? 1000000,
+      1000000,
+      Math.max(100, Math.ceil(windowUnits / periodUnitsForBound) + 10),
+    );
+    let loopCount: number = 0;
+    let truncated: boolean = false;
+
+    /*
+     * The first loop iteration expands the rotation period that CONTAINS the
+     * window start; its currentEventStartTime may be clamped to the window
+     * start (now) rather than the true period start. Tracked so the rotation
+     * advance can be decided against the period's full span (audit F2).
+     */
+    let isFirstPeriod: boolean = true;
+
+    while (!hasReachedTheEndOfTheCalendar) {
+      loopCount++;
+      if (loopCount > maxLoopCount) {
+        truncated = true;
+        break;
+      }
+      currentEventEndTime = handOffTime;
+
+      // The rotation boundary that ends this period, before any clamp to `end`.
+      const periodBoundaryEnd: Date = handOffTime;
+
+      // if current event start time and end time is the same then increase current event start time by 1 second.
+
+      if (OneUptimeDate.isSame(currentEventStartTime, currentEventEndTime)) {
+        currentEventStartTime = OneUptimeDate.addRemoveSeconds(
+          currentEventEndTime,
+          1,
+        );
+        handOffTime = this.moveHandsOffTimeAfterCurrentEventStartTime({
+          handOffTime,
+          currentEventStartTime,
+          rotation: data.rotation,
+        });
+
+        continue;
+      }
+
+      // check calendar end time. if the end time of the event is after the end time of the calendar, we need to update the end time of the event
+      if (OneUptimeDate.isAfter(currentEventEndTime, end)) {
+        currentEventEndTime = end;
+        hasReachedTheEndOfTheCalendar = true;
+      }
+
+      /*
+       * When the window end lands exactly on a handoff, the previous period
+       * already ended at `end` and this period starts 1 s after it, so the
+       * clamp above leaves an inverted [end + 1s, end] slice. Emitting it
+       * handed direct getEvents callers (the layer shift preview, the calendar
+       * feed coverage envelope) a negative-length event for the next user.
+       * It is the final period, so stopping here changes nothing else.
+       */
+      if (OneUptimeDate.isAfter(currentEventStartTime, currentEventEndTime)) {
+        break;
+      }
+
+      // check restriction times. if the end time of the event is after the end time of the restriction times, we need to update the end time of the event.
+
+      const trimmedStartAndEndTimes: Array<StartAndEndTime> =
+        this.trimStartAndEndTimesBasedOnRestrictionTimes({
+          eventStartTime: currentEventStartTime,
+          eventEndTime: currentEventEndTime,
+          restrictionTimes: data.restrictionTimes,
+        });
+
+      /*
+       * push() instead of rebuilding the array with [...events, ...new] every
+       * iteration. The spread reallocated and copied the whole accumulated array
+       * each period — O(n^2) over the loop — which, combined with a window sized
+       * to a slow layer, made a fast (e.g. hourly) layer's expansion quadratic
+       * (audit H2). Each period contributes only a handful of segments, so the
+       * spread of the small per-period array as push args is safe.
+       */
+      events.push(
+        ...this.getCalendarEventsFromStartAndEndDates(
+          trimmedStartAndEndTimes,
+          data.users,
+          currentUserIndex,
+          /*
+           * The first iteration expands the period that CONTAINS the window
+           * start, whose currentEventStartTime may be clamped to it; stamp the
+           * period's TRUE start so the identity does not move with the window.
+           */
+          isFirstPeriod ? firstPeriodTrueStart : currentEventStartTime,
+        ),
+      );
+
+      if (options?.getNumberOfEvents !== undefined) {
+        if (events.length >= options.getNumberOfEvents) {
+          return { events, truncated: false };
+        }
+      }
+
+      // update the current event start time
+
+      currentEventStartTime = OneUptimeDate.addRemoveSeconds(
+        currentEventEndTime,
+        1,
+      );
+
+      // update the handoff time
+
+      handOffTime = this.moveHandsOffTimeAfterCurrentEventStartTime({
+        handOffTime,
+        currentEventStartTime,
+        rotation: data.rotation,
+      });
+
+      /*
+       * Only advance the rotation if this rotation period actually produced
+       * coverage. Otherwise the user "lost" their turn to a fully restricted
+       * window (e.g. a weekend with Mon-Fri restrictions), which would skip
+       * rotations and break ordering across the gap. See issue #2413.
+       */
+      let periodProducedCoverage: boolean = trimmedStartAndEndTimes.length > 0;
+
+      /*
+       * First-period correction (audit F2): when the window starts partway
+       * through the current period AND begins after that period's restriction
+       * window has already closed (the live roster refresh resolving in a
+       * daily/weekend off-hours gap), the clamped [now, periodEnd] slice trims
+       * to nothing even though the period DID have coverage earlier. Deciding
+       * the advance on that empty clamped slice carried the current user into
+       * the next period, so every subsequent shift resolved one user off from
+       * the calendar/full expansion — paging/notifying the wrong "next" user.
+       * Re-evaluate the advance against the period's FULL span so a
+       * partially-elapsed period still consumes its rotation turn, while a
+       * genuinely fully-restricted period (full-span trim also empty) still
+       * correctly skips its turn and preserves the #2413 behavior.
+       */
+      if (
+        isFirstPeriod &&
+        !periodProducedCoverage &&
+        data.restrictionTimes &&
+        data.restrictionTimes.restictionType !== RestrictionType.None
+      ) {
+        const fullSpanTrim: Array<StartAndEndTime> =
+          this.trimStartAndEndTimesBasedOnRestrictionTimes({
+            eventStartTime: firstPeriodTrueStart,
+            eventEndTime: periodBoundaryEnd,
+            restrictionTimes: data.restrictionTimes,
+          });
+        periodProducedCoverage = fullSpanTrim.length > 0;
+      }
+
+      if (periodProducedCoverage) {
+        currentUserIndex = this.incrementUserIndex(
+          currentUserIndex,
+          data.users.length,
+        );
+      }
+
+      isFirstPeriod = false;
+    }
+
+    // increment ids of all the events and return them, to make sure they are unique
+
+    let id: number = 1;
+
+    for (const event of events) {
+      event.id = id;
+      id++;
+    }
+
+    if (options?.getNumberOfEvents !== undefined) {
+      if (events.length > options.getNumberOfEvents) {
+        events = events.slice(0, options.getNumberOfEvents);
+      }
+    }
+
+    return { events, truncated };
+  }
+
+  private sanitizeData(data: EventProps): EventProps {
+    if (!(data.restrictionTimes instanceof RestrictionTimes)) {
+      data.restrictionTimes = RestrictionTimes.fromJSON(data.restrictionTimes);
+    }
+
+    if (!(data.rotation instanceof Recurring)) {
+      data.rotation = Recurring.fromJSON(data.rotation);
+    }
+
+    if (typeof data.startDateTimeOfLayer === Typeof.String) {
+      data.startDateTimeOfLayer = OneUptimeDate.fromString(
+        data.startDateTimeOfLayer,
+      );
+    }
+
+    if (typeof data.calendarStartDate === Typeof.String) {
+      data.calendarStartDate = OneUptimeDate.fromString(data.calendarStartDate);
+    }
+
+    if (typeof data.calendarEndDate === Typeof.String) {
+      data.calendarEndDate = OneUptimeDate.fromString(data.calendarEndDate);
+    }
+
+    if (typeof data.handOffTime === Typeof.String) {
+      data.handOffTime = OneUptimeDate.fromString(data.handOffTime);
+    }
+
+    return data;
+  }
+
+  private isDataValid(data: EventProps): boolean {
+    // if calendar end time is before the start time then return an empty array.
+    if (OneUptimeDate.isBefore(data.calendarEndDate, data.calendarStartDate)) {
+      return false;
+    }
+
+    // end time of the layer is before the end time of the calendar, so, we dont have any events and we can return empty array
+    if (
+      OneUptimeDate.isAfter(data.startDateTimeOfLayer, data.calendarEndDate)
+    ) {
+      return false;
+    }
+
+    // if users are empty, we dont have any events and we can return empty array
+    if (data.users.length === 0) {
+      return false;
+    }
+
+    return true;
+  }
+
+  private moveHandsOffTimeAfterCurrentEventStartTime(data: {
+    handOffTime: Date;
+    currentEventStartTime: Date;
+    rotation: Recurring;
+  }): Date {
+    // if handoff time is ahead of the current event start time, then we dont need to move and we can return it as is.
+
+    if (OneUptimeDate.isAfter(data.handOffTime, data.currentEventStartTime)) {
+      return data.handOffTime;
+    }
+
+    const rawRotationInterval: number = data.rotation.intervalCount.toNumber();
+    /*
+     * Defensive clamp: an invalid interval count (0, NaN, negative) would make
+     * the alignment below produce an Invalid Date and spin the main getEvents
+     * loop. Treat any invalid value as a single unit.
+     */
+    const rotationInterval: number =
+      Number.isFinite(rawRotationInterval) && rawRotationInterval >= 1
+        ? Math.floor(rawRotationInterval)
+        : 1;
+
+    const intervalType: EventInterval = data.rotation.intervalType;
+
+    /*
+     * Rotation boundaries are exactly handOffTime + k * rotationInterval units
+     * (k a non-negative integer). Return the SMALLEST such boundary that is
+     * strictly after currentEventStartTime.
+     *
+     * We start from the floor of the whole-period distance and step UP one full
+     * rotation period at a time until strictly after the target. This:
+     *   - stays on the interval grid (multiples of rotationInterval), so
+     *     intervalCount >= 2 rotations never drift onto an off-grid boundary
+     *     (audit HIGH-1); and
+     *   - never OVERSHOOTS by a whole period. The previous
+     *     ceil(getUnitsInclusive / interval) * interval formula used an
+     *     INCLUSIVE unit count, which overshot by a full period for positions in
+     *     the last partial period before a boundary — and a DST offset shift
+     *     could push the inclusive count across an even/odd threshold — yielding
+     *     a first period that spanned two rotations and resolved the wrong
+     *     current/next on-call user for intervalCount >= 2 rotations.
+     * addRotationUnits carries the timezone per interval type (wall-clock across
+     * DST for Day/Week/Month/Year; absolute for Hour), matching the main loop.
+     */
+    const unitsBetween: number = this.getUnitsBetweenDates(
+      data.handOffTime,
+      data.currentEventStartTime,
+      intervalType,
+    );
+
+    let periods: number = Math.floor(unitsBetween / rotationInterval);
+    if (!Number.isFinite(periods) || periods < 0) {
+      periods = 0;
+    }
+
+    /*
+     * Compute the boundary `periods` rotation periods after the anchor. For
+     * Month/Year this ITERATES one period at a time (see addRotationPeriods),
+     * because moment end-of-month-clamps a single multiplied add differently
+     * than stepping period-by-period — e.g. Jan-31 + 11 months multiplied =
+     * Dec-31, but eleven iterated +1-month steps = Dec-28. countElapsedRotation
+     * Periods and the main getEvents loop both walk the ITERATED grid, so a
+     * multiplied step here produced handoff boundaries off that grid and paged
+     * the wrong on-call user for Month/Year rotations anchored on day 29-31 (or
+     * Feb-29 for Year) — audit H1.
+     */
+    let handOffTime: Date = this.addRotationPeriods(
+      data.handOffTime,
+      periods,
+      rotationInterval,
+      intervalType,
+    );
+
+    let safety: number = 0;
+    while (
+      OneUptimeDate.isOnOrBefore(handOffTime, data.currentEventStartTime) &&
+      safety < 1000000
+    ) {
+      periods++;
+      /*
+       * Step exactly ONE rotation period from the PREVIOUS boundary (not a fresh
+       * multiplied add from the anchor), so Month/Year stay on the same iterated,
+       * calendar-clamped grid as the initial jump above.
+       */
+      handOffTime = this.addRotationUnits(
+        handOffTime,
+        rotationInterval,
+        intervalType,
+      );
+      safety++;
+    }
+
+    return handOffTime;
+  }
+
+  /*
+   * Advance `anchor` by `numberOfPeriods` rotation periods (each period =
+   * rotationInterval units of intervalType). Hour/Day/Week have no calendar-
+   * length clamping, so a single multiplied add is exact and O(1). Month/Year
+   * DO clamp (moment: Jan-31 + 1mo = Feb-28, then Feb-28 + 1mo = Mar-28), so a
+   * multiplied add does NOT equal iterating; we step one period at a time to
+   * stay on the same grid the rest of the engine walks (audit H1). The period
+   * count for Month/Year is small even over decades, so iterating is cheap.
+   */
+  private addRotationPeriods(
+    anchor: Date,
+    numberOfPeriods: number,
+    rotationInterval: number,
+    intervalType: EventInterval,
+  ): Date {
+    if (numberOfPeriods <= 0) {
+      return anchor;
+    }
+
+    if (
+      intervalType === EventInterval.Month ||
+      intervalType === EventInterval.Year
+    ) {
+      let result: Date = anchor;
+      let safety: number = 0;
+      while (safety < numberOfPeriods && safety < 1000000) {
+        result = this.addRotationUnits(result, rotationInterval, intervalType);
+        safety++;
+      }
+      return result;
+    }
+
+    return this.addRotationUnits(
+      anchor,
+      numberOfPeriods * rotationInterval,
+      intervalType,
+    );
+  }
+
+  private getCurrentUserIndexBasedOnHandoffTime(data: {
+    rotation: Recurring;
+    handOffTime: Date;
+    currentUserIndex: number;
+    startDateTimeOfLayer: Date;
+    users: Array<UserModel>;
+    currentEventStartTime: Date;
+    restrictionTimes: RestrictionTimes;
+    maxSimulationIterations?: number | undefined;
+  }): {
+    currentUserIndex: number;
+    currentPeriodStart: Date;
+    truncated: boolean;
+  } {
+    /*
+     * Returns both the on-call user index for the rotation period that CONTAINS
+     * currentEventStartTime AND the true (un-clamped) start of that period.
+     * getEvents needs the true period start so it can decide, for the first
+     * (possibly clamped) period, whether that period consumed a rotation turn
+     * based on its FULL-span restriction coverage rather than the coverage in
+     * the clamped [now, periodEnd] slice (see the first-period advance guard in
+     * getEvents — audit F2).
+     */
+    let currentUserIndex: number = data.currentUserIndex;
+
+    // if current event start time is before layer start, idx unchanged.
+    if (
+      OneUptimeDate.isBefore(
+        data.currentEventStartTime,
+        data.startDateTimeOfLayer,
+      )
+    ) {
+      return {
+        currentUserIndex,
+        currentPeriodStart: data.currentEventStartTime,
+        truncated: false,
+      };
+    }
+
+    // if handoff is after current start, no rotation has occurred yet — idx unchanged.
+    if (OneUptimeDate.isAfter(data.handOffTime, data.currentEventStartTime)) {
+      /*
+       * No handoff has happened yet, so we are still inside the very first
+       * rotation period, which starts at the layer start.
+       */
+      return {
+        currentUserIndex,
+        currentPeriodStart: data.startDateTimeOfLayer,
+        truncated: false,
+      };
+    }
+
+    /*
+     * Fast path: with no restriction, every rotation period produces exactly
+     * one event, so the current user index is simply the initial index plus the
+     * number of whole rotation periods elapsed since the first handoff. We
+     * compute this analytically in O(1) instead of simulating one iteration per
+     * period. The simulation below capped at 10000 iterations and returned the
+     * WRONG user for long-lived schedules (e.g. an hourly rotation older than
+     * ~14 months). Restricted layers still use the period-by-period simulation
+     * because fully-restricted periods must not advance the rotation.
+     */
+    if (
+      data.restrictionTimes &&
+      data.restrictionTimes.restictionType === RestrictionType.None &&
+      data.users.length > 0
+    ) {
+      const firstBoundary: Date =
+        this.moveHandsOffTimeAfterCurrentEventStartTime({
+          handOffTime: data.handOffTime,
+          currentEventStartTime: data.startDateTimeOfLayer,
+          rotation: data.rotation,
+        });
+
+      const periodsElapsed: number = this.countElapsedRotationPeriods(
+        firstBoundary,
+        data.currentEventStartTime,
+        data.rotation,
+      );
+
+      const length: number = data.users.length;
+      /*
+       * Unrestricted layers never have coverage gaps, so getEvents never needs
+       * the full-span first-period fallback for them; currentPeriodStart is
+       * returned for interface symmetry only and is not read on this path.
+       */
+      return {
+        currentUserIndex:
+          (((currentUserIndex + periodsElapsed) % length) + length) % length,
+        currentPeriodStart: data.currentEventStartTime,
+        truncated: false,
+      };
+    }
+
+    /*
+     * Simulate rotation periods from layer start up to currentEventStartTime,
+     * only incrementing the user index when a period would have produced an
+     * event under the restriction. This mirrors the main loop in getEvents
+     * (see issue #2413) and keeps the rotation continuous across calendar
+     * windows that begin in the future (e.g. previewing next week).
+     */
+    let simulatedTime: Date = data.startDateTimeOfLayer;
+    let simulatedHandOff: Date =
+      this.moveHandsOffTimeAfterCurrentEventStartTime({
+        handOffTime: data.handOffTime,
+        currentEventStartTime: simulatedTime,
+        rotation: data.rotation,
+      });
+
+    /*
+     * Bound the simulation by the actual number of rotation periods between the
+     * layer start and the target, so the cap is always large enough to REACH the
+     * target for any realistic schedule age. A fixed 10000 cap (~14 months of
+     * hourly rotation) stopped early for long-lived sub-daily restricted
+     * schedules and returned the index at iteration 10000 instead of the index at
+     * "now" — paging the wrong current user (audit F9). We keep a very high
+     * ceiling to still bound pathological inputs. Restricted periods must be
+     * simulated one at a time (they must not advance the rotation), so this stays
+     * O(elapsed periods); for realistic ages that is small.
+     */
+    const rawSimCount: number = data.rotation.intervalCount.toNumber();
+    const simPeriodUnits: number =
+      Number.isFinite(rawSimCount) && rawSimCount >= 1
+        ? Math.floor(rawSimCount)
+        : 1;
+    const simUnitsBetween: number = this.getUnitsBetweenDates(
+      data.startDateTimeOfLayer,
+      data.currentEventStartTime,
+      data.rotation.intervalType,
+    );
+    const maxIterations: number = Math.min(
+      data.maxSimulationIterations ?? 5000000,
+      5000000,
+      Math.max(10000, Math.ceil(simUnitsBetween / simPeriodUnits) + 10),
+    );
+    let iterations: number = 0;
+    let truncated: boolean = false;
+
+    while (OneUptimeDate.isBefore(simulatedTime, data.currentEventStartTime)) {
+      /*
+       * Cap hit before the target was reached: the rotation position for the
+       * window is unknown. Report it instead of silently returning the index
+       * at the cap (audit F9 explains why that is the wrong on-call person).
+       */
+      if (iterations >= maxIterations) {
+        truncated = true;
+        break;
+      }
+      iterations++;
+
+      const eventEnd: Date = simulatedHandOff;
+
+      // Stop once the rotation period would extend past the target.
+      if (OneUptimeDate.isAfter(eventEnd, data.currentEventStartTime)) {
+        break;
+      }
+
+      const trimmed: Array<StartAndEndTime> =
+        this.trimStartAndEndTimesBasedOnRestrictionTimes({
+          eventStartTime: simulatedTime,
+          eventEndTime: eventEnd,
+          restrictionTimes: data.restrictionTimes,
+        });
+
+      if (trimmed.length > 0) {
+        currentUserIndex = this.incrementUserIndex(
+          currentUserIndex,
+          data.users.length,
+        );
+      }
+
+      simulatedTime = OneUptimeDate.addRemoveSeconds(eventEnd, 1);
+      simulatedHandOff = this.moveHandsOffTimeAfterCurrentEventStartTime({
+        handOffTime: simulatedHandOff,
+        currentEventStartTime: simulatedTime,
+        rotation: data.rotation,
+      });
+    }
+
+    /*
+     * simulatedTime is now the true (un-clamped) start of the rotation period
+     * that contains data.currentEventStartTime — the loop advances it to the
+     * next period start each covered iteration and breaks once a period would
+     * extend past the target, so it holds the current period's real start.
+     */
+    return { currentUserIndex, currentPeriodStart: simulatedTime, truncated };
+  }
+
+  /*
+   * Count the number of rotation boundaries that fall on-or-before `target`,
+   * starting from `firstBoundary` and stepping by one rotation period. This is
+   * the number of whole rotation periods elapsed, used for the O(1) unrestricted
+   * current-user computation. Uses calendar-aware unit stepping so it stays
+   * correct for Month/Year (variable length) and across DST for Day/Week.
+   */
+  private countElapsedRotationPeriods(
+    firstBoundary: Date,
+    target: Date,
+    rotation: Recurring,
+  ): number {
+    if (OneUptimeDate.isAfter(firstBoundary, target)) {
+      return 0;
+    }
+
+    const intervalType: EventInterval = rotation.intervalType;
+    const rawCount: number = rotation.intervalCount.toNumber();
+    const periodUnits: number =
+      Number.isFinite(rawCount) && rawCount >= 1 ? Math.floor(rawCount) : 1;
+
+    /*
+     * Month and Year have variable calendar length (moment clamps end-of-month:
+     * Jan 31 + 1mo = Feb 29, and Feb 29 + 1mo = Mar 29). Because of that,
+     * boundary_k computed as a SINGLE multiplied step (anchor + k*units) does
+     * NOT equal advancing one period at a time — which is exactly how the real
+     * rotation in getEvents (via moveHandsOffTimeAfterCurrentEventStartTime)
+     * steps. Using the multiplied form here under-counted elapsed periods by one
+     * at month-end anchors and paged the previous on-call user (audit F0). So we
+     * iterate one clamped period at a time for Month/Year. The boundary count
+     * stays small even over decades of monthly/yearly rotation, so this is cheap.
+     */
+    if (
+      intervalType === EventInterval.Month ||
+      intervalType === EventInterval.Year
+    ) {
+      let periods: number = 0;
+      let boundary: Date = firstBoundary;
+      let safety: number = 0;
+      while (OneUptimeDate.isOnOrBefore(boundary, target) && safety < 100000) {
+        periods++;
+        // step from the PREVIOUS boundary, mirroring the main-loop rotation.
+        boundary = this.addRotationUnits(boundary, periodUnits, intervalType);
+        safety++;
+      }
+      return periods;
+    }
+
+    /*
+     * Hour/Day/Week have no calendar-length clamping, so the O(1) analytic count
+     * (a multiplied step) is exact and equals iterating.
+     */
+    const unitsBetween: number = this.getUnitsBetweenDates(
+      firstBoundary,
+      target,
+      intervalType,
+    );
+
+    let periods: number = Math.floor(unitsBetween / periodUnits);
+    if (periods < 0) {
+      periods = 0;
+    }
+
+    /*
+     * `periods` is a lower bound (unit diffs truncate toward zero). Advance
+     * until firstBoundary + periods*periodUnits is strictly after target; the
+     * resulting count equals the number of boundaries on-or-before target.
+     */
+    let safety: number = 0;
+    while (
+      OneUptimeDate.isOnOrBefore(
+        this.addRotationUnits(
+          firstBoundary,
+          periods * periodUnits,
+          intervalType,
+        ),
+        target,
+      ) &&
+      safety < 100000
+    ) {
+      periods++;
+      safety++;
+    }
+
+    return periods;
+  }
+
+  private addRotationUnits(
+    date: Date,
+    units: number,
+    intervalType: EventInterval,
+  ): Date {
+    /*
+     * Day/Week/Month/Year preserve schedule wall-clock across DST (consistent
+     * with moveHandsOffTimeAfterCurrentEventStartTime); Hour is absolute.
+     */
+    const tz: string | undefined = this.timezone;
+    switch (intervalType) {
+      case EventInterval.Hour:
+        return OneUptimeDate.addRemoveHours(date, units);
+      case EventInterval.Day:
+        return OneUptimeDate.addRemoveDays(date, units, tz);
+      case EventInterval.Week:
+        return OneUptimeDate.addRemoveWeeks(date, units, tz);
+      case EventInterval.Month:
+        return OneUptimeDate.addRemoveMonths(date, units, tz);
+      case EventInterval.Year:
+        return OneUptimeDate.addRemoveYears(date, units, tz);
+      default:
+        return OneUptimeDate.addRemoveDays(date, units, tz);
+    }
+  }
+
+  private getUnitsBetweenDates(
+    from: Date,
+    to: Date,
+    intervalType: EventInterval,
+  ): number {
+    switch (intervalType) {
+      case EventInterval.Hour:
+        return OneUptimeDate.getHoursBetweenTwoDates(from, to);
+      case EventInterval.Day:
+        return OneUptimeDate.getDaysBetweenTwoDates(from, to);
+      case EventInterval.Week:
+        return OneUptimeDate.getWeeksBetweenTwoDates(from, to);
+      case EventInterval.Month:
+        return OneUptimeDate.getMonthsBetweenTwoDates(from, to);
+      case EventInterval.Year:
+        return OneUptimeDate.getYearsBetweenTwoDates(from, to);
+      default:
+        return OneUptimeDate.getDaysBetweenTwoDates(from, to);
+    }
+  }
+
+  public trimStartAndEndTimesBasedOnRestrictionTimes(data: {
+    eventStartTime: Date;
+    eventEndTime: Date;
+    restrictionTimes: RestrictionTimes;
+  }): Array<StartAndEndTime> {
+    const restrictionTimes: RestrictionTimes = data.restrictionTimes;
+
+    if (restrictionTimes.restictionType === RestrictionType.None) {
+      return [
+        {
+          startTime: data.eventStartTime,
+          endTime: data.eventEndTime,
+        },
+      ];
+    }
+
+    if (
+      restrictionTimes.restictionType === RestrictionType.Daily &&
+      restrictionTimes.dayRestrictionTimes
+    ) {
+      /*
+       * Move the restriction window to the event's day WITHOUT mutating the
+       * shared RestrictionTimes object. The previous code wrote the moved
+       * start/end back into restrictionTimes.dayRestrictionTimes, corrupting the
+       * caller's object across events/layers/calls and making resolution
+       * order-dependent (a hygiene defect flagged in the audit). keepTimeButMoveDay
+       * preserves the time-of-day regardless of the base day, so working on a
+       * local copy produces identical windows with no shared-state side effects.
+       */
+      const movedDayRestriction: StartAndEndTime = {
+        startTime: OneUptimeDate.keepTimeButMoveDay(
+          restrictionTimes.dayRestrictionTimes.startTime,
+          data.eventStartTime,
+          this.timezone,
+        ),
+        endTime: OneUptimeDate.keepTimeButMoveDay(
+          restrictionTimes.dayRestrictionTimes.endTime,
+          data.eventStartTime,
+          this.timezone,
+        ),
+      };
+
+      return this.getEventsByDailyRestriction({
+        eventStartTime: data.eventStartTime,
+        eventEndTime: data.eventEndTime,
+        restrictionStartAndEndTime: movedDayRestriction,
+        props: {
+          intervalType: EventInterval.Day,
+        },
+      });
+    }
+
+    if (restrictionTimes.restictionType === RestrictionType.Weekly) {
+      return this.getEventsByWeeklyRestriction(data);
+    }
+
+    return [];
+  }
+
+  public getEventsByWeeklyRestriction(data: {
+    eventStartTime: Date;
+    eventEndTime: Date;
+    restrictionTimes: RestrictionTimes;
+  }): Array<StartAndEndTime> {
+    const weeklyRestrictionTimes: Array<WeeklyResctriction> =
+      data.restrictionTimes.weeklyRestrictionTimes;
+
+    // if there are no weekly restriction times, we dont have any restrictions and we can return the event start and end times
+
+    let trimmedStartAndEndTimes: Array<StartAndEndTime> = [];
+
+    if (!weeklyRestrictionTimes || weeklyRestrictionTimes.length === 0) {
+      return [
+        {
+          startTime: data.eventStartTime,
+          endTime: data.eventEndTime,
+        },
+      ];
+    }
+
+    const restrictionStartAndEndTimes: Array<StartAndEndTime> =
+      this.getWeeklyRestrictionTimesForWeek(data);
+
+    for (const restrictionStartAndEndTime of restrictionStartAndEndTimes) {
+      const trimmedStartAndEndTimesForRestriction: Array<StartAndEndTime> =
+        this.getEventsByDailyRestriction({
+          eventStartTime: data.eventStartTime,
+          eventEndTime: data.eventEndTime,
+          restrictionStartAndEndTime: restrictionStartAndEndTime,
+          props: {
+            intervalType: EventInterval.Week,
+          },
+        });
+
+      trimmedStartAndEndTimes = [
+        ...trimmedStartAndEndTimes,
+        ...trimmedStartAndEndTimesForRestriction,
+      ];
+    }
+
+    /*
+     * Collapse overlapping/touching segments. The wrap-around split in
+     * getWeeklyRestrictionTimesForWeek emits a head segment (early-week tail)
+     * plus a main segment, and getEventsByDailyRestriction tiles each weekly
+     * across the event window. For a rotation event spanning more than one ISO
+     * week, week k's main segment already covers the Sunday->Monday that week
+     * (k+1)'s head segment re-covers, producing duplicate/overlapping events for
+     * the same user (audit F3). Merging contiguous coverage is always safe here
+     * because every segment belongs to the same layer/user.
+     */
+    return this.mergeOverlappingStartAndEndTimes(trimmedStartAndEndTimes);
+  }
+
+  private mergeOverlappingStartAndEndTimes(
+    times: Array<StartAndEndTime>,
+  ): Array<StartAndEndTime> {
+    if (times.length <= 1) {
+      return times;
+    }
+
+    const sorted: Array<StartAndEndTime> = [...times].sort(
+      (a: StartAndEndTime, b: StartAndEndTime) => {
+        if (OneUptimeDate.isBefore(a.startTime, b.startTime)) {
+          return -1;
+        }
+        if (OneUptimeDate.isAfter(a.startTime, b.startTime)) {
+          return 1;
+        }
+        return 0;
+      },
+    );
+
+    const merged: Array<StartAndEndTime> = [];
+
+    for (const current of sorted) {
+      const last: StartAndEndTime | undefined = merged[merged.length - 1];
+
+      // overlapping or directly touching the previous window -> extend it.
+      if (last && OneUptimeDate.isOnOrAfter(last.endTime, current.startTime)) {
+        if (OneUptimeDate.isAfter(current.endTime, last.endTime)) {
+          last.endTime = current.endTime;
+        }
+        continue;
+      }
+
+      merged.push({
+        startTime: current.startTime,
+        endTime: current.endTime,
+      });
+    }
+
+    return merged;
+  }
+
+  public getWeeklyRestrictionTimesForWeek(data: {
+    eventStartTime: Date;
+    eventEndTime: Date;
+    restrictionTimes: RestrictionTimes;
+  }): Array<StartAndEndTime> {
+    const weeklyRestrictionTimes: Array<WeeklyResctriction> =
+      data.restrictionTimes.weeklyRestrictionTimes;
+
+    const eventStartTime: Date = data.eventStartTime;
+
+    const startAndEndTimesOfWeeklyRestrictions: Array<StartAndEndTime> = [];
+
+    for (const weeklyRestriction of weeklyRestrictionTimes) {
+      // move all of these to the week of the event start time
+
+      let startTime: Date = weeklyRestriction.startTime;
+      let endTime: Date = weeklyRestriction.endTime;
+
+      // move start and end times to the week of the event start time
+
+      startTime = OneUptimeDate.moveDateToTheDayOfWeek(
+        startTime,
+        eventStartTime,
+        OneUptimeDate.getDayOfWeek(startTime, this.timezone),
+        this.timezone,
+      );
+
+      endTime = OneUptimeDate.moveDateToTheDayOfWeek(
+        endTime,
+        eventStartTime,
+        OneUptimeDate.getDayOfWeek(endTime, this.timezone),
+        this.timezone,
+      );
+
+      // now we have true start and end times of the weekly restriction
+
+      // if start time is after end time, we need to add one week to the end time
+
+      if (OneUptimeDate.isAfter(startTime, endTime)) {
+        /*
+         * in this case the restriction is towards the ends of the week and not in the middle so we need to add two objects to the array.
+         * One for start of the week
+         * and the other for end of the week .
+         */
+
+        /*
+         * Anchor the split to the START OF THE ISO WEEK that contains the event,
+         * NOT to data.eventStartTime. When resolution begins mid-week (the live
+         * "who is on call now" path always starts its window at the current
+         * instant), using eventStartTime made the head segment
+         * [eventStartTime, endTime] inverted (start > end) whenever "now" was
+         * already past the window's end-day. getEventsByDailyRestriction then
+         * mis-read that inverted segment as an overnight window and sprayed
+         * phantom all-day on-call coverage across every day of the week, paging
+         * the wrong user during hours the restriction excludes. Using the real
+         * week start keeps the head segment correctly ordered; the later
+         * intersection with the event window discards any portion that has
+         * already elapsed.
+         */
+        const startOfWeek: Date = OneUptimeDate.getStartOfTheWeek(
+          data.eventStartTime,
+          this.timezone, // anchor to the schedule zone's week boundary (audit F6)
+        );
+
+        /*
+         * Head segment: the early-week tail (week start -> endTime) of a weekend
+         * window that opened the PREVIOUS period. This is what covers an
+         * in-progress wrap-around window when resolution starts mid-weekend
+         * (e.g. resolving on the Sunday of a Fri 20:00 -> Mon 08:00 window).
+         */
+        startAndEndTimesOfWeeklyRestrictions.push({
+          startTime: startOfWeek,
+          endTime: endTime,
+        });
+
+        /*
+         * Main segment: the contiguous window from startTime (this week) through
+         * endTime moved to the NEXT week. Because this is a wrap-around,
+         * startTime is later in the week than endTime, so endTime + 7 days is the
+         * window's true close (e.g. Fri 20:00 -> the following Mon 08:00).
+         * Expressing it as one forward window — rather than clipping to the end
+         * of THIS ISO week — lets getEventsByDailyRestriction tile it weekly
+         * across a multi-week rotation event without leaving the Sunday/Monday
+         * portion of the weekend uncovered.
+         */
+        startAndEndTimesOfWeeklyRestrictions.push({
+          startTime: startTime,
+          /*
+           * Forward the schedule timezone so this +7-day step is a wall-clock
+           * week in the schedule's zone, consistent with every sibling
+           * day-step in the weekly tiling path (audit F8). Without it, when the
+           * server zone differs from the schedule zone across a DST transition,
+           * the wrap-around window's close drifted by the DST offset and that
+           * drift then propagated to every subsequent weekend of the expansion.
+           */
+          endTime: OneUptimeDate.addRemoveDays(endTime, 7, this.timezone),
+        });
+      } else {
+        /*
+         * Non-wrapping restriction: emit the single window. This is gated in an
+         * `else` because the wrap-around case above is already fully described
+         * by the two split segments; previously this raw push ran
+         * unconditionally, adding a third INVERTED (start > end) segment that
+         * getEventsByDailyRestriction then re-expanded into phantom nightly
+         * on-call windows on every day of the week.
+         */
+        startAndEndTimesOfWeeklyRestrictions.push({
+          startTime,
+          endTime,
+        });
+      }
+    }
+
+    return startAndEndTimesOfWeeklyRestrictions;
+  }
+
+  public getEventsByDailyRestriction(data: {
+    eventStartTime: Date;
+    eventEndTime: Date;
+    restrictionStartAndEndTime: StartAndEndTime;
+    props: {
+      intervalType: EventInterval;
+    };
+  }): Array<StartAndEndTime> {
+    const dayRestrictionTimes: StartAndEndTime | null =
+      data.restrictionStartAndEndTime;
+
+    // if there are no day restriction times, we dont have any restrictions and we can return the event start and end times
+
+    if (!dayRestrictionTimes) {
+      return [
+        {
+          startTime: data.eventStartTime,
+          endTime: data.eventEndTime,
+        },
+      ];
+    }
+
+    //
+
+    let restrictionStartTime: Date = dayRestrictionTimes.startTime;
+    let restrictionEndTime: Date = dayRestrictionTimes.endTime;
+
+    /*
+     * Special Case: Overnight (wrap-around) window where end time is logically on the next day.
+     * Example: 23:00 -> 11:00 (next day). Existing algorithm assumed end >= start within same day
+     * and returned no events. We explicitly expand such windows into two segments per day:
+     * 1) start -> endOfDay(start)
+     * 2) startOfNextDay -> end (moved to next day)
+     */
+    if (OneUptimeDate.isBefore(restrictionEndTime, restrictionStartTime)) {
+      const results: Array<StartAndEndTime> = [];
+
+      /*
+       * Iterate day-by-day within the event range. We start ONE day BEFORE the
+       * event's start day so the "morning" tail of the window that opened the
+       * previous night (e.g. a 22:00 -> 06:00 window covering 00:00 -> 06:00 on
+       * the event's own first day) is emitted. Previously the loop started at
+       * getStartOfDay(eventStart) and only ever tied the morning segment to the
+       * NEXT day, so a rotation event beginning at midnight lost its first-day
+       * morning coverage entirely, leaving a nightly gap where nobody was on
+       * call. The addIntersection clip to [eventStart, eventEnd] discards any
+       * segment of the extra leading day that falls outside the event.
+       */
+      let currentDayStart: Date = OneUptimeDate.addRemoveDays(
+        OneUptimeDate.getStartOfDay(data.eventStartTime, this.timezone),
+        -1,
+        this.timezone, // step wall-clock days in the schedule zone (audit L1)
+      );
+      const absoluteEventEnd: Date = data.eventEndTime;
+      let safetyCounter: number = 0;
+      /*
+       * Scale the day-by-day safeguard to the actual event span. A fixed 62-day
+       * cap dropped every night past ~day 62 for rotation events longer than
+       * that (e.g. a quarterly/annual rotation with an overnight restriction),
+       * leaving those nights with no on-call coverage (audit F2). Bound to the
+       * event length plus margin, with a hard ceiling for pathological inputs.
+       */
+      const maxDays: number = Math.min(
+        4000,
+        Math.max(
+          62,
+          OneUptimeDate.getDaysBetweenTwoDates(
+            data.eventStartTime,
+            data.eventEndTime,
+          ) + 3,
+        ),
+      );
+
+      while (
+        OneUptimeDate.isOnOrBefore(currentDayStart, absoluteEventEnd) &&
+        safetyCounter < maxDays
+      ) {
+        safetyCounter++;
+
+        const segmentNightStart: Date = OneUptimeDate.keepTimeButMoveDay(
+          restrictionStartTime,
+          currentDayStart,
+          this.timezone,
+        );
+        const segmentNightEnd: Date = OneUptimeDate.getEndOfDay(
+          segmentNightStart,
+          this.timezone,
+        );
+
+        const nextDayStart: Date = OneUptimeDate.addRemoveDays(
+          currentDayStart,
+          1,
+          this.timezone, // wall-clock day step; avoids revisiting a day across fall-back DST (audit L1)
+        );
+        const segmentMorningStart: Date = OneUptimeDate.getStartOfDay(
+          nextDayStart,
+          this.timezone,
+        );
+        const segmentMorningEnd: Date = OneUptimeDate.keepTimeButMoveDay(
+          restrictionEndTime,
+          nextDayStart,
+          this.timezone,
+        );
+
+        // helper to add intersection if it overlaps the event window
+        const addIntersection: (segStart: Date, segEnd: Date) => void = (
+          segStart: Date,
+          segEnd: Date,
+        ): void => {
+          // normalize zero / invalid lengths
+          if (OneUptimeDate.isOnOrBefore(segEnd, segStart)) {
+            return; // no length
+          }
+          // intersect with [eventStart, eventEnd]
+          const start: Date = OneUptimeDate.getGreaterDate(
+            segStart,
+            data.eventStartTime,
+          );
+          const end: Date = OneUptimeDate.getLesserDate(
+            segEnd,
+            data.eventEndTime,
+          );
+          if (OneUptimeDate.isAfter(end, start)) {
+            results.push({ startTime: start, endTime: end });
+          }
+        };
+
+        addIntersection(segmentNightStart, segmentNightEnd);
+        addIntersection(segmentMorningStart, segmentMorningEnd);
+
+        // advance a day
+        currentDayStart = nextDayStart;
+      }
+
+      return results;
+    }
+
+    let currentStartTime: Date = data.eventStartTime;
+    const currentEndTime: Date = data.eventEndTime;
+
+    const trimmedStartAndEndTimes: Array<StartAndEndTime> = [];
+
+    let reachedTheEndOfTheCurrentEvent: boolean = false;
+
+    /*
+     * Scale the break clause to the event span. The loop advances one restriction
+     * period (1 day for a Daily restriction, 7 days for a Weekly one) per
+     * iteration, so a single rotation event longer than ~50 days had its later
+     * days silently dropped, leaving no on-call coverage (audit F2). Days-in-event
+     * is a safe upper bound for both the daily (+1/day) and weekly (+7/day) paths.
+     */
+    const maxLoopCount: number = Math.min(
+      4000,
+      Math.max(
+        50,
+        OneUptimeDate.getDaysBetweenTwoDates(
+          data.eventStartTime,
+          data.eventEndTime,
+        ) + 10,
+      ),
+    );
+    let loopCount: number = 0;
+
+    while (!reachedTheEndOfTheCurrentEvent) {
+      loopCount++;
+
+      if (loopCount > maxLoopCount) {
+        break;
+      }
+      // if current end time is equalto or before than the current start time, we need to return the current event and exit the loop
+
+      if (OneUptimeDate.isOnOrBefore(currentEndTime, currentStartTime)) {
+        reachedTheEndOfTheCurrentEvent = true;
+      }
+
+      // if the event is ourside the restriction times, we need to return the trimmed array
+
+      if (OneUptimeDate.isOnOrAfter(restrictionStartTime, currentEndTime)) {
+        return trimmedStartAndEndTimes;
+      }
+
+      /*
+       * The event begins after THIS day's restriction window has already ended.
+       * Do NOT drop the whole event — a multi-day rotation event (e.g. a WEEKLY
+       * rotation whose handoff/start is at 20:00, with a 09:00-17:00 daily
+       * restriction) must still be covered on its subsequent days. Advance the
+       * restriction window to the next day/week and re-test instead of returning
+       * empty. Termination is preserved: after at most one advance the window's
+       * end moves past currentStartTime, and the "restrictionStart past
+       * currentEnd" guard above returns once the window moves past the event end
+       * (so a short event entirely after the window still yields no coverage).
+       */
+      if (OneUptimeDate.isOnOrAfter(currentStartTime, restrictionEndTime)) {
+        restrictionStartTime = OneUptimeDate.addRemoveDays(
+          restrictionStartTime,
+          data.props.intervalType === EventInterval.Day ? 1 : 7, // daily or weekly
+          this.timezone,
+        );
+        restrictionEndTime = OneUptimeDate.addRemoveDays(
+          restrictionEndTime,
+          data.props.intervalType === EventInterval.Day ? 1 : 7, // daily or weekly
+          this.timezone,
+        );
+        continue;
+      }
+
+      // if the restriction end time is before the restriction start time, we need to add one day to the restriction end time
+      if (OneUptimeDate.isAfter(restrictionStartTime, restrictionEndTime)) {
+        restrictionEndTime = OneUptimeDate.addRemoveDays(
+          restrictionEndTime,
+          data.props.intervalType === EventInterval.Day ? 1 : 7, // daily or weekly
+        );
+      }
+
+      /*
+       * The four cases below are mutually exclusive for a given iteration and
+       * are expressed as an if / else-if chain. This matters because cases 2 and
+       * 4 MUTATE currentStartTime / restrictionStartTime / restrictionEndTime and
+       * then continue the loop; without else-if, a later case would re-evaluate
+       * against the freshly-mutated state within the same iteration and emit a
+       * duplicate (or overlapping) window.
+       */
+
+      // 1 - the event falls entirely within the restriction window: emit it and finish.
+      if (
+        OneUptimeDate.isOnOrAfter(currentStartTime, restrictionStartTime) &&
+        OneUptimeDate.isOnOrAfter(restrictionEndTime, currentEndTime)
+      ) {
+        trimmedStartAndEndTimes.push({
+          startTime: currentStartTime,
+          endTime: currentEndTime,
+        });
+        reachedTheEndOfTheCurrentEvent = true;
+      } else if (
+        /*
+         * 2 - Start Restriction: the event starts inside the restriction window
+         * but extends past its end. Emit [currentStart, restrictionEnd], then
+         * ADVANCE to the next restriction day/week and continue, so every
+         * remaining day of a multi-day rotation event is emitted. Previously this
+         * terminated the loop after the first day, dropping on-call coverage for
+         * every subsequent day of the rotation period (e.g. a weekly rotation
+         * with a 09:00-17:00 daily restriction and a handoff at/after 09:00
+         * covered only day 1). This now mirrors case 4's advance-and-continue.
+         * Strict isAfter on the end keeps this exclusive from case 1.
+         */
+        OneUptimeDate.isOnOrAfter(currentStartTime, restrictionStartTime) &&
+        OneUptimeDate.isAfter(currentEndTime, restrictionEndTime)
+      ) {
+        trimmedStartAndEndTimes.push({
+          startTime: currentStartTime,
+          endTime: restrictionEndTime,
+        });
+
+        currentStartTime = OneUptimeDate.addRemoveSeconds(
+          restrictionEndTime,
+          1,
+        );
+
+        restrictionStartTime = OneUptimeDate.addRemoveDays(
+          restrictionStartTime,
+          data.props.intervalType === EventInterval.Day ? 1 : 7, // daily or weekly
+          this.timezone, // preserve wall-clock across DST (audit F5)
+        );
+        restrictionEndTime = OneUptimeDate.addRemoveDays(
+          restrictionEndTime,
+          data.props.intervalType === EventInterval.Day ? 1 : 7, // daily or weekly
+          this.timezone, // preserve wall-clock across DST (audit F5)
+        );
+      } else if (
+        // 3 - End Restriction - the event starts before the window and ends inside it.
+        OneUptimeDate.isBefore(currentStartTime, restrictionStartTime) &&
+        OneUptimeDate.isBefore(currentEndTime, restrictionEndTime) &&
+        OneUptimeDate.isAfter(currentEndTime, restrictionStartTime)
+      ) {
+        trimmedStartAndEndTimes.push({
+          startTime: restrictionStartTime,
+          endTime: currentEndTime,
+        });
+        reachedTheEndOfTheCurrentEvent = true;
+      } else if (
+        // 4 - the event spans the whole window: emit it, advance a day/week, continue.
+        OneUptimeDate.isBefore(currentStartTime, restrictionStartTime) &&
+        OneUptimeDate.isOnOrAfter(currentEndTime, restrictionEndTime)
+      ) {
+        trimmedStartAndEndTimes.push({
+          startTime: restrictionStartTime,
+          endTime: restrictionEndTime,
+        });
+
+        currentStartTime = OneUptimeDate.addRemoveSeconds(
+          restrictionEndTime,
+          1,
+        );
+
+        // add day to restriction start and end times.
+
+        restrictionStartTime = OneUptimeDate.addRemoveDays(
+          restrictionStartTime,
+          data.props.intervalType === EventInterval.Day ? 1 : 7, // daily or weekly
+          this.timezone, // preserve wall-clock across DST (audit F5)
+        );
+        restrictionEndTime = OneUptimeDate.addRemoveDays(
+          restrictionEndTime,
+          data.props.intervalType === EventInterval.Day ? 1 : 7, // daily or weekly
+          this.timezone, // preserve wall-clock across DST (audit F5)
+        );
+      }
+    }
+
+    return trimmedStartAndEndTimes;
+  }
+
+  // helper functions.
+
+  private incrementUserIndex(
+    currentIndex: number,
+    userArrayLength: number,
+    incrementBy?: number,
+  ): number {
+    // update the current user index
+
+    if (incrementBy === undefined) {
+      incrementBy = 1;
+    }
+
+    currentIndex = currentIndex + incrementBy;
+
+    // if the current user index is greater than the length of the users array, we need to reset the current user index to 0
+    if (currentIndex >= userArrayLength) {
+      // then modulo the current user index by the length of the users array
+      currentIndex = currentIndex % userArrayLength; // so this rotates the users.
+    }
+
+    return currentIndex;
+  }
+
+  private getCalendarEventsFromStartAndEndDates(
+    trimmedStartAndEndTimes: Array<StartAndEndTime>,
+    users: Array<UserModel>,
+    currentUserIndex: number,
+    // True (un-clamped) start of the rotation period these segments came from.
+    rotationPeriodStartsAt: Date,
+  ): Array<CalendarEvent> {
+    const events: Array<CalendarEvent> = [];
+
+    const userId: string = users[currentUserIndex]?.id?.toString() || "";
+
+    for (const trimmedStartAndEndTime of trimmedStartAndEndTimes) {
+      const event: CalendarEvent = {
+        id: 0,
+        title: userId, // This will be changed to username in the UI or will bve kept the same if used on the server.
+        allDay: false,
+        start: trimmedStartAndEndTime.startTime,
+        end: trimmedStartAndEndTime.endTime,
+      };
+
+      // See ROTATION_PERIOD_START_KEY.
+      (event as unknown as Record<string, unknown>)[ROTATION_PERIOD_START_KEY] =
+        rotationPeriodStartsAt.getTime();
+
+      events.push(event);
+    }
+
+    return events;
+  }
+
+  public getMultiLayerEvents(
+    data: MultiLayerProps,
+    options?: LayerExpansionOptions | undefined,
+  ): Array<CalendarEvent> {
+    return this.getMultiLayerEventsWithMeta(data, options).events;
+  }
+
+  /*
+   * Same priority merge as getMultiLayerEvents, plus a `truncated` flag that
+   * is true when ANY layer's expansion hit an iteration cap (see
+   * LayerExpansionOptions.maxSimulationIterations). getMultiLayerEvents
+   * discards the flag so its existing callers are untouched.
+   */
+  public getMultiLayerEventsWithMeta(
+    data: MultiLayerProps,
+    options?: LayerExpansionOptions | undefined,
+  ): LayerEventsResult {
+    const events: Array<PriorityCalendarEvents> = [];
+    let layerPriority: number = 1;
+    let truncated: boolean = false;
+
+    const layerOptions: LayerExpansionOptions | undefined =
+      options?.maxSimulationIterations !== undefined
+        ? { maxSimulationIterations: options.maxSimulationIterations }
+        : undefined;
+
+    for (const layer of data.layers) {
+      /*
+       * Do NOT forward getNumberOfEvents to the per-layer expansion. Capping
+       * each layer to N events before the priority merge can drop a lower-
+       * priority (fallback) layer's post-block coverage: if a higher-priority
+       * layer's restricted block swallows the fallback's first N events, the
+       * fallback's (N+1)-th event — the true "next" on-call after the block —
+       * is never generated, corrupting the merged "next" roster. The cap is
+       * applied only once, after the merge, below.
+       */
+      const layerResult: LayerEventsResult = this.getEventsWithMeta(
+        {
+          users: layer.users,
+          startDateTimeOfLayer: layer.startDateTimeOfLayer,
+          restrictionTimes: layer.restrictionTimes,
+          handOffTime: layer.handOffTime,
+          rotation: layer.rotation,
+          timezone: layer.timezone,
+          calendarStartDate: data.calendarStartDate,
+          calendarEndDate: data.calendarEndDate,
+        },
+        layerOptions,
+      );
+
+      truncated = truncated || layerResult.truncated;
+
+      /*
+       * Add priority (and, when the caller identified the layer, its id and
+       * name) to each event. The keys are only added when present so callers
+       * that never set them get exactly the event shape they always did.
+       */
+      for (const layerEvent of layerResult.events) {
+        const priorityEvent: PriorityCalendarEvents = {
+          ...layerEvent,
+          priority: layerPriority,
+        };
+
+        if (layer.layerId !== undefined) {
+          priorityEvent.layerId = layer.layerId;
+        }
+
+        if (layer.layerName !== undefined) {
+          priorityEvent.layerName = layer.layerName;
+        }
+
+        events.push(priorityEvent);
+      }
+
+      // increment layer priority
+      layerPriority++;
+    }
+
+    // now remove the overlapping events
+
+    const nonOverlappingEvents: Array<CalendarEvent> =
+      this.removeOverlappingEvents(events);
+
+    if (options?.getNumberOfEvents !== undefined) {
+      if (nonOverlappingEvents.length > options.getNumberOfEvents) {
+        return {
+          events: nonOverlappingEvents.slice(0, options.getNumberOfEvents),
+          truncated,
+        };
+      }
+    }
+
+    return { events: nonOverlappingEvents, truncated };
+  }
+
+  public removeOverlappingEvents(
+    events: PriorityCalendarEvents[],
+  ): CalendarEvent[] {
+    /*
+     * Flatten overlapping events by priority. A LOWER priority number wins: an
+     * event is trimmed back so it does not overlap any higher-priority (lower
+     * numbered) event, and where a lower-priority event straddles a
+     * higher-priority one it is split into a leading and a trailing segment.
+     * Segments are separated by a 1-second seam.
+     *
+     * This runs on the browser's main thread on the on-call schedule screen,
+     * over every event in the coverage window — an hourly rotation over three
+     * months is thousands of events. The previous implementation had three
+     * separate problems here, in increasing order of severity:
+     *
+     *   - CONSTANT FACTOR. Every comparison went through `OneUptimeDate.*`,
+     *     which wraps each operand in a moment object (via `fromString`) —
+     *     roughly 8 allocations per overlap test, and it dominated the profile.
+     *     All comparisons below are numeric `getTime()` instead. Timestamps are
+     *     normalised once, up front, so string-typed inputs are still accepted.
+     *   - COMPLEXITY. The inner scan walked the whole of `finalEvents` for every
+     *     event placed, which is O(n^2): ~1000 hourly events took over a minute,
+     *     and every re-render of the schedule screen paid it again.
+     *     `activeEventIndexes` keeps the scan off events that can no longer
+     *     match. Events are processed in ascending start order and an event's
+     *     start only ever moves forward, so once a placed event ends at or
+     *     before the current start it cannot overlap this event or any later
+     *     one, and is dropped from the scan for good.
+     *   - TERMINATION. On some inputs it never finished at all — see the
+     *     exhausted-event break inside the scan below. That was the real bug;
+     *     the two above only made the schedule screen slow.
+     */
+
+    /*
+     * Normalise to real Dates once. Everything below reads `.getTime()`
+     * directly, which is only safe if these are Date instances — callers may
+     * hand us JSON-deserialised events whose start/end are strings, which the
+     * old `OneUptimeDate.*` comparisons coerced on every single call.
+     */
+    for (const event of events) {
+      event.start = OneUptimeDate.fromString(event.start);
+      event.end = OneUptimeDate.fromString(event.end);
+    }
+
+    // Drop zero-length and inverted events; the merge below assumes end > start.
+    events = events.filter((event: PriorityCalendarEvents) => {
+      return event.end.getTime() > event.start.getTime();
+    });
+
+    /*
+     * Ascending start time. Array.prototype.sort is stable, so events that share
+     * a start stay in insertion order — which is layer order, i.e. ascending
+     * priority. The merge below depends on this ordering in both directions:
+     * ascending starts let the active-set pruning work, and the priority tie
+     * order decides which of two same-start events is the one that gets trimmed.
+     */
+    events.sort((a: CalendarEvent, b: CalendarEvent) => {
+      return a.start.getTime() - b.start.getTime();
+    });
+
+    const finalEvents: PriorityCalendarEvents[] = [];
+
+    /*
+     * Indexes into finalEvents that may still overlap the event being placed,
+     * in ascending index order — the same order the old full scan visited them
+     * in. Order is load-bearing, not incidental: trimming a lower-priority final
+     * event uses the current event's start, which a higher-priority final event
+     * visited earlier in the same scan may already have pushed forward.
+     */
+    const activeEventIndexes: number[] = [];
+
+    // Tombstones. Splicing finalEvents mid-merge would invalidate these indexes.
+    const removedEventIndexes: Set<number> = new Set<number>();
+
+    for (const event of events) {
+      const eventEndTime: number = event.end.getTime();
+
+      /*
+       * Retire everything that ends at or before this event's start. Events
+       * arrive in ascending start order, so nothing retired here can overlap any
+       * later event either. Each index is examined once more after it stops
+       * matching, making this O(1) amortised per placed event.
+       */
+      const eventStartTime: number = event.start.getTime();
+      let keptCount: number = 0;
+
+      for (let i: number = 0; i < activeEventIndexes.length; i++) {
+        const index: number = activeEventIndexes[i]!;
+
+        if (removedEventIndexes.has(index)) {
+          continue;
+        }
+
+        if (finalEvents[index]!.end.getTime() <= eventStartTime) {
+          continue;
+        }
+
+        activeEventIndexes[keptCount] = index;
+        keptCount++;
+      }
+
+      activeEventIndexes.length = keptCount;
+
+      /*
+       * Length is re-read each pass: trailing segments appended below join the
+       * scan, exactly as they did when this walked finalEvents directly. They
+       * start after this event ends, so they never match it — but the scan is
+       * kept faithful rather than relying on that.
+       */
+      for (let i: number = 0; i < activeEventIndexes.length; i++) {
+        const currentStart: number = event.start.getTime();
+
+        /*
+         * Nothing left of this event. The else-branch below pushes its start
+         * forward past each higher-priority window it meets, and that can
+         * consume the event entirely — at which point it covers no time, will
+         * not be placed, and must stop trimming other events.
+         *
+         * WITHOUT this stop the merge does not terminate, which is the bug this
+         * whole rewrite exists to fix. `OneUptimeDate.isOverlapping` reports a
+         * zero-length or inverted interval as overlapping anything that shares
+         * an endpoint with it (its moment `isBetween` bounds are exclusive, but
+         * it also has explicit start===start / end===end arms). So an exhausted
+         * event kept matching the very tail segment it had just created, split
+         * it again, matched the new tail, and so on forever. Empirically an
+         * hourly grid with 3 priorities settled at 14 events and never returned
+         * at 16.
+         *
+         * Stopping here is also the correct answer rather than merely a
+         * terminating one: an event with no remaining duration represents nobody
+         * on call, so letting it carve a second out of a lower-priority event
+         * opened a 1-second hole in the fallback coverage for no reason.
+         */
+        if (currentStart >= eventEndTime) {
+          break;
+        }
+
+        const finalEventIndex: number = activeEventIndexes[i]!;
+
+        if (removedEventIndexes.has(finalEventIndex)) {
+          continue;
+        }
+
+        const finalEvent: PriorityCalendarEvents =
+          finalEvents[finalEventIndex]!;
+
+        const finalStart: number = finalEvent.start.getTime();
+        const finalEnd: number = finalEvent.end.getTime();
+
+        /*
+         * Half-open overlap: touching endpoints do not overlap. Both intervals
+         * are guaranteed positive-length here — final events are length-checked
+         * before being placed, and the current event is checked by the break
+         * above — and over positive-length intervals this is exactly equivalent
+         * to the OneUptimeDate.isOverlapping it replaces.
+         */
+        if (currentStart >= finalEnd || finalStart >= eventEndTime) {
+          continue;
+        }
+
+        if (event.priority < finalEvent.priority) {
+          /*
+           * The current event outranks this one. Trim the final event back to
+           * end 1s before the current event starts.
+           */
+          const tempFinalEventEnd: Date = finalEvent.end;
+
+          /*
+           * Reconstruct the trailing tail FIRST, before the front-collapse
+           * removal below. If the lower-priority (fallback) event originally
+           * extended past the higher-priority event, the portion AFTER the
+           * higher-priority window must survive as its own segment — even when
+           * the FRONT of the final event collapses to zero/negative length
+           * (which happens when the higher-priority event starts at or before
+           * the final event's start, e.g. two back-to-back higher-priority
+           * rotation windows over a 24/7 fallback layer). Previously this block
+           * ran only AFTER the collapse checks, whose `continue` skipped it,
+           * silently deleting the fallback layer's coverage after the higher-
+           * priority window and leaving on-call gaps where nobody is paged.
+           */
+          if (tempFinalEventEnd.getTime() > eventEndTime) {
+            // add the trailing segment of the lower-priority event
+            const trimmedEvent: PriorityCalendarEvents = {
+              ...finalEvent,
+              priority: finalEvent.priority,
+              start: new Date(eventEndTime + 1000),
+              end: tempFinalEventEnd,
+            };
+
+            // only keep it if it has positive length
+            if (trimmedEvent.end.getTime() > trimmedEvent.start.getTime()) {
+              activeEventIndexes.push(finalEvents.length);
+              finalEvents.push(trimmedEvent);
+            }
+          }
+
+          finalEvent.end = new Date(currentStart - 1000);
+
+          /*
+           * If the front collapsed to zero or negative length, drop it. The
+           * trailing tail, if any, was already preserved above.
+           */
+          if (finalEvent.end.getTime() <= finalStart) {
+            removedEventIndexes.add(finalEventIndex);
+          }
+        } else {
+          /*
+           * Trim the current (lower-priority) event: push its start past this
+           * higher-priority window. This is a monotonic max rather than a bare
+           * assignment so the result does NOT depend on the order finalEvents
+           * are visited. That is what made it safe to hoist the per-iteration
+           * finalEvents.sort() out of the loop (audit H2).
+           */
+          const trimmedStart: number = finalEnd + 1000;
+
+          if (trimmedStart > currentStart) {
+            event.start = new Date(trimmedStart);
+          }
+        }
+      }
+
+      // Whatever is left of the current event, if anything, is placed.
+      if (eventEndTime > event.start.getTime()) {
+        activeEventIndexes.push(finalEvents.length);
+        finalEvents.push(event);
+      }
+
+      /*
+       * The sweep that used to run HERE — rescanning all of finalEvents for
+       * zero-length and inverted entries after every placement — was O(n^2) on
+       * its own and could never find anything. Every event reaching finalEvents
+       * is length-checked at the moment it is pushed, and the only field mutated
+       * afterwards is `end` in the trim branch above, which drops the event on
+       * the spot when it collapses.
+       */
+    }
+
+    /*
+     * Single final sort by start time (hoisted out of the per-event loop above,
+     * audit H2). Downstream consumers (getEvents id assignment, the schedule
+     * service's current/next selection) expect events in start order.
+     */
+    const keptEvents: PriorityCalendarEvents[] = finalEvents.filter(
+      (_event: PriorityCalendarEvents, index: number) => {
+        return !removedEventIndexes.has(index);
+      },
+    );
+
+    keptEvents.sort((a: CalendarEvent, b: CalendarEvent) => {
+      return a.start.getTime() - b.start.getTime();
+    });
+
+    // convert PriorityCalendarEvents to CalendarEvents
+
+    const calendarEvents: CalendarEvent[] = [];
+    let id: number = 1;
+
+    for (const event of keptEvents) {
+      const calendarEvent: CalendarEvent = {
+        ...event,
+        id: id,
+      };
+
+      calendarEvents.push(calendarEvent);
+      id++;
+    }
+
+    return calendarEvents;
+  }
+}

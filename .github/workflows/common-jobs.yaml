@@ -1,14 +1,24 @@
 name: Common Jobs
 
+# Supersede in-flight runs for the same branch/PR: only the newest commit needs CI.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 on:
-  pull_request: 
+  pull_request:
   push:
-    branches-ignore:
-      - 'hotfix-*'   # excludes hotfix branches
-      - 'release'
+    branches:
+      - master
 
 jobs:
-  helm-lint:
+  # Every Helm chart test, in one check. The runner walks HelmChart/Tests/suites
+  # cheapest-first -- lint, then the cluster-free helm-unittest suites, then the
+  # ones that need a real API server (secrets-lifecycle installs and upgrades the
+  # chart on a throwaway KinD cluster; no images are pulled, since the release
+  # goes up without --wait and without hooks). A failing suite does not stop the
+  # rest, so one run reports everything that is broken.
+  helm-test:
     runs-on: ubuntu-latest
     env:
       CI_PIPELINE_ID: ${{github.run_number}}
@@ -18,11 +28,73 @@ jobs:
       - name: Install Helm
         run: |
           curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-      - name: Lint Helm Chart
+      # The unit suite needs the helm-unittest plugin, which used to come from
+      # `helm plugin install`: its install hook downloads the plugin from
+      # GitHub's release CDN with a single unretried curl, and a burst of 500/504s
+      # from that CDN failed this job on 2026-09-21. The harness now installs
+      # the release tarball whose sha256 HelmChart/Tests/lib/harness.sh pins,
+      # from HELM_UNITTEST_CACHE_DIR. These steps keep that directory in the
+      # Actions cache, keyed on the pin, so the CDN is only asked when the pin
+      # changes or the entry was evicted -- and then with exponential backoff
+      # (Scripts/GHA/fetch_pinned_artifact.sh). The cache is filled by a step of
+      # its own, before the suites run, because actions/cache's post step only
+      # saves when the whole job passes.
+      - name: Resolve the pinned helm-unittest
+        id: helm-unittest
+        env:
+          HELM_UNITTEST_CACHE_DIR: ${{ runner.temp }}/helm-unittest
         run: |
-          helm lint ./HelmChart/Public/oneuptime
-          helm lint ./HelmChart/Public/kubernetes-agent
-          
+          source ./HelmChart/Tests/lib/harness.sh
+          harness_unittest_pin >>"$GITHUB_OUTPUT"
+      - name: Restore helm-unittest from the Actions cache
+        id: helm-unittest-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.helm-unittest.outputs.dir }}
+          key: helm-unittest-${{ steps.helm-unittest.outputs.version }}-${{ steps.helm-unittest.outputs.platform }}-${{ steps.helm-unittest.outputs.sha256 }}
+      # Runs on a hit too: a restored tarball is only used once it matches the
+      # pin, and one that does not is downloaded again.
+      - name: Verify helm-unittest, or download it on a cache miss
+        env:
+          HELM_UNITTEST_CACHE_DIR: ${{ steps.helm-unittest.outputs.dir }}
+        run: |
+          source ./HelmChart/Tests/lib/harness.sh
+          harness_fetch_unittest_plugin
+      # Two runs missing at once both try to save; the loser only logs a warning.
+      - name: Save helm-unittest to the Actions cache
+        if: steps.helm-unittest-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.helm-unittest.outputs.dir }}
+          key: ${{ steps.helm-unittest-cache.outputs.cache-primary-key }}
+      - name: Run Helm Chart tests
+        env:
+          HELM_UNITTEST_CACHE_DIR: ${{ steps.helm-unittest.outputs.dir }}
+        run: bash ./HelmChart/Tests/run.sh
+      - name: Show how to run these locally
+        if: ${{ failure() }}
+        run: echo "Run 'npm run test-helm-chart-all', or a single suite with 'bash ./HelmChart/Tests/run.sh <suite>' (suites live in HelmChart/Tests/suites). 'npm run test-helm-chart' still runs just the cluster-free helm-unittest suites."
+
+
+  # The shell scripts the release runs on. They only ever execute during a
+  # release, where a bug in one costs a 90-minute rerun -- or, as in 12.0.27,
+  # a release that shipped every image and then stranded itself as a draft. The
+  # suites stub out syft and zero the retry delays, so this job talks to no
+  # registry and finishes in seconds.
+  gha-scripts-test:
+    runs-on: ubuntu-latest
+    env:
+      CI_PIPELINE_ID: ${{github.run_number}}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+      - name: Run Scripts/GHA tests
+        run: bash ./Scripts/GHA/Tests/run.sh
+      - name: Show how to run these locally
+        if: ${{ failure() }}
+        run: echo "Run 'npm run test-gha-scripts', or a single suite with 'bash ./Scripts/GHA/Tests/run.sh <suite>' (suites are the *_test.sh files in Scripts/GHA/Tests)."
+
+
   js-lint:
     runs-on: ubuntu-latest
     env:
@@ -30,14 +102,24 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-      - run: sudo apt-get update
-      - run: sudo apt-get install -y curl gcc
-      - run: sudo apt-get install -y build-essential
-      - run: sudo apt-get install -y nodejs
+      # This job used to `apt-get update` and then install curl, gcc,
+      # build-essential and nodejs. ubuntu-latest ships all four, and the apt
+      # `nodejs` package is older than the Node this repo requires anyway (it
+      # installs as /usr/bin/nodejs and never shadowed the runner's node), so
+      # the four steps cost a minute of package-index traffic and changed
+      # nothing. setup-node pins the Node the rest of CI uses and caches the
+      # npm download for the install below.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+          cache: npm
+          cache-dependency-path: '**/package-lock.json'
       - run: npm install
       - run: npm run lint
       - name: Validate locale files (key parity + placeholders)
         run: npm run i18n:validate
+      - name: Validate docs anchor links resolve to a heading
+        run: npm run docs:check-anchors
       - name: Show how to fix lint
         if: ${{ failure() }}
-        run: echo "Please run 'npm run fix' to auto-fix lint, and 'npm run i18n:validate' locally to see any missing/extra locale keys or broken placeholders."
+        run: echo "Please run 'npm run fix' to auto-fix lint, 'npm run i18n:validate' to see any missing/extra locale keys or broken placeholders, and 'npm run docs:check-anchors' to see any in-page doc links pointing at a heading that does not exist."

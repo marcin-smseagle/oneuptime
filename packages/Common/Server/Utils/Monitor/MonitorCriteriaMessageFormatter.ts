@@ -1,0 +1,219 @@
+import logger from "../Logger";
+import BasicInfrastructureMetrics from "../../../Types/Infrastructure/BasicMetrics";
+import Typeof from "../../../Types/Typeof";
+import { ServerProcess } from "../../../Types/Monitor/ServerMonitor/ServerMonitorResponse";
+
+export default class MonitorCriteriaMessageFormatter {
+  public static formatNumber(
+    value: number | null | undefined,
+    options?: { maximumFractionDigits?: number },
+  ): string | null {
+    if (value === null || value === undefined || isNaN(value)) {
+      return null;
+    }
+
+    const fractionDigits: number =
+      options?.maximumFractionDigits !== undefined
+        ? options.maximumFractionDigits
+        : Math.abs(value) < 10
+          ? 2
+          : Math.abs(value) < 100
+            ? 1
+            : 0;
+
+    return value.toFixed(fractionDigits);
+  }
+
+  public static formatPercentage(
+    value: number | null | undefined,
+  ): string | null {
+    const formatted: string | null =
+      MonitorCriteriaMessageFormatter.formatNumber(value, {
+        maximumFractionDigits:
+          value !== null && value !== undefined && Math.abs(value) < 100
+            ? 1
+            : 0,
+      });
+
+    if (!formatted) {
+      return null;
+    }
+
+    return `${formatted}%`;
+  }
+
+  public static formatBytes(bytes: number | null | undefined): string | null {
+    if (bytes === null || bytes === undefined || isNaN(bytes)) {
+      return null;
+    }
+
+    const units: Array<string> = ["B", "KB", "MB", "GB", "TB", "PB"];
+    let value: number = bytes;
+    let index: number = 0;
+
+    while (value >= 1024 && index < units.length - 1) {
+      value = value / 1024;
+      index++;
+    }
+
+    const formatted: string | null =
+      MonitorCriteriaMessageFormatter.formatNumber(value, {
+        maximumFractionDigits: value >= 100 ? 0 : value >= 10 ? 1 : 2,
+      });
+
+    if (!formatted) {
+      return null;
+    }
+
+    return `${formatted} ${units[index]}`;
+  }
+
+  public static formatList(items: Array<string>, maxItems: number = 5): string {
+    if (!items.length) {
+      return "";
+    }
+
+    const trimmedItems: Array<string> = items.slice(0, maxItems);
+    const suffix: string =
+      items.length > maxItems ? `, +${items.length - maxItems} more` : "";
+
+    return `${trimmedItems.join(", ")} ${suffix}`.trim();
+  }
+
+  public static formatSnippet(text: string, maxLength: number = 120): string {
+    const sanitized: string = text.replace(/\s+/g, " ").trim();
+
+    if (sanitized.length <= maxLength) {
+      return sanitized;
+    }
+
+    return `${sanitized.slice(0, maxLength)}…`;
+  }
+
+  public static describeProcesses(
+    processes: Array<ServerProcess>,
+  ): string | null {
+    if (!processes.length) {
+      return null;
+    }
+
+    const processSummaries: Array<string> = processes.map(
+      (process: ServerProcess) => {
+        return `${process.name} (pid ${process.pid})`;
+      },
+    );
+
+    return MonitorCriteriaMessageFormatter.formatList(processSummaries);
+  }
+
+  public static computeDiskUsagePercent(
+    diskMetric: BasicInfrastructureMetrics["diskMetrics"][number],
+  ): number | null {
+    if (!diskMetric) {
+      return null;
+    }
+
+    if (
+      diskMetric.percentUsed !== undefined &&
+      diskMetric.percentUsed !== null &&
+      !isNaN(diskMetric.percentUsed)
+    ) {
+      return diskMetric.percentUsed;
+    }
+
+    if (
+      diskMetric.percentFree !== undefined &&
+      diskMetric.percentFree !== null &&
+      !isNaN(diskMetric.percentFree)
+    ) {
+      return 100 - diskMetric.percentFree;
+    }
+
+    if (diskMetric.total && diskMetric.used && diskMetric.total > 0) {
+      return (diskMetric.used / diskMetric.total) * 100;
+    }
+
+    return null;
+  }
+
+  /**
+   * "latest 1.07 GB (min 900 KB, max 1.07 GB) across 3 data points".
+   *
+   * `format`, when supplied, renders ONE value — unit included — and is
+   * applied to latest, min and max independently. That independence is the
+   * point: auto-scaling can land min and max on different rungs of the
+   * ladder, which a single trailing unit suffix cannot express. It is the
+   * same reason CompareCriteria puts the unit on each number rather than on
+   * the sentence, and using the same callback in both places is what stops
+   * the evaluation log and the alert email describing one sample two ways.
+   *
+   * Without it the `unit` string is appended as before, so the caller that
+   * passes no unit at all (execution time) stays byte-identical.
+   */
+  public static summarizeNumericSeries(
+    values: Array<number>,
+    unit?: string | undefined,
+    format?: ((value: number) => string) | undefined,
+  ): string | null {
+    if (!values.length) {
+      return null;
+    }
+
+    const latest: number | undefined = values[values.length - 1];
+
+    if (latest === undefined) {
+      return null;
+    }
+
+    /*
+     * Suffix each value with its unit (e.g. "0.06 sec") so the reader knows
+     * what the numbers mean. Empty when the metric has no known unit.
+     */
+    const unitSuffix: string = unit ? ` ${unit}` : "";
+
+    const renderValue: (value: number) => string = (value: number): string => {
+      if (format) {
+        return format(value);
+      }
+
+      const formatted: string | null =
+        MonitorCriteriaMessageFormatter.formatNumber(value, {
+          maximumFractionDigits: 2,
+        });
+
+      return `${formatted ?? value}${unitSuffix}`;
+    };
+
+    let summary: string = `latest ${renderValue(latest)}`;
+
+    if (values.length > 1) {
+      const min: number = Math.min(...values);
+      const max: number = Math.max(...values);
+
+      summary += ` (min ${renderValue(min)}, max ${renderValue(max)})`;
+    }
+
+    summary += ` across ${values.length} data point${
+      values.length === 1 ? "" : "s"
+    }`;
+
+    return summary;
+  }
+
+  public static formatResultValue(value: unknown): string {
+    if (value === null || value === undefined) {
+      return "undefined";
+    }
+
+    if (typeof value === Typeof.Object) {
+      try {
+        return JSON.stringify(value);
+      } catch (err) {
+        logger.error(err);
+        return "[object]";
+      }
+    }
+
+    return value.toString();
+  }
+}

@@ -1,0 +1,1488 @@
+import logger from "../Logger";
+import CaptureSpan from "../Telemetry/CaptureSpan";
+import TelemetryUtil from "../Telemetry/Telemetry";
+import MetricResourceAttributeUtil from "../../../Utils/Metrics/MetricResourceAttributeUtil";
+import CapturedMetricAttributeUtil, {
+  SanitizedCapturedMetricAttributes,
+} from "./CapturedMetricAttributeUtil";
+import MetricService from "../../Services/MetricService";
+import GlobalConfigService from "../../Services/GlobalConfigService";
+import GlobalConfig from "../../../Models/DatabaseModels/GlobalConfig";
+import DataToProcess from "./DataToProcess";
+import { MetricPointType } from "../../../Models/AnalyticsModels/Metric";
+import ServiceType from "../../../Types/Telemetry/ServiceType";
+import MetricType from "../../../Models/DatabaseModels/MetricType";
+import Label from "../../../Models/DatabaseModels/Label";
+import BasicInfrastructureMetrics, {
+  NetworkInterfaceMetrics,
+} from "../../../Types/Infrastructure/BasicMetrics";
+import Dictionary from "../../../Types/Dictionary";
+import { JSONObject } from "../../../Types/JSON";
+import CapturedMetric from "../../../Types/Monitor/CustomCodeMonitor/CapturedMetric";
+import { getAllDatabaseMetrics } from "../../../Types/Monitor/DatabaseMetricCatalog";
+import DatabaseMonitorResponse from "../../../Types/Monitor/DatabaseMonitor/DatabaseMonitorResponse";
+import HttpPhaseTimings from "../../../Types/Monitor/HttpPhaseTimings";
+import MonitorMetricType from "../../../Types/Monitor/MonitorMetricType";
+import PingMonitorResponse from "../../../Types/Monitor/PingMonitor/PingMonitorResponse";
+import PortMonitorTimings from "../../../Types/Monitor/PortMonitor/PortMonitorTimings";
+import SnmpInterface from "../../../Types/Monitor/SnmpMonitor/SnmpInterface";
+import {
+  MAX_INTERFACE_METRIC_SERIES,
+  MAX_OID_METRIC_SERIES,
+} from "../../../Types/Monitor/SnmpMonitor/SnmpOidListUtil";
+import { SnmpOidResponse } from "../../../Types/Monitor/SnmpMonitor/SnmpMonitorResponse";
+import ProbeMonitorResponse from "../../../Types/Probe/ProbeMonitorResponse";
+import ServerMonitorResponse from "../../../Types/Monitor/ServerMonitor/ServerMonitorResponse";
+import SyntheticMonitorResponse from "../../../Types/Monitor/SyntheticMonitors/SyntheticMonitorResponse";
+import { CheckOn } from "../../../Types/Monitor/CriteriaFilter";
+import ObjectID from "../../../Types/ObjectID";
+import OneUptimeDate from "../../../Types/Date";
+
+export default class MonitorMetricUtil {
+  /*
+   * Default retention in days if GlobalConfig is not set. 30 days keeps
+   * enough history for trend analysis and evaluate-over-time criteria;
+   * one day made week-over-week charts impossible out of the box.
+   */
+  private static readonly DEFAULT_RETENTION_DAYS: number = 30;
+
+  // Cached retention value to avoid querying GlobalConfig on every monitor check
+  private static cachedRetentionDays: number | null = null;
+  private static lastCacheRefresh: Date | null = null;
+  private static readonly CACHE_TTL_MS: number = 5 * 60 * 1000; // 5 minutes
+
+  private static async getRetentionDays(): Promise<number> {
+    const now: Date = OneUptimeDate.getCurrentDate();
+
+    // Return cached value if still fresh
+    if (
+      this.cachedRetentionDays !== null &&
+      this.lastCacheRefresh !== null &&
+      now.getTime() - this.lastCacheRefresh.getTime() < this.CACHE_TTL_MS
+    ) {
+      return this.cachedRetentionDays;
+    }
+
+    try {
+      const globalConfig: GlobalConfig | null =
+        await GlobalConfigService.findOneBy({
+          query: {
+            _id: ObjectID.getZeroObjectID().toString(),
+          },
+          props: {
+            isRoot: true,
+          },
+          select: {
+            monitorMetricRetentionInDays: true,
+          },
+        });
+
+      if (
+        globalConfig &&
+        globalConfig.monitorMetricRetentionInDays !== undefined &&
+        globalConfig.monitorMetricRetentionInDays !== null &&
+        globalConfig.monitorMetricRetentionInDays > 0
+      ) {
+        this.cachedRetentionDays = globalConfig.monitorMetricRetentionInDays;
+      } else {
+        this.cachedRetentionDays = this.DEFAULT_RETENTION_DAYS;
+      }
+
+      this.lastCacheRefresh = now;
+    } catch (error) {
+      logger.error(
+        "Error fetching monitor metric retention config, using default:",
+      );
+      logger.error(error);
+      this.cachedRetentionDays = this.DEFAULT_RETENTION_DAYS;
+      this.lastCacheRefresh = now;
+    }
+
+    return this.cachedRetentionDays;
+  }
+  private static buildMonitorMetricAttributes(data: {
+    monitorId: ObjectID;
+    projectId: ObjectID;
+    monitorName?: string | undefined;
+    probeName?: string | undefined;
+    extraAttributes?: JSONObject;
+  }): JSONObject {
+    const attributes: JSONObject = {
+      monitorId: data.monitorId.toString(),
+      projectId: data.projectId.toString(),
+    };
+
+    if (data.extraAttributes) {
+      Object.assign(attributes, data.extraAttributes);
+    }
+
+    if (data.monitorName) {
+      attributes["monitorName"] = data.monitorName;
+    }
+
+    if (data.probeName) {
+      attributes["probeName"] = data.probeName;
+    }
+
+    return attributes;
+  }
+
+  private static async buildMonitorMetricRow(data: {
+    projectId: ObjectID;
+    monitorId: ObjectID;
+    metricName: string;
+    value: number | null | undefined;
+    attributes: JSONObject;
+    metricPointType?: MetricPointType;
+  }): Promise<JSONObject> {
+    const ingestionDate: Date = OneUptimeDate.getCurrentDate();
+    const ingestionTimestamp: string =
+      OneUptimeDate.toClickhouseDateTime(ingestionDate);
+    const timeUnixNano: string =
+      OneUptimeDate.toUnixNano(ingestionDate).toString();
+
+    const attributes: JSONObject = { ...data.attributes };
+    const attributeKeys: Array<string> =
+      TelemetryUtil.getAttributeKeys(attributes);
+
+    const retentionDays: number = await this.getRetentionDays();
+    const retentionDate: Date = OneUptimeDate.addRemoveDays(
+      ingestionDate,
+      retentionDays,
+    );
+
+    return {
+      _id: ObjectID.generateTimeOrdered().toString(),
+      createdAt: ingestionTimestamp,
+      projectId: data.projectId.toString(),
+      primaryEntityId: data.monitorId.toString(),
+      primaryEntityType: ServiceType.Monitor,
+      name: data.metricName,
+      aggregationTemporality: null,
+      metricPointType: data.metricPointType || MetricPointType.Sum,
+      time: ingestionTimestamp,
+      startTime: null,
+      timeUnixNano: timeUnixNano,
+      startTimeUnixNano: null,
+      attributes: attributes,
+      attributeKeys: attributeKeys,
+      isMonotonic: null,
+      count: null,
+      sum: null,
+      min: null,
+      max: null,
+      bucketCounts: [],
+      explicitBounds: [],
+      value: data.value ?? null,
+      retentionDate: OneUptimeDate.toClickhouseDateTime(retentionDate),
+    } as JSONObject;
+  }
+
+  /*
+   * Helper that collapses the "build attributes → build row → push → register MetricType"
+   * pattern used repeatedly below. Silently skips emission when value is missing/non-finite
+   * so callers can pass optional agent fields directly.
+   */
+  private static async pushMonitorMetric(data: {
+    projectId: ObjectID;
+    monitorId: ObjectID;
+    monitorName: string | undefined;
+    probeName: string | undefined;
+    metricName: string;
+    value: number | null | undefined;
+    description: string;
+    unit: string;
+    extraAttributes?: JSONObject;
+    metricPointType?: MetricPointType;
+    metricRows: Array<JSONObject>;
+    metricNameServiceNameMap: Dictionary<MetricType>;
+  }): Promise<void> {
+    if (
+      data.value === undefined ||
+      data.value === null ||
+      typeof data.value !== "number" ||
+      !isFinite(data.value)
+    ) {
+      return;
+    }
+
+    const attributeInput: {
+      monitorId: ObjectID;
+      projectId: ObjectID;
+      monitorName?: string | undefined;
+      probeName?: string | undefined;
+      extraAttributes?: JSONObject;
+    } = {
+      monitorId: data.monitorId,
+      projectId: data.projectId,
+      monitorName: data.monitorName,
+      probeName: data.probeName,
+    };
+
+    if (data.extraAttributes) {
+      attributeInput.extraAttributes = data.extraAttributes;
+    }
+
+    const attributes: JSONObject =
+      this.buildMonitorMetricAttributes(attributeInput);
+
+    const metricRow: JSONObject = await this.buildMonitorMetricRow({
+      projectId: data.projectId,
+      monitorId: data.monitorId,
+      metricName: data.metricName,
+      value: data.value,
+      attributes: attributes,
+      metricPointType: data.metricPointType || MetricPointType.Sum,
+    });
+
+    data.metricRows.push(metricRow);
+
+    const metricType: MetricType = new MetricType();
+    metricType.name = data.metricName;
+    metricType.description = data.description;
+    metricType.unit = data.unit;
+
+    data.metricNameServiceNameMap[data.metricName] = metricType;
+  }
+
+  /**
+   * Stamp every metric row produced by one monitor check with the monitor's
+   * label and custom field attributes.
+   *
+   * Done as a single pass over the finished rows rather than threaded through
+   * the ~30 emission sites below: every metric from one check describes the
+   * same monitor, so there is nothing per-metric to decide, and one pass is
+   * far easier to keep correct than thirty call sites.
+   *
+   * Resource attributes are merged LAST, so a resource attribute wins any
+   * collision. That merge is NOT what keeps the oneuptime.* namespace safe
+   * from a monitor script, though — it only ever writes the handful of keys
+   * this monitor's own labels and custom fields produce, and it does not run
+   * at all for a monitor that has neither. Script-supplied attribute keys are
+   * refused at the point they are read instead, by
+   * CapturedMetricAttributeUtil, which rejects the whole oneuptime.* and
+   * resource.* namespaces rather than the keys that happen to collide today.
+   */
+  public static applyResourceAttributesToMetricRows(data: {
+    metricRows: Array<JSONObject>;
+    labels?: Array<Label> | undefined;
+    customFields?: JSONObject | undefined;
+  }): void {
+    const resourceAttributes: JSONObject =
+      MetricResourceAttributeUtil.getResourceAttributes({
+        labels: data.labels,
+        customFields: data.customFields,
+      });
+
+    if (Object.keys(resourceAttributes).length === 0) {
+      // Nothing to stamp; leave the rows (and their attributeKeys) untouched.
+      return;
+    }
+
+    for (const metricRow of data.metricRows) {
+      const attributes: JSONObject =
+        MetricResourceAttributeUtil.mergeResourceAttributes(
+          (metricRow["attributes"] as JSONObject) || {},
+          resourceAttributes,
+        );
+
+      metricRow["attributes"] = attributes;
+      metricRow["attributeKeys"] = TelemetryUtil.getAttributeKeys(attributes);
+    }
+  }
+
+  @CaptureSpan()
+  public static async saveMonitorMetrics(data: {
+    monitorId: ObjectID;
+    projectId: ObjectID;
+    dataToProcess: DataToProcess;
+    probeName: string | undefined;
+    monitorName: string | undefined;
+    /*
+     * The monitor's own taxonomy, passed in by the caller which has already
+     * loaded the monitor — this is the hottest Postgres path in the product,
+     * so nothing here re-reads it. Both are optional: callers that do not
+     * select them simply record no oneuptime.label.* / oneuptime.customField.*
+     * attributes.
+     */
+    monitorLabels?: Array<Label> | undefined;
+    monitorCustomFields?: JSONObject | undefined;
+  }): Promise<void> {
+    if (!data.monitorId) {
+      return;
+    }
+
+    if (!data.projectId) {
+      return;
+    }
+
+    if (!data.dataToProcess) {
+      return;
+    }
+
+    const metricRows: Array<JSONObject> = [];
+
+    /*
+     * Metric name to serviceId map
+     * example: "cpu.usage" -> [serviceId1, serviceId2]
+     * since these are monitor metrics. They dont belong to any service so we can keep the array empty.
+     */
+    const metricNameServiceNameMap: Dictionary<MetricType> = {};
+
+    if (
+      (data.dataToProcess as ServerMonitorResponse).basicInfrastructureMetrics
+    ) {
+      // store cpu, memory, disk metrics.
+
+      if ((data.dataToProcess as ServerMonitorResponse).requestReceivedAt) {
+        let isOnline: boolean = true;
+
+        const differenceInMinutes: number =
+          OneUptimeDate.getDifferenceInMinutes(
+            (data.dataToProcess as ServerMonitorResponse).requestReceivedAt,
+            OneUptimeDate.getCurrentDate(),
+          );
+
+        if (differenceInMinutes > 2) {
+          isOnline = false;
+        }
+
+        const attributes: JSONObject = this.buildMonitorMetricAttributes({
+          monitorId: data.monitorId,
+          projectId: data.projectId,
+          monitorName: data.monitorName,
+          probeName: data.probeName,
+        });
+
+        const metricRow: JSONObject = await this.buildMonitorMetricRow({
+          projectId: data.projectId,
+          monitorId: data.monitorId,
+          metricName: MonitorMetricType.IsOnline,
+          value: isOnline ? 1 : 0,
+          attributes: attributes,
+          metricPointType: MetricPointType.Sum,
+        });
+
+        metricRows.push(metricRow);
+
+        // add MetricType
+        const metricType: MetricType = new MetricType();
+        metricType.name = MonitorMetricType.IsOnline;
+        metricType.description = CheckOn.IsOnline + " status for monitor";
+        metricType.unit = "";
+
+        // add to map
+        metricNameServiceNameMap[MonitorMetricType.IsOnline] = metricType;
+      }
+
+      const basicMetrics: BasicInfrastructureMetrics | undefined = (
+        data.dataToProcess as ServerMonitorResponse
+      ).basicInfrastructureMetrics;
+
+      if (!basicMetrics) {
+        return;
+      }
+
+      if (basicMetrics.cpuMetrics) {
+        const attributes: JSONObject = this.buildMonitorMetricAttributes({
+          monitorId: data.monitorId,
+          projectId: data.projectId,
+          monitorName: data.monitorName,
+          probeName: data.probeName,
+        });
+
+        const metricRow: JSONObject = await this.buildMonitorMetricRow({
+          projectId: data.projectId,
+          monitorId: data.monitorId,
+          metricName: MonitorMetricType.CPUUsagePercent,
+          value: basicMetrics.cpuMetrics.percentUsed ?? null,
+          attributes: attributes,
+          metricPointType: MetricPointType.Sum,
+        });
+
+        metricRows.push(metricRow);
+
+        const metricType: MetricType = new MetricType();
+        metricType.name = MonitorMetricType.CPUUsagePercent;
+        metricType.description = CheckOn.CPUUsagePercent + " of Server/VM";
+        metricType.unit = "%";
+
+        metricNameServiceNameMap[MonitorMetricType.CPUUsagePercent] =
+          metricType;
+      }
+
+      if (basicMetrics.memoryMetrics) {
+        const attributes: JSONObject = this.buildMonitorMetricAttributes({
+          monitorId: data.monitorId,
+          projectId: data.projectId,
+          monitorName: data.monitorName,
+          probeName: data.probeName,
+        });
+
+        const metricRow: JSONObject = await this.buildMonitorMetricRow({
+          projectId: data.projectId,
+          monitorId: data.monitorId,
+          metricName: MonitorMetricType.MemoryUsagePercent,
+          value: basicMetrics.memoryMetrics.percentUsed ?? null,
+          attributes: attributes,
+          metricPointType: MetricPointType.Sum,
+        });
+
+        metricRows.push(metricRow);
+
+        const metricType: MetricType = new MetricType();
+        metricType.name = MonitorMetricType.MemoryUsagePercent;
+        metricType.description = CheckOn.MemoryUsagePercent + " of Server/VM";
+        metricType.unit = "%";
+
+        metricNameServiceNameMap[MonitorMetricType.MemoryUsagePercent] =
+          metricType;
+      }
+
+      if (basicMetrics.diskMetrics && basicMetrics.diskMetrics.length > 0) {
+        for (const diskMetric of basicMetrics.diskMetrics) {
+          const extraAttributes: JSONObject = {};
+
+          if (diskMetric.diskPath) {
+            extraAttributes["diskPath"] = diskMetric.diskPath;
+          }
+
+          const attributes: JSONObject = this.buildMonitorMetricAttributes({
+            monitorId: data.monitorId,
+            projectId: data.projectId,
+            monitorName: data.monitorName,
+            probeName: data.probeName,
+            extraAttributes: extraAttributes,
+          });
+
+          const metricRow: JSONObject = await this.buildMonitorMetricRow({
+            projectId: data.projectId,
+            monitorId: data.monitorId,
+            metricName: MonitorMetricType.DiskUsagePercent,
+            value: diskMetric.percentUsed ?? null,
+            attributes: attributes,
+            metricPointType: MetricPointType.Sum,
+          });
+
+          metricRows.push(metricRow);
+
+          const metricType: MetricType = new MetricType();
+          metricType.name = MonitorMetricType.DiskUsagePercent;
+          metricType.description = CheckOn.DiskUsagePercent + " of Server/VM";
+          metricType.unit = "%";
+
+          metricNameServiceNameMap[MonitorMetricType.DiskUsagePercent] =
+            metricType;
+        }
+
+        // Per-disk I/O counters (cumulative since boot).
+        for (const diskMetric of basicMetrics.diskMetrics) {
+          const diskAttrs: JSONObject = {};
+          if (diskMetric.diskPath) {
+            diskAttrs["diskPath"] = diskMetric.diskPath;
+          }
+          if (diskMetric.device) {
+            diskAttrs["device"] = diskMetric.device;
+          }
+          if (diskMetric.fstype) {
+            diskAttrs["fstype"] = diskMetric.fstype;
+          }
+
+          await this.pushMonitorMetric({
+            projectId: data.projectId,
+            monitorId: data.monitorId,
+            monitorName: data.monitorName,
+            probeName: data.probeName,
+            metricName: MonitorMetricType.DiskReadBytesTotal,
+            value: diskMetric.readBytes,
+            description: "Total bytes read from disk since boot",
+            unit: "bytes",
+            extraAttributes: diskAttrs,
+            metricRows,
+            metricNameServiceNameMap,
+          });
+
+          await this.pushMonitorMetric({
+            projectId: data.projectId,
+            monitorId: data.monitorId,
+            monitorName: data.monitorName,
+            probeName: data.probeName,
+            metricName: MonitorMetricType.DiskWriteBytesTotal,
+            value: diskMetric.writeBytes,
+            description: "Total bytes written to disk since boot",
+            unit: "bytes",
+            extraAttributes: diskAttrs,
+            metricRows,
+            metricNameServiceNameMap,
+          });
+
+          await this.pushMonitorMetric({
+            projectId: data.projectId,
+            monitorId: data.monitorId,
+            monitorName: data.monitorName,
+            probeName: data.probeName,
+            metricName: MonitorMetricType.DiskReadOpsTotal,
+            value: diskMetric.readCount,
+            description: "Total disk read operations since boot",
+            unit: "ops",
+            extraAttributes: diskAttrs,
+            metricRows,
+            metricNameServiceNameMap,
+          });
+
+          await this.pushMonitorMetric({
+            projectId: data.projectId,
+            monitorId: data.monitorId,
+            monitorName: data.monitorName,
+            probeName: data.probeName,
+            metricName: MonitorMetricType.DiskWriteOpsTotal,
+            value: diskMetric.writeCount,
+            description: "Total disk write operations since boot",
+            unit: "ops",
+            extraAttributes: diskAttrs,
+            metricRows,
+            metricNameServiceNameMap,
+          });
+        }
+      }
+
+      // Load average (1/5/15 min). Emitted only when the agent provides it.
+      if (basicMetrics.loadMetrics) {
+        await this.pushMonitorMetric({
+          projectId: data.projectId,
+          monitorId: data.monitorId,
+          monitorName: data.monitorName,
+          probeName: data.probeName,
+          metricName: MonitorMetricType.LoadAverage1Min,
+          value: basicMetrics.loadMetrics.load1,
+          description: "1-minute load average",
+          unit: "",
+          metricRows,
+          metricNameServiceNameMap,
+        });
+        await this.pushMonitorMetric({
+          projectId: data.projectId,
+          monitorId: data.monitorId,
+          monitorName: data.monitorName,
+          probeName: data.probeName,
+          metricName: MonitorMetricType.LoadAverage5Min,
+          value: basicMetrics.loadMetrics.load5,
+          description: "5-minute load average",
+          unit: "",
+          metricRows,
+          metricNameServiceNameMap,
+        });
+        await this.pushMonitorMetric({
+          projectId: data.projectId,
+          monitorId: data.monitorId,
+          monitorName: data.monitorName,
+          probeName: data.probeName,
+          metricName: MonitorMetricType.LoadAverage15Min,
+          value: basicMetrics.loadMetrics.load15,
+          description: "15-minute load average",
+          unit: "",
+          metricRows,
+          metricNameServiceNameMap,
+        });
+      }
+
+      // Memory extras: swap + available.
+      if (basicMetrics.memoryMetrics) {
+        await this.pushMonitorMetric({
+          projectId: data.projectId,
+          monitorId: data.monitorId,
+          monitorName: data.monitorName,
+          probeName: data.probeName,
+          metricName: MonitorMetricType.SwapUsagePercent,
+          value: basicMetrics.memoryMetrics.swapPercentUsed,
+          description: "Swap memory usage percentage",
+          unit: "%",
+          metricRows,
+          metricNameServiceNameMap,
+        });
+        await this.pushMonitorMetric({
+          projectId: data.projectId,
+          monitorId: data.monitorId,
+          monitorName: data.monitorName,
+          probeName: data.probeName,
+          metricName: MonitorMetricType.MemoryAvailableBytes,
+          value: basicMetrics.memoryMetrics.available,
+          description: "Memory available to new allocations",
+          unit: "bytes",
+          metricRows,
+          metricNameServiceNameMap,
+        });
+      }
+
+      // CPU time breakdown — drills down into what the CPU was doing.
+      if (basicMetrics.cpuMetrics) {
+        await this.pushMonitorMetric({
+          projectId: data.projectId,
+          monitorId: data.monitorId,
+          monitorName: data.monitorName,
+          probeName: data.probeName,
+          metricName: MonitorMetricType.CPUTimeUserPercent,
+          value: basicMetrics.cpuMetrics.timeUserPercent,
+          description: "CPU time spent in user space",
+          unit: "%",
+          metricRows,
+          metricNameServiceNameMap,
+        });
+        await this.pushMonitorMetric({
+          projectId: data.projectId,
+          monitorId: data.monitorId,
+          monitorName: data.monitorName,
+          probeName: data.probeName,
+          metricName: MonitorMetricType.CPUTimeSystemPercent,
+          value: basicMetrics.cpuMetrics.timeSystemPercent,
+          description: "CPU time spent in kernel space",
+          unit: "%",
+          metricRows,
+          metricNameServiceNameMap,
+        });
+        await this.pushMonitorMetric({
+          projectId: data.projectId,
+          monitorId: data.monitorId,
+          monitorName: data.monitorName,
+          probeName: data.probeName,
+          metricName: MonitorMetricType.CPUTimeIoWaitPercent,
+          value: basicMetrics.cpuMetrics.timeIoWaitPercent,
+          description: "CPU time spent waiting on I/O",
+          unit: "%",
+          metricRows,
+          metricNameServiceNameMap,
+        });
+        await this.pushMonitorMetric({
+          projectId: data.projectId,
+          monitorId: data.monitorId,
+          monitorName: data.monitorName,
+          probeName: data.probeName,
+          metricName: MonitorMetricType.CPUTimeIdlePercent,
+          value: basicMetrics.cpuMetrics.timeIdlePercent,
+          description: "CPU time spent idle",
+          unit: "%",
+          metricRows,
+          metricNameServiceNameMap,
+        });
+        await this.pushMonitorMetric({
+          projectId: data.projectId,
+          monitorId: data.monitorId,
+          monitorName: data.monitorName,
+          probeName: data.probeName,
+          metricName: MonitorMetricType.CPUTimeStealPercent,
+          value: basicMetrics.cpuMetrics.timeStealPercent,
+          description: "CPU time stolen by the hypervisor",
+          unit: "%",
+          metricRows,
+          metricNameServiceNameMap,
+        });
+      }
+
+      // Network counters — both per-interface and aggregate.
+      if (basicMetrics.networkMetrics) {
+        const net: typeof basicMetrics.networkMetrics =
+          basicMetrics.networkMetrics;
+
+        for (const iface of net.interfaces || []) {
+          const ifaceAttrs: JSONObject = {
+            interfaceName: (iface as NetworkInterfaceMetrics).interfaceName,
+          };
+
+          await this.pushMonitorMetric({
+            projectId: data.projectId,
+            monitorId: data.monitorId,
+            monitorName: data.monitorName,
+            probeName: data.probeName,
+            metricName: MonitorMetricType.NetworkBytesReceivedTotal,
+            value: iface.bytesReceived,
+            description: "Network bytes received since boot (per-interface)",
+            unit: "bytes",
+            extraAttributes: ifaceAttrs,
+            metricRows,
+            metricNameServiceNameMap,
+          });
+          await this.pushMonitorMetric({
+            projectId: data.projectId,
+            monitorId: data.monitorId,
+            monitorName: data.monitorName,
+            probeName: data.probeName,
+            metricName: MonitorMetricType.NetworkBytesSentTotal,
+            value: iface.bytesSent,
+            description: "Network bytes sent since boot (per-interface)",
+            unit: "bytes",
+            extraAttributes: ifaceAttrs,
+            metricRows,
+            metricNameServiceNameMap,
+          });
+          await this.pushMonitorMetric({
+            projectId: data.projectId,
+            monitorId: data.monitorId,
+            monitorName: data.monitorName,
+            probeName: data.probeName,
+            metricName: MonitorMetricType.NetworkPacketsReceivedTotal,
+            value: iface.packetsReceived,
+            description: "Network packets received since boot (per-interface)",
+            unit: "packets",
+            extraAttributes: ifaceAttrs,
+            metricRows,
+            metricNameServiceNameMap,
+          });
+          await this.pushMonitorMetric({
+            projectId: data.projectId,
+            monitorId: data.monitorId,
+            monitorName: data.monitorName,
+            probeName: data.probeName,
+            metricName: MonitorMetricType.NetworkPacketsSentTotal,
+            value: iface.packetsSent,
+            description: "Network packets sent since boot (per-interface)",
+            unit: "packets",
+            extraAttributes: ifaceAttrs,
+            metricRows,
+            metricNameServiceNameMap,
+          });
+          await this.pushMonitorMetric({
+            projectId: data.projectId,
+            monitorId: data.monitorId,
+            monitorName: data.monitorName,
+            probeName: data.probeName,
+            metricName: MonitorMetricType.NetworkErrorsIn,
+            value: iface.errorsIn,
+            description: "Network receive errors since boot (per-interface)",
+            unit: "errors",
+            extraAttributes: ifaceAttrs,
+            metricRows,
+            metricNameServiceNameMap,
+          });
+          await this.pushMonitorMetric({
+            projectId: data.projectId,
+            monitorId: data.monitorId,
+            monitorName: data.monitorName,
+            probeName: data.probeName,
+            metricName: MonitorMetricType.NetworkErrorsOut,
+            value: iface.errorsOut,
+            description: "Network transmit errors since boot (per-interface)",
+            unit: "errors",
+            extraAttributes: ifaceAttrs,
+            metricRows,
+            metricNameServiceNameMap,
+          });
+        }
+
+        await this.pushMonitorMetric({
+          projectId: data.projectId,
+          monitorId: data.monitorId,
+          monitorName: data.monitorName,
+          probeName: data.probeName,
+          metricName: MonitorMetricType.NetworkConnectionsEstablished,
+          value: net.connectionsEstablished,
+          description: "Count of ESTABLISHED network connections",
+          unit: "connections",
+          metricRows,
+          metricNameServiceNameMap,
+        });
+        await this.pushMonitorMetric({
+          projectId: data.projectId,
+          monitorId: data.monitorId,
+          monitorName: data.monitorName,
+          probeName: data.probeName,
+          metricName: MonitorMetricType.NetworkConnectionsListen,
+          value: net.connectionsListen,
+          description: "Count of LISTENing network sockets",
+          unit: "connections",
+          metricRows,
+          metricNameServiceNameMap,
+        });
+      }
+
+      // Host uptime.
+      if (basicMetrics.hostMetrics) {
+        await this.pushMonitorMetric({
+          projectId: data.projectId,
+          monitorId: data.monitorId,
+          monitorName: data.monitorName,
+          probeName: data.probeName,
+          metricName: MonitorMetricType.HostUptimeSeconds,
+          value: basicMetrics.hostMetrics.uptimeSeconds,
+          description: "Host uptime in seconds",
+          unit: "seconds",
+          metricRows,
+          metricNameServiceNameMap,
+        });
+      }
+
+      // Process count — simple scalar derived from the processes array.
+      const serverProcesses: Array<unknown> | undefined = (
+        data.dataToProcess as ServerMonitorResponse
+      ).processes;
+      if (serverProcesses && serverProcesses.length >= 0) {
+        await this.pushMonitorMetric({
+          projectId: data.projectId,
+          monitorId: data.monitorId,
+          monitorName: data.monitorName,
+          probeName: data.probeName,
+          metricName: MonitorMetricType.ProcessCountTotal,
+          value: serverProcesses.length,
+          description: "Total running processes on the server",
+          unit: "processes",
+          metricRows,
+          metricNameServiceNameMap,
+        });
+      }
+    }
+
+    if (
+      (data.dataToProcess as ProbeMonitorResponse).customCodeMonitorResponse
+        ?.executionTimeInMS
+    ) {
+      const extraAttributes: JSONObject = {
+        probeId: (
+          data.dataToProcess as ProbeMonitorResponse
+        ).probeId.toString(),
+      };
+
+      const attributes: JSONObject = this.buildMonitorMetricAttributes({
+        monitorId: data.monitorId,
+        projectId: data.projectId,
+        extraAttributes: extraAttributes,
+      });
+
+      const metricRow: JSONObject = await this.buildMonitorMetricRow({
+        projectId: data.projectId,
+        monitorId: data.monitorId,
+        metricName: MonitorMetricType.ExecutionTime,
+        value:
+          (data.dataToProcess as ProbeMonitorResponse).customCodeMonitorResponse
+            ?.executionTimeInMS ?? null,
+        attributes: attributes,
+        metricPointType: MetricPointType.Sum,
+      });
+
+      metricRows.push(metricRow);
+
+      const metricType: MetricType = new MetricType();
+      metricType.name = MonitorMetricType.ExecutionTime;
+      metricType.description = CheckOn.ExecutionTime + " of this monitor";
+      metricType.unit = "ms";
+
+      metricNameServiceNameMap[MonitorMetricType.ExecutionTime] = metricType;
+    }
+
+    if (
+      (data.dataToProcess as ProbeMonitorResponse) &&
+      (data.dataToProcess as ProbeMonitorResponse).syntheticMonitorResponse &&
+      (
+        (data.dataToProcess as ProbeMonitorResponse).syntheticMonitorResponse ||
+        []
+      ).length > 0
+    ) {
+      const syntheticResponses: Array<SyntheticMonitorResponse> =
+        (data.dataToProcess as ProbeMonitorResponse).syntheticMonitorResponse ||
+        [];
+
+      for (const syntheticMonitorResponse of syntheticResponses) {
+        const extraAttributes: JSONObject = {
+          probeId: (
+            data.dataToProcess as ProbeMonitorResponse
+          ).probeId.toString(),
+        };
+
+        if (syntheticMonitorResponse.browserType) {
+          extraAttributes["browserType"] = syntheticMonitorResponse.browserType;
+        }
+
+        if (syntheticMonitorResponse.screenSizeType) {
+          extraAttributes["screenSizeType"] =
+            syntheticMonitorResponse.screenSizeType;
+        }
+
+        const attributes: JSONObject = this.buildMonitorMetricAttributes({
+          monitorId: data.monitorId,
+          projectId: data.projectId,
+          monitorName: data.monitorName,
+          probeName: data.probeName,
+          extraAttributes: extraAttributes,
+        });
+
+        const metricRow: JSONObject = await this.buildMonitorMetricRow({
+          projectId: data.projectId,
+          monitorId: data.monitorId,
+          metricName: MonitorMetricType.ExecutionTime,
+          value: syntheticMonitorResponse.executionTimeInMS ?? null,
+          attributes: attributes,
+          metricPointType: MetricPointType.Sum,
+        });
+
+        metricRows.push(metricRow);
+
+        const metricType: MetricType = new MetricType();
+        metricType.name = MonitorMetricType.ExecutionTime;
+        metricType.description = CheckOn.ExecutionTime + " of this monitor";
+        metricType.unit = "ms";
+
+        metricNameServiceNameMap[MonitorMetricType.ExecutionTime] = metricType;
+      }
+    }
+
+    if ((data.dataToProcess as ProbeMonitorResponse).responseTimeInMs) {
+      const extraAttributes: JSONObject = {
+        probeId: (
+          data.dataToProcess as ProbeMonitorResponse
+        ).probeId.toString(),
+      };
+
+      const attributes: JSONObject = this.buildMonitorMetricAttributes({
+        monitorId: data.monitorId,
+        projectId: data.projectId,
+        monitorName: data.monitorName,
+        probeName: data.probeName,
+        extraAttributes: extraAttributes,
+      });
+
+      const metricRow: JSONObject = await this.buildMonitorMetricRow({
+        projectId: data.projectId,
+        monitorId: data.monitorId,
+        metricName: MonitorMetricType.ResponseTime,
+        value:
+          (data.dataToProcess as ProbeMonitorResponse).responseTimeInMs ?? null,
+        attributes: attributes,
+        metricPointType: MetricPointType.Sum,
+      });
+
+      metricRows.push(metricRow);
+
+      const metricType: MetricType = new MetricType();
+      metricType.name = MonitorMetricType.ResponseTime;
+      metricType.description = CheckOn.ResponseTime + " of this monitor";
+      metricType.unit = "ms";
+
+      metricNameServiceNameMap[MonitorMetricType.ResponseTime] = metricType;
+    }
+
+    const databaseResponse: DatabaseMonitorResponse | undefined = (
+      data.dataToProcess as ProbeMonitorResponse
+    ).databaseMonitorResponse;
+
+    if (databaseResponse) {
+      const extraAttributes: JSONObject = {
+        probeId: (
+          data.dataToProcess as ProbeMonitorResponse
+        ).probeId.toString(),
+      };
+
+      /*
+       * Driven off the catalog rather than a list here so a metric is wired
+       * end to end the moment it is added there. Every database series is
+       * single-valued per check, so there is no per-series fan-out to cap
+       * and probeId is the only attribute worth carrying.
+       *
+       * A metric the engine could not report, or whose group was skipped,
+       * is simply absent from the map and pushMonitorMetric writes no row
+       * for it. Absent must never become zero: a replication lag that was
+       * not measured and a replication lag of zero mean opposite things.
+       */
+      for (const definition of getAllDatabaseMetrics()) {
+        await this.pushMonitorMetric({
+          projectId: data.projectId,
+          monitorId: data.monitorId,
+          monitorName: data.monitorName,
+          probeName: data.probeName,
+          metricName: definition.metricType,
+          value: databaseResponse.metrics[definition.metricType],
+          description: definition.description,
+          unit: definition.unit,
+          extraAttributes: extraAttributes,
+          metricRows: metricRows,
+          metricNameServiceNameMap: metricNameServiceNameMap,
+        });
+      }
+    }
+
+    const snmpInterfaces: Array<SnmpInterface> | undefined = (
+      data.dataToProcess as ProbeMonitorResponse
+    ).snmpResponse?.interfaces;
+
+    if (snmpInterfaces && snmpInterfaces.length > 0) {
+      /*
+       * Cap per-check interface series to keep a single check from writing
+       * unbounded rows (large routers can expose thousands of
+       * subinterfaces). Same approach as the custom-metric cap below.
+       */
+      const interfacesToEmit: Array<SnmpInterface> = snmpInterfaces.slice(
+        0,
+        MAX_INTERFACE_METRIC_SERIES,
+      );
+
+      if (interfacesToEmit.length < snmpInterfaces.length) {
+        logger.warn(
+          `Monitor ${data.monitorId.toString()}: emitting metrics for first ${interfacesToEmit.length} of ${snmpInterfaces.length} SNMP interfaces`,
+        );
+      }
+
+      for (const snmpInterface of interfacesToEmit) {
+        const extraAttributes: JSONObject = {
+          probeId: (
+            data.dataToProcess as ProbeMonitorResponse
+          ).probeId.toString(),
+          interfaceName: snmpInterface.name,
+          interfaceIndex: snmpInterface.interfaceIndex.toString(),
+        };
+
+        const interfaceMetrics: Array<{
+          metricName: MonitorMetricType;
+          value: number | undefined;
+          description: string;
+          unit: string;
+        }> = [
+          {
+            metricName: MonitorMetricType.SnmpInterfaceOperStatus,
+            value: snmpInterface.isOperationallyUp ? 1 : 0,
+            description: "SNMP interface operational status (1 up, 0 down)",
+            unit: "",
+          },
+          {
+            metricName: MonitorMetricType.SnmpInterfaceInBitsPerSecond,
+            value: snmpInterface.inBitsPerSecond,
+            description: "SNMP interface inbound bandwidth",
+            unit: "bps",
+          },
+          {
+            metricName: MonitorMetricType.SnmpInterfaceOutBitsPerSecond,
+            value: snmpInterface.outBitsPerSecond,
+            description: "SNMP interface outbound bandwidth",
+            unit: "bps",
+          },
+          {
+            metricName: MonitorMetricType.SnmpInterfaceUtilizationPercent,
+            value: snmpInterface.utilizationPercent,
+            description: "SNMP interface utilization",
+            unit: "%",
+          },
+          {
+            metricName: MonitorMetricType.SnmpInterfaceErrorsPerSecond,
+            value: snmpInterface.errorsPerSecond,
+            description: "SNMP interface errors per second",
+            unit: "errors/s",
+          },
+        ];
+
+        for (const interfaceMetric of interfaceMetrics) {
+          await this.pushMonitorMetric({
+            projectId: data.projectId,
+            monitorId: data.monitorId,
+            monitorName: data.monitorName,
+            probeName: data.probeName,
+            metricName: interfaceMetric.metricName,
+            value: interfaceMetric.value,
+            description: interfaceMetric.description,
+            unit: interfaceMetric.unit,
+            extraAttributes: extraAttributes,
+            metricRows: metricRows,
+            metricNameServiceNameMap: metricNameServiceNameMap,
+          });
+        }
+      }
+    }
+
+    /*
+     * Polled OID values (vendor-template CPU/memory/temperature and custom
+     * OIDs). Without this the values users poll every check can gate
+     * criteria but can never be charted or evaluated over time. One series
+     * per OID, keyed by the oid/oidName attributes; non-numeric values
+     * (strings, OIDs, MACs) are skipped — they carry no chartable signal.
+     */
+    const snmpOidResponses: Array<SnmpOidResponse> | undefined = (
+      data.dataToProcess as ProbeMonitorResponse
+    ).snmpResponse?.oidResponses;
+
+    if (snmpOidResponses && snmpOidResponses.length > 0) {
+      /*
+       * Same unbounded-write cap rationale as the interface block above.
+       *
+       * Shared with NetworkDeviceMetricUtil rather than repeated as a
+       * literal: this is the monitor-scoped copy of the same emit, and the
+       * two caps have to move together or a device charts a different number
+       * of OIDs than the monitors watching it.
+       */
+      const oidResponsesToEmit: Array<SnmpOidResponse> = snmpOidResponses.slice(
+        0,
+        MAX_OID_METRIC_SERIES,
+      );
+
+      if (oidResponsesToEmit.length < snmpOidResponses.length) {
+        logger.warn(
+          `Monitor ${data.monitorId.toString()}: emitting metrics for first ${oidResponsesToEmit.length} of ${snmpOidResponses.length} SNMP OID responses`,
+        );
+      }
+
+      for (const oidResponse of oidResponsesToEmit) {
+        const numericValue: number | undefined =
+          typeof oidResponse.value === "number" && isFinite(oidResponse.value)
+            ? oidResponse.value
+            : undefined;
+
+        if (numericValue === undefined) {
+          continue;
+        }
+
+        await this.pushMonitorMetric({
+          projectId: data.projectId,
+          monitorId: data.monitorId,
+          monitorName: data.monitorName,
+          probeName: data.probeName,
+          metricName: MonitorMetricType.SnmpOidValue,
+          value: numericValue,
+          description: "Value of a polled SNMP OID",
+          unit: "",
+          extraAttributes: {
+            probeId: (
+              data.dataToProcess as ProbeMonitorResponse
+            ).probeId.toString(),
+            oid: oidResponse.oid,
+            oidName: oidResponse.name || oidResponse.oid,
+          },
+          metricRows: metricRows,
+          metricNameServiceNameMap: metricNameServiceNameMap,
+        });
+      }
+    }
+
+    if ((data.dataToProcess as ProbeMonitorResponse).httpTimings) {
+      const httpTimings: HttpPhaseTimings = (
+        data.dataToProcess as ProbeMonitorResponse
+      ).httpTimings!;
+
+      const extraAttributes: JSONObject = {
+        probeId: (
+          data.dataToProcess as ProbeMonitorResponse
+        ).probeId.toString(),
+      };
+
+      const phaseMetrics: Array<{
+        metricName: MonitorMetricType;
+        value: number | undefined;
+        description: string;
+      }> = [
+        {
+          metricName: MonitorMetricType.DnsLookupTime,
+          value: httpTimings.dnsLookupInMs,
+          description: "DNS lookup time for this monitor",
+        },
+        {
+          metricName: MonitorMetricType.TcpConnectTime,
+          value: httpTimings.tcpConnectInMs,
+          description: "TCP connect time for this monitor",
+        },
+        {
+          metricName: MonitorMetricType.TlsHandshakeTime,
+          value: httpTimings.tlsHandshakeInMs,
+          description: "TLS handshake time for this monitor",
+        },
+        {
+          metricName: MonitorMetricType.TimeToFirstByte,
+          value: httpTimings.timeToFirstByteInMs,
+          description: "Time to first byte for this monitor",
+        },
+        {
+          metricName: MonitorMetricType.DownloadTime,
+          value: httpTimings.downloadInMs,
+          description: "Response download time for this monitor",
+        },
+      ];
+
+      for (const phaseMetric of phaseMetrics) {
+        await this.pushMonitorMetric({
+          projectId: data.projectId,
+          monitorId: data.monitorId,
+          monitorName: data.monitorName,
+          probeName: data.probeName,
+          metricName: phaseMetric.metricName,
+          value: phaseMetric.value,
+          description: phaseMetric.description,
+          unit: "ms",
+          extraAttributes: extraAttributes,
+          metricRows: metricRows,
+          metricNameServiceNameMap: metricNameServiceNameMap,
+        });
+      }
+    }
+
+    const portTimings: PortMonitorTimings | undefined = (
+      data.dataToProcess as ProbeMonitorResponse
+    ).portTimings;
+
+    if (portTimings) {
+      const extraAttributes: JSONObject = {
+        probeId: (
+          data.dataToProcess as ProbeMonitorResponse
+        ).probeId.toString(),
+      };
+
+      const phaseMetrics: Array<{
+        metricName: MonitorMetricType;
+        value: number | undefined;
+        description: string;
+      }> = [
+        {
+          metricName: MonitorMetricType.PortDnsLookupTime,
+          value: portTimings.dnsLookupInMs,
+          description: "DNS lookup time for this Port monitor",
+        },
+        {
+          metricName: MonitorMetricType.PortTcpConnectTime,
+          value: portTimings.tcpConnectInMs,
+          description: "TCP connect time for this Port monitor",
+        },
+      ];
+
+      for (const phaseMetric of phaseMetrics) {
+        await this.pushMonitorMetric({
+          projectId: data.projectId,
+          monitorId: data.monitorId,
+          monitorName: data.monitorName,
+          probeName: data.probeName,
+          metricName: phaseMetric.metricName,
+          value: phaseMetric.value,
+          description: phaseMetric.description,
+          unit: "ms",
+          extraAttributes: extraAttributes,
+          metricRows: metricRows,
+          metricNameServiceNameMap: metricNameServiceNameMap,
+        });
+      }
+    }
+
+    if ((data.dataToProcess as ProbeMonitorResponse).pingResponse) {
+      const pingResponse: PingMonitorResponse = (
+        data.dataToProcess as ProbeMonitorResponse
+      ).pingResponse!;
+
+      const extraAttributes: JSONObject = {
+        probeId: (
+          data.dataToProcess as ProbeMonitorResponse
+        ).probeId.toString(),
+      };
+
+      await this.pushMonitorMetric({
+        projectId: data.projectId,
+        monitorId: data.monitorId,
+        monitorName: data.monitorName,
+        probeName: data.probeName,
+        metricName: MonitorMetricType.PacketLossPercent,
+        value: pingResponse.packetLossPercent,
+        description: CheckOn.PacketLossPercent + " for this monitor",
+        unit: "%",
+        extraAttributes: extraAttributes,
+        metricRows: metricRows,
+        metricNameServiceNameMap: metricNameServiceNameMap,
+      });
+
+      await this.pushMonitorMetric({
+        projectId: data.projectId,
+        monitorId: data.monitorId,
+        monitorName: data.monitorName,
+        probeName: data.probeName,
+        metricName: MonitorMetricType.Jitter,
+        value: pingResponse.jitterInMs,
+        description: CheckOn.Jitter + " for this monitor",
+        unit: "ms",
+        extraAttributes: extraAttributes,
+        metricRows: metricRows,
+        metricNameServiceNameMap: metricNameServiceNameMap,
+      });
+    }
+
+    if ((data.dataToProcess as ProbeMonitorResponse).isOnline !== undefined) {
+      const extraAttributes: JSONObject = {
+        probeId: (
+          data.dataToProcess as ProbeMonitorResponse
+        ).probeId.toString(),
+      };
+
+      const attributes: JSONObject = this.buildMonitorMetricAttributes({
+        monitorId: data.monitorId,
+        projectId: data.projectId,
+        monitorName: data.monitorName,
+        probeName: data.probeName,
+        extraAttributes: extraAttributes,
+      });
+
+      const metricRow: JSONObject = await this.buildMonitorMetricRow({
+        projectId: data.projectId,
+        monitorId: data.monitorId,
+        metricName: MonitorMetricType.IsOnline,
+        value: (data.dataToProcess as ProbeMonitorResponse).isOnline ? 1 : 0,
+        attributes: attributes,
+        metricPointType: MetricPointType.Sum,
+      });
+
+      metricRows.push(metricRow);
+
+      const metricType: MetricType = new MetricType();
+      metricType.name = MonitorMetricType.IsOnline;
+      metricType.description = CheckOn.IsOnline + " status for monitor";
+      metricType.unit = "";
+
+      metricNameServiceNameMap[MonitorMetricType.IsOnline] = metricType;
+    }
+
+    if ((data.dataToProcess as ProbeMonitorResponse).responseCode) {
+      const extraAttributes: JSONObject = {
+        probeId: (
+          data.dataToProcess as ProbeMonitorResponse
+        ).probeId.toString(),
+      };
+
+      const attributes: JSONObject = this.buildMonitorMetricAttributes({
+        monitorId: data.monitorId,
+        projectId: data.projectId,
+        monitorName: data.monitorName,
+        probeName: data.probeName,
+        extraAttributes: extraAttributes,
+      });
+
+      const metricRow: JSONObject = await this.buildMonitorMetricRow({
+        projectId: data.projectId,
+        monitorId: data.monitorId,
+        metricName: MonitorMetricType.ResponseStatusCode,
+        value:
+          (data.dataToProcess as ProbeMonitorResponse).responseCode ?? null,
+        attributes: attributes,
+        metricPointType: MetricPointType.Sum,
+      });
+
+      metricRows.push(metricRow);
+
+      const metricType: MetricType = new MetricType();
+      metricType.name = MonitorMetricType.ResponseStatusCode;
+      metricType.description = CheckOn.ResponseStatusCode + " for this monitor";
+      metricType.unit = "Status Code";
+
+      metricNameServiceNameMap[MonitorMetricType.ResponseStatusCode] =
+        metricType;
+    }
+
+    // Process custom metrics from Custom Code and Synthetic Monitor responses
+    const customCodeMetrics: CapturedMetric[] =
+      (data.dataToProcess as ProbeMonitorResponse).customCodeMonitorResponse
+        ?.capturedMetrics || [];
+
+    const syntheticCustomMetrics: CapturedMetric[] = [];
+    const syntheticResponsesForMetrics: Array<SyntheticMonitorResponse> =
+      (data.dataToProcess as ProbeMonitorResponse).syntheticMonitorResponse ||
+      [];
+    for (const resp of syntheticResponsesForMetrics) {
+      if (resp.capturedMetrics) {
+        syntheticCustomMetrics.push(...resp.capturedMetrics);
+      }
+    }
+
+    const allCustomMetrics: CapturedMetric[] = [
+      ...customCodeMetrics,
+      ...syntheticCustomMetrics,
+    ].slice(0, 100);
+
+    if (allCustomMetrics.length > 0) {
+      logger.debug(
+        `${data.monitorId.toString()} - Processing ${allCustomMetrics.length} custom metrics`,
+      );
+    }
+
+    /*
+     * Keys a script tried to write but is not allowed to own, collected
+     * across the whole check so the operator gets one line naming them
+     * rather than one per datapoint. Without it, an attribute that silently
+     * never reaches a chart is indistinguishable from a bug in the script.
+     */
+    const droppedReservedAttributeKeys: Set<string> = new Set<string>();
+
+    for (const customMetric of allCustomMetrics) {
+      if (
+        !customMetric.name ||
+        typeof customMetric.name !== "string" ||
+        typeof customMetric.value !== "number" ||
+        isNaN(customMetric.value)
+      ) {
+        continue;
+      }
+
+      const prefixedName: string = `custom.monitor.${customMetric.name}`;
+
+      /*
+       * Script-supplied attributes first, OneUptime's own stamps after, so
+       * the stamps are written onto a set the guard has already cleared of
+       * every key OneUptime owns.
+       */
+      const sanitized: SanitizedCapturedMetricAttributes =
+        CapturedMetricAttributeUtil.sanitize(customMetric.attributes);
+
+      for (const droppedKey of sanitized.droppedReservedKeys) {
+        droppedReservedAttributeKeys.add(droppedKey);
+      }
+
+      const extraAttributes: JSONObject = {
+        ...sanitized.attributes,
+        isCustomMetric: "true",
+      };
+
+      if ((data.dataToProcess as ProbeMonitorResponse).probeId) {
+        extraAttributes["probeId"] = (
+          data.dataToProcess as ProbeMonitorResponse
+        ).probeId.toString();
+      }
+
+      const attributes: JSONObject = this.buildMonitorMetricAttributes({
+        monitorId: data.monitorId,
+        projectId: data.projectId,
+        monitorName: data.monitorName,
+        probeName: data.probeName,
+        extraAttributes: extraAttributes,
+      });
+
+      const metricRow: JSONObject = await this.buildMonitorMetricRow({
+        projectId: data.projectId,
+        monitorId: data.monitorId,
+        metricName: prefixedName,
+        value: customMetric.value,
+        attributes: attributes,
+        metricPointType: MetricPointType.Gauge,
+      });
+
+      metricRows.push(metricRow);
+
+      const metricType: MetricType = new MetricType();
+      metricType.name = prefixedName;
+      metricType.description = `Custom metric: ${customMetric.name}`;
+      metricType.unit = "";
+
+      metricNameServiceNameMap[prefixedName] = metricType;
+    }
+
+    if (droppedReservedAttributeKeys.size > 0) {
+      logger.warn(
+        `${data.monitorId.toString()} - Custom metric attributes dropped, these keys are reserved by OneUptime: ${Array.from(
+          droppedReservedAttributeKeys,
+        )
+          .sort()
+          .join(", ")}`,
+      );
+    }
+
+    this.applyResourceAttributesToMetricRows({
+      metricRows: metricRows,
+      labels: data.monitorLabels,
+      customFields: data.monitorCustomFields,
+    });
+
+    if (metricRows.length > 0) {
+      await MetricService.insertJsonRows(metricRows);
+    }
+
+    // index metrics
+    TelemetryUtil.indexMetricNameServiceNameMap({
+      projectId: data.projectId,
+      metricNameServiceNameMap: metricNameServiceNameMap,
+    }).catch((err: Error) => {
+      logger.error(err);
+    });
+  }
+}

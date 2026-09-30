@@ -51,6 +51,9 @@ spec:
         - name: run
           emptyDir:
             sizeLimit: "1Gi"
+        {{- with (default $.Values.extraVolumes $.Values.nginx.extraVolumes) }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- if $.Values.nginx.podSecurityContext }}
       securityContext:
         {{- toYaml $.Values.nginx.podSecurityContext | nindent 8 }}
@@ -75,12 +78,42 @@ spec:
       {{- if $.Values.tolerations }}
       tolerations: {{- $.Values.tolerations | toYaml | nindent 8 }}
       {{- end }}
-      {{- if $.Values.nginx.nodeSelector }}
       nodeSelector:
-        {{- toYaml $.Values.nginx.nodeSelector | nindent 8 }}
-      {{- else if $.Values.nodeSelector }}
-      nodeSelector:
-        {{- toYaml $.Values.nodeSelector | nindent 8 }}
+        {{- include "oneuptime.nodeSelector" ($.Values.nginx.nodeSelector | default $.Values.nodeSelector) | nindent 8 }}
+      {{- if and $.Values.nginx.sysctlTuning $.Values.nginx.sysctlTuning.enabled }}
+      # Widen the ephemeral source-port range and enable TIME_WAIT reuse so the
+      # ingress never runs out of local ports while proxying the ingest and
+      # telemetry firehose to the backend Service. These net.* sysctls are
+      # per-network-namespace; every container in the pod shares one netns, so
+      # nginx inherits them. Runs privileged (tcp_tw_reuse is an "unsafe" sysctl
+      # kubelets do not expose via pod securityContext.sysctls) — which is why
+      # it is opt-in: restricted PodSecurity / Autopilot / OpenShift reject a
+      # privileged pod at admission, so leave sysctlTuning.enabled=false there.
+      initContainers:
+        - name: sysctl-tuning
+          image: {{ include "oneuptime.image" (dict "Values" $.Values "ServiceName" "nginx") }}
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          securityContext:
+            privileged: true
+            runAsNonRoot: false
+            runAsUser: 0
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -x
+              # Non-fatal (|| true) so a kernel that refuses a write can never
+              # block the pod from starting — the gateway still comes up.
+              echo "{{ $.Values.nginx.sysctlTuning.ipLocalPortRange }}" > /proc/sys/net/ipv4/ip_local_port_range || true
+              echo "{{ $.Values.nginx.sysctlTuning.tcpTwReuse }}" > /proc/sys/net/ipv4/tcp_tw_reuse || true
+              echo "{{ $.Values.nginx.sysctlTuning.tcpFinTimeout }}" > /proc/sys/net/ipv4/tcp_fin_timeout || true
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
       {{- end }}
       containers:
         - image: {{ include "oneuptime.image" (dict "Values" $.Values "ServiceName" "nginx") }}
@@ -125,6 +158,9 @@ spec:
               mountPath: /etc/nginx/conf.d
             - name: run
               mountPath: /var/run
+            {{- with (default $.Values.extraVolumeMounts $.Values.nginx.extraVolumeMounts) }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           {{- if $.Values.nginx.containerSecurityContext }}
           securityContext:
             {{- toYaml $.Values.nginx.containerSecurityContext | nindent 12 }}
@@ -140,6 +176,17 @@ spec:
               value: {{ $.Values.nginx.listenAddress | quote }}
             - name: NGINX_LISTEN_OPTIONS
               value: {{ $.Values.nginx.listenOptions | quote }}
+            # Ingest access logging. `default "on"` is deliberately fail-safe:
+            # an empty override -- or a YAML-boolean `off` written unquoted,
+            # which Helm sees as empty -- keeps the ingest logs rather than
+            # silently dropping them. Only the literal string "off"/"false"/
+            # "0"/"no" reaches nginx's map and turns them off.
+            - name: NGINX_INGEST_ACCESS_LOG
+              value: {{ default "on" $.Values.nginx.ingestAccessLog | quote }}
+            - name: NGINX_UPSTREAM_KEEPALIVE
+              value: {{ (and $.Values.nginx.upstreamKeepalive $.Values.nginx.upstreamKeepalive.enabled) | default false | quote }}
+            - name: NGINX_UPSTREAM_KEEPALIVE_CONNECTIONS
+              value: {{ (default 64 (and $.Values.nginx.upstreamKeepalive $.Values.nginx.upstreamKeepalive.connections)) | quote }}
             {{- if $.Values.nginx.serverNamesHash.bucketSize }}
             - name: SERVER_NAMES_HASH_BUCKET_SIZE
               value: {{ $.Values.nginx.serverNamesHash.bucketSize | quote }}
@@ -154,6 +201,9 @@ spec:
               value: "7851" # Port for the nodejs server for live and ready status
             - name: DISABLE_TELEMETRY
               value: {{ $.Values.nginx.disableTelemetryCollection | quote }}
+            {{- with (default $.Values.extraEnv $.Values.nginx.extraEnv) }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           ports:
             - containerPort: 7849
               protocol: TCP

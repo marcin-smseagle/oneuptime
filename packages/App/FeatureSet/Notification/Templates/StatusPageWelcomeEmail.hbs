@@ -1,0 +1,22 @@
+{{> Start this}}
+
+{{> CustomLogo this}}
+
+{{> EmailTitle title=(concat "You have been invited to status page - " statusPageName) }}
+
+{{> InfoBlock info=(concat "You have been invited to status page -  " statusPageName)}}
+
+{{> InfoBlock info="Please click on the button below to set up your account. Please note, this email expires in 24 hours. "}}
+
+{{> ButtonBlock buttonUrl=tokenVerifyUrl buttonText="Set up my account"}}
+
+{{> LinkBlock linkUrl=tokenVerifyUrl linkLabel="You can also copy and paste this link:"}}
+
+
+{{> InfoBlock info="Thanks, have a great day."}}
+
+{{> InfoBlock info=(concat statusPageName " Team.")}}
+
+{{> VerticalSpace this}}
+
+{{> End this}}

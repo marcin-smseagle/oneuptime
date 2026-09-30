@@ -20,10 +20,12 @@ spec:
     spec:
       serviceAccountName: {{ include "kubernetes-agent.serviceAccountName" . }}
       hostPID: true
-      {{- with .Values.ebpf.nodeSelector }}
+      # kubernetes.io/os=linux is always merged in (user keys win): the
+      # image is linux-only and eBPF needs a Linux kernel, and the blanket
+      # toleration below would otherwise land pods on Windows nodes in
+      # permanent ImagePullBackOff.
       nodeSelector:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- include "kubernetes-agent.nodeSelector" .Values.ebpf.nodeSelector | nindent 8 }}
       {{- with .Values.ebpf.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
@@ -88,12 +90,17 @@ spec:
             - name: OTEL_EBPF_METRICS_FEATURES
               value: {{ include "kubernetes-agent.ebpfMetricsFeatures" . | quote }}
             {{- if .Values.ebpf.contextPropagation }}
-            # Inject W3C `traceparent` into outbound traffic so traces
-            # link across services. Mode is governed by
-            # `.Values.ebpf.contextPropagationMode` — default `headers`
-            # (HTTP/1.1 headers only) which is safe alongside service
-            # meshes and eBPF CNIs. Set to `ip` or `all` if you also
-            # need propagation across raw TCP.
+            # Inject a W3C `traceparent` into outbound traffic so traces link
+            # across services. OFF unless explicitly opted into, because every
+            # mode rewrites traffic that is already in flight (in-place buffer
+            # widening for plaintext HTTP, a TC-injected TCP option for TLS and
+            # raw TCP) and a bad rewrite stalls the connection rather than just
+            # losing a span. Mode comes from
+            # `.Values.ebpf.contextPropagationMode` — `headers` (default, the
+            # narrowest), `tcp`, or `all`. No kernel version makes this inert:
+            # below 5.17 OBI falls back to bounded-scan variants and still
+            # rewrites traffic. This pod is privileged, so the capability gate
+            # that would otherwise stop injection is always open.
             - name: OTEL_EBPF_BPF_CONTEXT_PROPAGATION
               value: {{ .Values.ebpf.contextPropagationMode | default "headers" | quote }}
             {{- if .Values.ebpf.trackRequestHeaders }}
@@ -115,13 +122,15 @@ spec:
             # do NOT override it here.
             - name: OTEL_RESOURCE_ATTRIBUTES
               value: "k8s.cluster.name={{ .Values.clusterName }}"
-            {{- if .Values.namespaceFilters.include }}
+            {{- $ebpfInclude := include "kubernetes-agent.namespaceRulePatterns" (dict "root" . "action" "include" "scope" "ebpfDiscovery") | fromJsonArray }}
+            {{- $ebpfExclude := include "kubernetes-agent.namespaceRulePatterns" (dict "root" . "action" "exclude" "scope" "ebpfDiscovery") | fromJsonArray }}
+            {{- if $ebpfInclude }}
             - name: OTEL_EBPF_DISCOVERY_NAMESPACE
-              value: {{ join "," .Values.namespaceFilters.include | quote }}
+              value: {{ join "," $ebpfInclude | quote }}
             {{- end }}
-            {{- if .Values.namespaceFilters.exclude }}
+            {{- if $ebpfExclude }}
             - name: OTEL_EBPF_DISCOVERY_EXCLUDE_NAMESPACE
-              value: {{ join "," .Values.namespaceFilters.exclude | quote }}
+              value: {{ join "," $ebpfExclude | quote }}
             {{- end }}
           resources:
             {{- toYaml .Values.ebpf.resources | nindent 12 }}

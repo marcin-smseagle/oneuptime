@@ -1,0 +1,231 @@
+import PageMap from "../../Utils/PageMap";
+import RouteMap, { RouteUtil } from "../../Utils/RouteMap";
+import Route from "Common/Types/API/Route";
+import IconProp from "Common/Types/Icon/IconProp";
+import Link from "Common/Types/Link";
+import SideMenu, {
+  SideMenuSectionProps,
+} from "Common/UI/Components/SideMenu/SideMenu";
+import Navigation from "Common/UI/Utils/Navigation";
+import React, { ReactElement } from "react";
+
+const DashboardSideMenu: () => ReactElement = (): ReactElement => {
+  let subItemMenuLink: Link | undefined = undefined;
+
+  if (
+    Navigation.isOnThisPage(
+      RouteMap[PageMap.USER_SETTINGS_ON_CALL_LOGS_TIMELINE]!,
+    )
+  ) {
+    subItemMenuLink = {
+      title: "Timeline",
+      to: Navigation.getCurrentRoute(),
+    };
+  }
+
+  const sections: SideMenuSectionProps[] = [
+    /*
+     * First, because it is the page that explains the other twelve. Somebody
+     * who lands here without knowing the difference between a notification
+     * method, a notification rule and a notification setting reaches this
+     * before any of the pages that assume they already know.
+     */
+    {
+      title: "Get Started",
+      items: [
+        {
+          link: {
+            title: "Setup Checklist",
+            to: RouteUtil.populateRouteParams(
+              RouteMap[PageMap.USER_SETTINGS_SETUP] as Route,
+            ),
+          },
+          icon: IconProp.ClipboardDocumentCheck,
+        },
+      ],
+    },
+    {
+      title: "Alerts & Notifications",
+      items: [
+        {
+          link: {
+            title: "Notification Methods",
+            to: RouteUtil.populateRouteParams(
+              RouteMap[PageMap.USER_SETTINGS_NOTIFICATION_METHODS] as Route,
+            ),
+          },
+          icon: IconProp.Bell,
+        },
+        {
+          link: {
+            title: "Notification Settings",
+            to: RouteUtil.populateRouteParams(
+              RouteMap[PageMap.USER_SETTINGS_NOTIFICATION_SETTINGS] as Route,
+            ),
+          },
+          icon: IconProp.Settings,
+        },
+        /*
+         * Last of the three, because it is the only one that answers "how
+         * much", and that question follows "on what channel" and "about
+         * what". Inside this section rather than in one of its own: the two
+         * controls it holds are email-volume controls, and a reader who has
+         * just set up their notifications is exactly the reader who needs to
+         * find them.
+         */
+        {
+          link: {
+            title: "Email Preferences",
+            to: RouteUtil.populateRouteParams(
+              RouteMap[PageMap.USER_SETTINGS_EMAIL_PREFERENCES] as Route,
+            ),
+          },
+          icon: IconProp.Envelope,
+        },
+      ],
+    },
+    {
+      title: "Incident On-Call",
+      items: [
+        {
+          link: {
+            title: "Incident On-Call Rules",
+            to: RouteUtil.populateRouteParams(
+              RouteMap[PageMap.USER_SETTINGS_INCIDENT_ON_CALL_RULES] as Route,
+            ),
+          },
+          icon: IconProp.Alert,
+        },
+        {
+          link: {
+            title: "Incident Episode On-Call Rules",
+            to: RouteUtil.populateRouteParams(
+              RouteMap[
+                PageMap.USER_SETTINGS_INCIDENT_EPISODE_ON_CALL_RULES
+              ] as Route,
+            ),
+          },
+          icon: IconProp.Squares,
+        },
+      ],
+    },
+    {
+      title: "Alert On-Call",
+      items: [
+        {
+          link: {
+            title: "Alert On-Call Rules",
+            to: RouteUtil.populateRouteParams(
+              RouteMap[PageMap.USER_SETTINGS_ALERT_ON_CALL_RULES] as Route,
+            ),
+          },
+          icon: IconProp.ExclaimationCircle,
+        },
+        {
+          link: {
+            title: "Alert Episode On-Call Rules",
+            to: RouteUtil.populateRouteParams(
+              RouteMap[
+                PageMap.USER_SETTINGS_ALERT_EPISODE_ON_CALL_RULES
+              ] as Route,
+            ),
+          },
+          icon: IconProp.Squares,
+        },
+      ],
+    },
+    {
+      title: "On-Call Logs",
+      items: [
+        {
+          link: {
+            title: "On-Call Logs",
+            to: RouteUtil.populateRouteParams(
+              RouteMap[PageMap.USER_SETTINGS_ON_CALL_LOGS] as Route,
+            ),
+          },
+          icon: IconProp.Logs,
+          subItemIcon: IconProp.Clock,
+          subItemLink: subItemMenuLink,
+        },
+      ],
+    },
+    {
+      title: "Incoming Call Policy",
+      items: [
+        {
+          link: {
+            title: "Incoming Phone Numbers",
+            to: RouteUtil.populateRouteParams(
+              RouteMap[
+                PageMap.USER_SETTINGS_INCOMING_CALL_PHONE_NUMBERS
+              ] as Route,
+            ),
+          },
+          icon: IconProp.Call,
+        },
+      ],
+    },
+    /*
+     * Before Workspace: the calendar link is something everybody on a rota
+     * wants, while the workspace links only matter in projects that use them.
+     */
+    {
+      title: "Calendar",
+      items: [
+        {
+          link: {
+            title: "Calendar Feed",
+            to: RouteUtil.populateRouteParams(
+              RouteMap[PageMap.USER_SETTINGS_ON_CALL_CALENDAR_FEED] as Route,
+            ),
+          },
+          icon: IconProp.Calendar,
+        },
+      ],
+    },
+    {
+      title: "Workspace",
+      items: [
+        {
+          link: {
+            title: "Slack",
+            to: RouteUtil.populateRouteParams(
+              RouteMap[PageMap.USER_SETTINGS_SLACK_INTEGRATION] as Route,
+            ),
+          },
+          icon: IconProp.Slack,
+        },
+        {
+          link: {
+            title: "Microsoft Teams",
+            to: RouteUtil.populateRouteParams(
+              RouteMap[
+                PageMap.USER_SETTINGS_MICROSOFT_TEAMS_INTEGRATION
+              ] as Route,
+            ),
+          },
+          icon: IconProp.MicrosoftTeams,
+        },
+      ],
+    },
+    {
+      title: "Profile",
+      items: [
+        {
+          link: {
+            title: "Custom Fields",
+            to: RouteUtil.populateRouteParams(
+              RouteMap[PageMap.USER_SETTINGS_CUSTOM_FIELDS] as Route,
+            ),
+          },
+          icon: IconProp.TableCells,
+        },
+      ],
+    },
+  ];
+
+  return <SideMenu sections={sections} />;
+};
+
+export default DashboardSideMenu;

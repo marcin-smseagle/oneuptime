@@ -1,7 +1,4 @@
 {{- if .Values.pgbouncer.enabled }}
-{{- if and (eq .Values.pgbouncer.poolMode "transaction") (not .Values.migrate.enabled) }}
-{{- fail "pgbouncer.poolMode=transaction requires migrate.enabled=true: in transaction mode the data-migration session advisory lock breaks unless migrations run in the dedicated Job instead of on the runtime pods. Set migrate.enabled=true, or use poolMode=session." }}
-{{- end }}
 {{- $isExternal := and (not .Values.postgresql.enabled) (not .Values.postgresOperator.cnpg.enabled) }}
 {{- $externalSsl := and $isExternal .Values.externalPostgres.ssl.enabled }}
 # =============================================================================
@@ -11,11 +8,10 @@
 # multiplexes their per-process node-postgres pools onto a smaller set of
 # server connections. Fronts WHICHEVER Postgres backend is active — the
 # built-in StatefulSet, the CloudNativePG operator, or an externalPostgres
-# (managed RDS / Cloud SQL / Neon / Azure). Runs in SESSION pool mode by
-# default, which is safe for everything OneUptime does, including the boot-time
-# schema migrations and the session-level advisory lock the data-migration
-# runner relies on. See HelmChart/Docs/Postgres.md for the rationale and for
-# why transaction mode would need the migration path moved off the pooler.
+# (managed RDS / Cloud SQL / Neon / Azure). Either pool mode is safe for
+# everything OneUptime does: runtime traffic uses no session-level Postgres
+# features, and the migration runners no longer take a session-level advisory
+# lock. See HelmChart/Docs/Postgres.md.
 # =============================================================================
 ---
 apiVersion: v1
@@ -98,16 +94,19 @@ spec:
         appname: oneuptime
       annotations:
         # Roll the pods when the rendered pgbouncer.ini (its inputs) changes.
-        checksum/config: {{ printf "%s|%s|%s|%s" (toYaml .Values.pgbouncer) (include "oneuptime.postgres.backendHost" .) (include "oneuptime.postgres.backendPort" .) (include "oneuptime.postgres.backendUser" .) | sha256sum }}
+        {{- /* extraEnv/extraVolumes/extraVolumeMounts are omitted on purpose: they are
+               pod-spec inputs, not pgbouncer.ini inputs, so setting one already changes the
+               pod template and rolls the pods on its own. Leaving them in the hash would
+               instead roll the pooler on the upgrade that merely INTRODUCED the keys, for
+               every install, without the ini changing. */}}
+        checksum/config: {{ printf "%s|%s|%s|%s" (toYaml (omit .Values.pgbouncer "extraEnv" "extraVolumes" "extraVolumeMounts")) (include "oneuptime.postgres.backendHost" .) (include "oneuptime.postgres.backendPort" .) (include "oneuptime.postgres.backendUser" .) | sha256sum }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.pgbouncer.nodeSelector }}
       nodeSelector:
-        {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- include "oneuptime.nodeSelector" .Values.pgbouncer.nodeSelector | nindent 8 }}
       {{- with .Values.pgbouncer.affinity }}
       affinity:
         {{- toYaml . | nindent 8 }}
@@ -156,6 +155,9 @@ spec:
         - name: PGB_DB_USER
           value: {{ include "oneuptime.postgres.backendUser" . | quote }}
         {{- include "oneuptime.postgres.backendPasswordEnv" . | nindent 8 }}
+        {{- with (default $.Values.extraEnv $.Values.pgbouncer.extraEnv) }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
         ports:
         - name: pgbouncer
           containerPort: {{ .Values.pgbouncer.service.port | int }}
@@ -189,6 +191,9 @@ spec:
           mountPath: /etc/pgbouncer/tls
           readOnly: true
         {{- end }}
+        {{- with (default $.Values.extraVolumeMounts $.Values.pgbouncer.extraVolumeMounts) }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       volumes:
       - name: config
         configMap:
@@ -202,6 +207,9 @@ spec:
           items:
           - key: ssl-ca
             path: server-ca.crt
+      {{- end }}
+      {{- with (default $.Values.extraVolumes $.Values.pgbouncer.extraVolumes) }}
+      {{- toYaml . | nindent 6 }}
       {{- end }}
 ---
 apiVersion: v1

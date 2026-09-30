@@ -1,0 +1,69 @@
+import { useQuery, UseQueryResult } from "@tanstack/react-query";
+import {
+  fetchIncidentById,
+  fetchIncidentStates,
+  fetchIncidentStateTimeline,
+  fetchIncidentFeed,
+} from "../api/incidents";
+import type {
+  IncidentItem,
+  IncidentState,
+  StateTimelineItem,
+  FeedItem,
+} from "../api/types";
+
+/*
+ * `IncidentItem | null`, because `fetchIncidentById` resolves `null` for an
+ * incident that is gone. That miss is settled DATA, so `isError` here means
+ * the request failed and a null `data` means there is no such incident.
+ */
+export function useIncidentDetail(
+  projectId: string,
+  incidentId: string,
+): UseQueryResult<IncidentItem | null, Error> {
+  return useQuery({
+    queryKey: ["incident", projectId, incidentId],
+    queryFn: () => {
+      return fetchIncidentById(projectId, incidentId);
+    },
+    enabled: Boolean(projectId) && Boolean(incidentId),
+  });
+}
+
+export function useIncidentStates(
+  projectId: string,
+): UseQueryResult<IncidentState[], Error> {
+  return useQuery({
+    queryKey: ["incident-states", projectId],
+    queryFn: () => {
+      return fetchIncidentStates(projectId);
+    },
+    enabled: Boolean(projectId),
+  });
+}
+
+export function useIncidentStateTimeline(
+  projectId: string,
+  incidentId: string,
+): UseQueryResult<StateTimelineItem[], Error> {
+  return useQuery({
+    queryKey: ["incident-state-timeline", projectId, incidentId],
+    queryFn: () => {
+      return fetchIncidentStateTimeline(projectId, incidentId);
+    },
+    enabled: Boolean(projectId) && Boolean(incidentId),
+  });
+}
+
+export function useIncidentFeed(
+  projectId: string,
+  incidentId: string,
+): UseQueryResult<FeedItem[], Error> {
+  return useQuery({
+    queryKey: ["incident-feed", projectId, incidentId],
+    queryFn: () => {
+      return fetchIncidentFeed(projectId, incidentId);
+    },
+    enabled: Boolean(projectId) && Boolean(incidentId),
+  });
+}

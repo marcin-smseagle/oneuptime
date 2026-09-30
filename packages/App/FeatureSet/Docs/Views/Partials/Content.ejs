@@ -1,0 +1,29 @@
+<article class="docs-article">
+    <nav aria-label="Breadcrumb" class="mb-5">
+        <ol class="docs-breadcrumb flex flex-wrap items-center gap-x-1.5 gap-y-1">
+            <li>
+                <a href="/docs/<%= lang %>/introduction/getting-started"><%- t('ui.docs') %></a>
+            </li>
+            <li aria-hidden="true" class="flex items-center">
+                <svg class="docs-breadcrumb__sep" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+                </svg>
+            </li>
+            <li><span><%- category.title %></span></li>
+            <li aria-hidden="true" class="flex items-center">
+                <svg class="docs-breadcrumb__sep" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/>
+                </svg>
+            </li>
+            <li><span class="docs-breadcrumb__current"><%- link.title %></span></li>
+        </ol>
+    </nav>
+
+    <header class="mb-8">
+        <h1 class="docs-title"><%- link.title %></h1>
+    </header>
+
+    <div class="docs-content" id="docs-content">
+        <%- content %>
+    </div>
+</article>

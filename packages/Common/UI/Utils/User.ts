@@ -1,0 +1,285 @@
+import { IDENTITY_URL } from "../Config";
+import { AppApiRoute } from "../../ServiceRoute";
+import LocalStorage from "./LocalStorage";
+import URL from "../../Types/API/URL";
+import Route from "../../Types/API/Route";
+import Dictionary from "../../Types/Dictionary";
+import Email from "../../Types/Email";
+import BadDataException from "../../Types/Exception/BadDataException";
+import { JSONObject, JSONValue } from "../../Types/JSON";
+import Name from "../../Types/Name";
+import ObjectID from "../../Types/ObjectID";
+import Timezone from "../../Types/Timezone";
+import OneUptimeDate from "../../Types/Date";
+import API from "../Utils/API/API";
+import Cookie from "./Cookie";
+import CookieName from "../../Types/CookieName";
+import SessionStorage from "./SessionStorage";
+import { Logger } from "./Logger";
+
+export default class UserUtil {
+  public static setProfilePicId(id: ObjectID | null): void {
+    if (!id) {
+      LocalStorage.removeItem("profile_pic_id");
+      return;
+    }
+
+    LocalStorage.setItem("profile_pic_id", id.toString());
+  }
+
+  public static getProfilePicId(): ObjectID | null {
+    // check cookie first.
+
+    const profilePicIdCookie: JSONValue | string = Cookie.getItem(
+      CookieName.ProfilePicID,
+    );
+
+    if (profilePicIdCookie) {
+      return new ObjectID(profilePicIdCookie as string);
+    }
+
+    if (!LocalStorage.getItem("profile_pic_id")) {
+      return null;
+    }
+
+    return new ObjectID(
+      (LocalStorage.getItem("profile_pic_id") as string) || "",
+    );
+  }
+
+  public static getProfilePictureRoute(userId: ObjectID): Route {
+    return Route.fromString(AppApiRoute.toString())
+      .addRoute("/user/profile-picture")
+      .addRoute(`/${userId.toString()}`);
+  }
+
+  public static isCardRegistered(): boolean {
+    return Boolean(LocalStorage.getItem("cardRegistered"));
+  }
+
+  public static getSavedUserTimezone(): Timezone {
+    return LocalStorage.getItem("user_timezone") as Timezone;
+  }
+
+  public static setSavedUserTimezone(timezone: Timezone): void {
+    LocalStorage.setItem("user_timezone", timezone);
+    OneUptimeDate.setUserTimezone(timezone);
+  }
+
+  /**
+   * Hand the timezone the user picked in User Settings to OneUptimeDate so
+   * every date the UI renders and every date the user types is resolved in
+   * that zone instead of whatever zone the browser reports. Call this once at
+   * app startup, before anything renders.
+   */
+  public static initializeUserTimezone(): void {
+    try {
+      OneUptimeDate.setUserTimezone(this.getSavedUserTimezone() || null);
+    } catch (err) {
+      // A missing / unreadable local storage must not stop the app from booting.
+      Logger.error(err as Error);
+    }
+  }
+
+  public static getDismissedTimezonePrompt(): Timezone | null {
+    const value: JSONValue = LocalStorage.getItem("user_timezone_dismissed");
+    if (!value) {
+      return null;
+    }
+    return value as Timezone;
+  }
+
+  public static setDismissedTimezonePrompt(timezone: Timezone): void {
+    LocalStorage.setItem("user_timezone_dismissed", timezone);
+  }
+
+  public static clearDismissedTimezonePrompt(): void {
+    LocalStorage.removeItem("user_timezone_dismissed");
+  }
+
+  public static setCardRegistered(value: boolean): void {
+    LocalStorage.setItem("cardRegistered", value.toString());
+  }
+
+  public static setUserId(id: ObjectID): void {
+    LocalStorage.setItem("user_id", id.toString());
+  }
+
+  public static getUserId(): ObjectID {
+    // check cookie first.
+    const userIdCookie: JSONValue | string = Cookie.getItem(CookieName.UserID);
+
+    if (userIdCookie) {
+      return new ObjectID(userIdCookie as string);
+    }
+
+    return new ObjectID((LocalStorage.getItem("user_id") as string) || "");
+  }
+
+  public static getName(): Name {
+    // check cookie first.
+    const userNameCookie: JSONValue | string = Cookie.getItem(CookieName.Name);
+
+    if (userNameCookie) {
+      return new Name(userNameCookie as string);
+    }
+
+    return new Name((LocalStorage.getItem("user_name") as string) || "");
+  }
+
+  public static setName(name: Name): void {
+    LocalStorage.setItem("user_name", name.toString());
+  }
+
+  public static getEmail(): Email | null {
+    // check cookie first.
+
+    const userEmailCookie: JSONValue | string = Cookie.getItem(
+      CookieName.Email,
+    );
+
+    if (userEmailCookie) {
+      return new Email(userEmailCookie as string);
+    }
+
+    if (!LocalStorage.getItem("user_email")) {
+      return null;
+    }
+
+    return new Email(LocalStorage.getItem("user_email") as string);
+  }
+
+  public static setEmail(email: Email): void {
+    LocalStorage.setItem("user_email", email);
+  }
+
+  public static initialUrl(): URL {
+    if (LocalStorage.getItem("initialUrl")) {
+      return URL.fromString(LocalStorage.getItem("initialUrl") as string);
+    }
+
+    throw new BadDataException("Initial URL not found");
+  }
+
+  public static setInitialUrl(url: URL): void {
+    LocalStorage.setItem("initialUrl", url);
+  }
+
+  // TODO: Fix project type
+  public static setProject(project: JSONObject): void {
+    LocalStorage.setItem("project", project);
+  }
+
+  public static getProject(): JSONObject {
+    return LocalStorage.getItem("project") as JSONObject;
+  }
+
+  public static clear(): void {
+    LocalStorage.clear();
+  }
+
+  public static removeUserId(): void {
+    LocalStorage.removeItem("user_id");
+  }
+
+  public static removeAccessToken(): void {
+    LocalStorage.removeItem("token");
+  }
+
+  public static removeInitialUrl(): void {
+    return sessionStorage.removeItem("initialUrl");
+  }
+
+  public static isMasterAdmin(): boolean {
+    // check cookie first.
+
+    const isMasterAdminCookie: JSONValue | string = Cookie.getItem(
+      CookieName.IsMasterAdmin,
+    );
+
+    if (isMasterAdminCookie) {
+      return isMasterAdminCookie === "true" || isMasterAdminCookie === true;
+    }
+
+    return LocalStorage.getItem("is_master_admin") as boolean;
+  }
+
+  public static setIsMasterAdmin(isMasterAdmin: boolean): void {
+    LocalStorage.setItem("is_master_admin", isMasterAdmin);
+  }
+
+  public static isLoggedIn(): boolean {
+    return Boolean(this.getEmail());
+  }
+
+  public static logout(): void {
+    LocalStorage.clear();
+    SessionStorage.clear();
+    Cookie.clearAllCookies();
+    // The next user on this browser must not inherit this user's timezone.
+    OneUptimeDate.setUserTimezone(null);
+
+    API.post({
+      url: URL.fromString(IDENTITY_URL.toString()).addRoute("/logout"),
+    }).catch((err: Error) => {
+      Logger.error("Error during logout:");
+      Logger.error(err.message);
+    });
+  }
+
+  public static getUtmParams(): Dictionary<string> {
+    const localStorageItems: Dictionary<string> = LocalStorage.getAllItems();
+    const result: Dictionary<string> = {};
+
+    for (const key in localStorageItems) {
+      const value: string = localStorageItems[key] as string;
+
+      /*
+       * Older versions of the marketing site stored the literal strings
+       * "null" / "undefined" for missing utm params. Filter those out so
+       * they never end up on the User record.
+       */
+      if (!value || value === "null" || value === "undefined") {
+        continue;
+      }
+
+      if (key.startsWith("utm")) {
+        result[key] = value;
+      }
+    }
+
+    return result;
+  }
+
+  // Ad platform click IDs (gclid, fbclid, etc.) stored by the marketing site.
+  public static getAttributionClickIds(): JSONObject | null {
+    return UserUtil.parseJsonLocalStorageItem("clickIds");
+  }
+
+  // First attributed touch (utm params, click IDs, landing URL) — never overwritten.
+  public static getFirstTouchAttribution(): JSONObject | null {
+    return UserUtil.parseJsonLocalStorageItem("firstTouch");
+  }
+
+  private static parseJsonLocalStorageItem(key: string): JSONObject | null {
+    /*
+     * LocalStorage.getItem JSON-parses stored strings when it can, so this
+     * may already be an object; fall back to parsing the raw string.
+     */
+    let value: JSONValue = LocalStorage.getItem(key);
+
+    if (typeof value === "string") {
+      try {
+        value = JSON.parse(value);
+      } catch {
+        return null;
+      }
+    }
+
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      return value as JSONObject;
+    }
+
+    return null;
+  }
+}

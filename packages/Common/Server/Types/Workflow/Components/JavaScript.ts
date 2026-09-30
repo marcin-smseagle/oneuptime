@@ -1,0 +1,125 @@
+import { WorkflowScriptTimeoutInMS } from "../../../../Server/EnvironmentConfig";
+import VMUtil from "../../../Utils/VM/VMAPI";
+import ComponentCode, { RunOptions, RunReturnType } from "../ComponentCode";
+import BadDataException from "../../../../Types/Exception/BadDataException";
+import ReturnResult from "../../../../Types/IsolatedVM/ReturnResult";
+import { JSONObject, JSONValue } from "../../../../Types/JSON";
+import ComponentMetadata, { Port } from "../../../../Types/Workflow/Component";
+import ComponentID from "../../../../Types/Workflow/ComponentID";
+import JavaScriptComponents from "../../../../Types/Workflow/Components/JavaScript";
+import CaptureSpan from "../../../Utils/Telemetry/CaptureSpan";
+
+export default class JavaScriptCode extends ComponentCode {
+  public constructor() {
+    super();
+
+    const JavaScriptComponent: ComponentMetadata | undefined =
+      JavaScriptComponents.find((i: ComponentMetadata) => {
+        return i.id === ComponentID.JavaScriptCode;
+      });
+
+    if (!JavaScriptComponent) {
+      throw new BadDataException("Custom JavaScript Component not found.");
+    }
+
+    this.setMetadata(JavaScriptComponent);
+  }
+
+  @CaptureSpan()
+  public override async run(
+    args: JSONObject,
+    options: RunOptions,
+  ): Promise<RunReturnType> {
+    const successPort: Port | undefined = this.getMetadata().outPorts.find(
+      (p: Port) => {
+        return p.id === "success";
+      },
+    );
+
+    if (!successPort) {
+      throw options.onError(new BadDataException("Success port not found"));
+    }
+
+    const errorPort: Port | undefined = this.getMetadata().outPorts.find(
+      (p: Port) => {
+        return p.id === "error";
+      },
+    );
+
+    if (!errorPort) {
+      throw options.onError(new BadDataException("Error port not found"));
+    }
+
+    try {
+      /*
+       * Set timeout
+       * Inject args
+       * Inject dependencies
+       */
+
+      let scriptArgs: JSONObject | string =
+        (args["arguments"] as JSONObject | string) || {};
+
+      if (typeof scriptArgs === "string") {
+        scriptArgs = JSON.parse(scriptArgs);
+      }
+
+      const code: string = (args["code"] as string) || "";
+
+      const returnResult: ReturnResult = await VMUtil.runCodeInSandbox({
+        code,
+        options: {
+          args: scriptArgs as JSONObject,
+          timeout: WorkflowScriptTimeoutInMS,
+          /*
+           * The sandbox's axios bridge is guarded by the same SSRF blocklist
+           * as the API components, and is eligible for the same exception for
+           * the same reason: this script was authored by a member of the
+           * project the workflow runs in (issue #3424). The instance
+           * configuration decides whether that unlocks anything.
+           */
+          allowPrivateNetworkRequests: true,
+        },
+      });
+
+      const logMessages: string[] = returnResult.logMessages;
+
+      // add to option.log
+      logMessages.forEach((msg: string) => {
+        options.log(msg);
+      });
+
+      /*
+       * runCodeInSandbox resolves with `scriptError` when the user script
+       * threw or timed out — it no longer rejects. Route those runs to the
+       * error port, matching the pre-sandbox behavior.
+       */
+      if (returnResult.scriptError) {
+        throw returnResult.scriptError;
+      }
+
+      const returnVal: JSONValue = returnResult.returnValue;
+
+      return {
+        returnValues: {
+          returnValue: returnVal,
+        },
+        executePort: successPort,
+      };
+    } catch (err: unknown) {
+      const errorMessage: string =
+        err instanceof Error && err.message
+          ? err.message
+          : typeof err === "string" && err
+            ? err
+            : "JavaScript execution failed.";
+
+      options.log("Error running script");
+      options.log(errorMessage);
+      return {
+        returnValues: { error: errorMessage },
+        executePort: errorPort,
+      };
+    }
+  }
+}

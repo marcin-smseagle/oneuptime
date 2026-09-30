@@ -1,0 +1,555 @@
+import LayerConfigForm from "./LayerConfigForm";
+import LayerRotationSummary from "./LayerRotationSummary";
+import { getLayerPreviewEvents, LayerPreviewResult } from "./LayerShiftPreview";
+import {
+  OverrideUserDisplayInfo,
+  describeShiftOverride,
+} from "./OverridePresentation";
+import { OverrideUserInfo } from "./ScheduleOverrides";
+import LayerUser from "./LayerUser";
+import { getColorForUserId, getUserInitials } from "./LayerUserColors";
+import {
+  formatRelativeStart,
+  summarizeRestriction,
+  summarizeRotation,
+} from "./LayerSummary";
+import IconProp from "Common/Types/Icon/IconProp";
+import Dictionary from "Common/Types/Dictionary";
+import ScheduleShiftUtil, {
+  CurrentAndNextShift,
+  OnCallShift,
+} from "Common/Types/OnCallDutyPolicy/ScheduleShiftUtil";
+import { UserOverrideRecord } from "Common/Types/OnCallDutyPolicy/UserOverrideUtil";
+import Icon from "Common/UI/Components/Icon/Icon";
+import Tooltip from "Common/UI/Components/Tooltip/Tooltip";
+import OnCallDutyPolicyScheduleLayer from "Common/Models/DatabaseModels/OnCallDutyPolicyScheduleLayer";
+import OnCallDutyPolicyScheduleLayerUser from "Common/Models/DatabaseModels/OnCallDutyPolicyScheduleLayerUser";
+import User from "Common/Models/DatabaseModels/User";
+import React, { FunctionComponent, ReactElement, useMemo } from "react";
+
+export interface ComponentProps {
+  layer: OnCallDutyPolicyScheduleLayer;
+  users: Array<OnCallDutyPolicyScheduleLayerUser>;
+  // The schedule's timezone — restriction hours are shown/entered in it (F1/F10).
+  timezone?: string | undefined;
+  index: number;
+  total: number;
+  isExpanded: boolean;
+  /*
+   * The user overrides in force for this schedule, already scoped to the right
+   * policy by the parent (see ./ScheduleOverrides). Applied to this layer's
+   * rotation so "on call now" names whoever is actually covering.
+   */
+  overrides: Array<UserOverrideRecord>;
+  // The policy whose scoped overrides apply, or "" when policy-agnostic.
+  overridePolicyContextId: string;
+  // Display info for substitute users, who are by definition not on this layer.
+  overrideUserInfo: Dictionary<OverrideUserInfo>;
+  /*
+   * Disables delete + reorder while any layer mutation is in flight, so
+   * concurrent add / delete / reorder cannot interleave and corrupt ordering.
+   */
+  actionsDisabled: boolean;
+  isDeleteButtonLoading: boolean;
+  onToggleExpand: () => void;
+  onMoveUp: () => void;
+  onMoveDown: () => void;
+  onDeleteLayer: () => void;
+  onLayerChange: (layer: OnCallDutyPolicyScheduleLayer) => void;
+  onUsersChange: (users: Array<OnCallDutyPolicyScheduleLayerUser>) => void;
+}
+
+interface SummaryChipProps {
+  icon: IconProp;
+  text: string;
+}
+
+const SummaryChip: FunctionComponent<SummaryChipProps> = (
+  props: SummaryChipProps,
+): ReactElement => {
+  return (
+    <span className="inline-flex items-center gap-1.5 rounded-md bg-gray-50 px-2 py-1 text-xs font-medium text-gray-600 ring-1 ring-inset ring-gray-200">
+      <Icon icon={props.icon} className="h-3.5 w-3.5 text-gray-400" />
+      <span>{props.text}</span>
+    </span>
+  );
+};
+
+const LayerCard: FunctionComponent<ComponentProps> = (
+  props: ComponentProps,
+): ReactElement => {
+  const layer: OnCallDutyPolicyScheduleLayer = props.layer;
+  const isTopPriority: boolean = props.index === 0;
+
+  const rotationSummary: string = summarizeRotation(layer.rotation);
+
+  const restrictionSummary: string = summarizeRestriction(
+    layer.restrictionTimes,
+    props.timezone,
+  );
+
+  /*
+   * A cheap client-side rotation preview (using the SAME LayerUtil the server
+   * and the calendar use) powers both the collapsed "on call now" line and the
+   * expanded rotation summary. Memoized on the fields that actually affect the
+   * schedule so it does not recompute on unrelated re-renders (expanding a
+   * sibling layer, editing another card). The layer object is mutated in place
+   * on save, so a reference-based dependency would go stale — key on the values.
+   */
+  const previewKey: string = [
+    layer.startsAt?.toString() || "",
+    layer.handOffTime?.toString() || "",
+    JSON.stringify(layer.rotation || null),
+    JSON.stringify(layer.restrictionTimes || null),
+    props.users
+      .map((u: OnCallDutyPolicyScheduleLayerUser) => {
+        return u.user?.id?.toString() || "";
+      })
+      .join(","),
+    props.timezone || "",
+    /*
+     * Overrides belong in the key: without them, creating or editing a shift
+     * override would leave this card memoized on the un-substituted rotation
+     * and it would keep naming the wrong person until an unrelated re-render.
+     */
+    props.overrides
+      .map((override: UserOverrideRecord) => {
+        return [
+          override.overrideUserId,
+          override.routeAlertsToUserId,
+          override.startsAt?.toString() || "",
+          override.endsAt?.toString() || "",
+          override.onCallDutyPolicyId || "",
+        ].join(">");
+      })
+      .join(";"),
+    props.overridePolicyContextId,
+  ].join("|");
+
+  const preview: LayerPreviewResult = useMemo(() => {
+    return getLayerPreviewEvents({
+      layer,
+      users: props.users,
+      timezone: props.timezone,
+      numberOfShifts: 6,
+      overrides: props.overrides,
+      currentOnCallDutyPolicyId: props.overridePolicyContextId || undefined,
+    });
+  }, [previewKey]);
+
+  /*
+   * The person literally on call at this instant (null during off-hours or a
+   * coverage gap) and who is up next. Computed from raw coverage (no across-gap
+   * merging) so the header line is honest for restricted layers.
+   */
+  const coverageShifts: Array<OnCallShift> =
+    ScheduleShiftUtil.groupEventsIntoShifts(preview.events, {
+      /*
+       * Override-aware so the "on call now" line can name the person being
+       * covered. The default key folds a substitute's own rotation turn into
+       * the window they are covering, and a merged shift keeps only the first
+       * segment's override - which is how this line used to be able to say
+       * "covering" with nothing to say who for.
+       */
+      groupKey: ScheduleShiftUtil.groupKeyByUserAndOverride,
+    });
+  const currentAndNext: CurrentAndNextShift =
+    ScheduleShiftUtil.getCurrentAndNextShift(coverageShifts, preview.now);
+
+  const nameById: Record<string, string> = {};
+  for (const layerUser of props.users) {
+    const id: string = layerUser.user?.id?.toString() || "";
+    if (id && !nameById[id]) {
+      nameById[id] =
+        layerUser.user?.name?.toString() ||
+        layerUser.user?.email?.toString() ||
+        "Unknown user";
+    }
+  }
+
+  /*
+   * A substitute is by construction NOT assigned to this layer, so the loop
+   * above cannot name them. Without this the card would replace the wrong name
+   * with no name at all during an override — "Unknown user on call now".
+   */
+  for (const userId in props.overrideUserInfo) {
+    const info: OverrideUserInfo | undefined = props.overrideUserInfo[userId];
+    if (!info || nameById[userId]) {
+      continue;
+    }
+    nameById[userId] = info.name || info.email || "Unknown user";
+  }
+
+  /*
+   * Name + email for everyone who can appear on this card: the layer's own
+   * users and the substitutes an override brought in. describeShiftOverride
+   * needs both fields, so this cannot be derived from nameById above.
+   */
+  const overrideDisplayInfoById: Dictionary<OverrideUserDisplayInfo> = {};
+  for (const layerUser of props.users) {
+    const id: string = layerUser.user?.id?.toString() || "";
+    if (id && !overrideDisplayInfoById[id]) {
+      overrideDisplayInfoById[id] = {
+        name: layerUser.user?.name?.toString() || "",
+        email: layerUser.user?.email?.toString() || "",
+      };
+    }
+  }
+  for (const userId in props.overrideUserInfo) {
+    const info: OverrideUserInfo | undefined = props.overrideUserInfo[userId];
+    if (info && !overrideDisplayInfoById[userId]) {
+      overrideDisplayInfoById[userId] = {
+        name: info.name,
+        email: info.email,
+      };
+    }
+  }
+
+  /*
+   * True when the person on call right now got there through an override rather
+   * than through this layer's rotation. Drives the "covering" tag: seeing a name
+   * that is not in the layer's user list, with no explanation, reads as a bug.
+   */
+  const layerUserIds: Set<string> = new Set<string>(
+    props.users
+      .map((layerUser: OnCallDutyPolicyScheduleLayerUser) => {
+        return layerUser.user?.id?.toString() || "";
+      })
+      .filter(Boolean),
+  );
+
+  const isCurrentUserSubstitute: boolean = Boolean(
+    currentAndNext.current && !layerUserIds.has(currentAndNext.current.userId),
+  );
+
+  /*
+   * "Covering for Alice Nakamura" when the shift carries the override that put
+   * this person on it.
+   *
+   * Falls back to the old, unnamed wording only when the substitution is
+   * visible (the name on the line is not one of this layer's users) but the
+   * shift did not carry its provenance - a shape the grouping above should
+   * prevent, though saying "covering" with no name still beats saying nothing
+   * and letting a stranger's name read as a bug.
+   */
+  const coveringLabel: string | null = currentAndNext.current?.override
+    ? describeShiftOverride({
+        override: currentAndNext.current.override,
+        userInfoById: overrideDisplayInfoById,
+        policyNameById: {},
+      }).coveringLabel
+    : isCurrentUserSubstitute
+      ? "Covering via override"
+      : null;
+
+  const userCount: number = props.users.length;
+  const shownUsers: Array<OnCallDutyPolicyScheduleLayerUser> =
+    props.users.slice(0, 4);
+  const remainingUsers: number = userCount - shownUsers.length;
+
+  const getAvatarStack: () => ReactElement = (): ReactElement => {
+    if (userCount === 0) {
+      return <SummaryChip icon={IconProp.User} text="No users assigned" />;
+    }
+
+    return (
+      <span className="inline-flex items-center gap-2 rounded-md bg-gray-50 py-1 pl-1.5 pr-2 ring-1 ring-inset ring-gray-200">
+        <span className="flex -space-x-1.5">
+          {shownUsers.map(
+            (layerUser: OnCallDutyPolicyScheduleLayerUser, i: number) => {
+              const user: User | undefined = layerUser.user;
+              const userId: string = user?.id?.toString() || `unknown-${i}`;
+              const name: string = user?.name?.toString() || "";
+              const email: string = user?.email?.toString() || "";
+              /*
+               * Key by the per-assignment row id, not the user id: the same user
+               * can appear twice in a layer, which would collide on user id.
+               */
+              const rowKey: string =
+                layerUser.id?.toString() || `${userId}-${i}`;
+              return (
+                <Tooltip key={rowKey} text={name || email || "Unknown user"}>
+                  <span
+                    className="inline-flex h-6 w-6 items-center justify-center rounded-full text-[10px] font-semibold text-white ring-2 ring-white"
+                    style={{ backgroundColor: getColorForUserId(userId) }}
+                  >
+                    {getUserInitials(name, email)}
+                  </span>
+                </Tooltip>
+              );
+            },
+          )}
+          {remainingUsers > 0 && (
+            <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-gray-200 text-[10px] font-semibold text-gray-600 ring-2 ring-white">
+              +{remainingUsers}
+            </span>
+          )}
+        </span>
+        <span className="text-xs font-medium text-gray-600">
+          {userCount === 1 ? "1 user" : `${userCount} users`}
+        </span>
+      </span>
+    );
+  };
+
+  const getReorderButton: (params: {
+    icon: IconProp;
+    label: string;
+    disabled: boolean;
+    onClick: () => void;
+  }) => ReactElement = (params: {
+    icon: IconProp;
+    label: string;
+    disabled: boolean;
+    onClick: () => void;
+  }): ReactElement => {
+    return (
+      <button
+        type="button"
+        aria-label={params.label}
+        disabled={params.disabled || props.actionsDisabled}
+        onClick={(e: React.MouseEvent) => {
+          e.stopPropagation();
+          params.onClick();
+        }}
+        className={`flex h-4 w-6 items-center justify-center rounded transition-colors ${
+          params.disabled || props.actionsDisabled
+            ? "cursor-not-allowed text-gray-300"
+            : "text-gray-400 hover:bg-gray-100 hover:text-gray-700"
+        }`}
+      >
+        <Icon icon={params.icon} className="h-3.5 w-3.5" />
+      </button>
+    );
+  };
+
+  return (
+    <div
+      className={`rounded-xl border bg-white shadow-sm transition-shadow ${
+        props.isExpanded
+          ? "border-indigo-200 shadow-md"
+          : "border-gray-200 hover:shadow-md"
+      }`}
+    >
+      {/* Header */}
+      <div className="flex items-start gap-3 p-4 md:p-5">
+        {/* Priority badge, aligned inline with the layer name */}
+        <Tooltip
+          text={
+            isTopPriority
+              ? "Highest priority layer"
+              : `Priority ${props.index + 1}`
+          }
+        >
+          <span
+            className={`mt-0.5 flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-lg text-sm font-semibold text-white ${
+              isTopPriority ? "bg-indigo-600" : "bg-gray-400"
+            }`}
+          >
+            {props.index + 1}
+          </span>
+        </Tooltip>
+
+        {/* Main clickable info */}
+        <div
+          role="button"
+          tabIndex={0}
+          onClick={props.onToggleExpand}
+          onKeyDown={(e: React.KeyboardEvent) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              props.onToggleExpand();
+            }
+          }}
+          aria-expanded={props.isExpanded}
+          className="min-w-0 flex-1 cursor-pointer text-left"
+        >
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <span className="truncate text-base font-semibold text-gray-900">
+              {layer.name?.toString() || `Layer ${props.index + 1}`}
+            </span>
+            {isTopPriority && props.total > 1 && (
+              <span className="inline-flex items-center rounded-full bg-indigo-50 px-2 py-0.5 text-xs font-medium text-indigo-700 ring-1 ring-inset ring-indigo-200/70">
+                Highest priority
+              </span>
+            )}
+          </div>
+          {layer.description ? (
+            <p className="mt-0.5 truncate text-sm text-gray-500">
+              {layer.description.toString()}
+            </p>
+          ) : null}
+
+          <div className="mt-2.5 flex flex-wrap items-center gap-2">
+            {getAvatarStack()}
+            <SummaryChip icon={IconProp.Refresh} text={rotationSummary} />
+            <SummaryChip icon={IconProp.Clock} text={restrictionSummary} />
+          </div>
+
+          {/*
+           * Live "who is on call right now" line, derived from the rotation.
+           * Rendered even with no users assigned — that is precisely the case
+           * where this layer can never put anybody on call, so suppressing the
+           * line there (as this used to) hid the most important state it has.
+           */}
+          <div className="mt-2 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-gray-500">
+            <span
+              className="inline-block h-2 w-2 flex-shrink-0 rounded-full"
+              style={{
+                backgroundColor: currentAndNext.current
+                  ? getColorForUserId(currentAndNext.current.userId)
+                  : "#d1d5db",
+              }}
+            />
+            {currentAndNext.current ? (
+              <span>
+                <span className="font-semibold text-gray-700">
+                  {nameById[currentAndNext.current.userId] || "Unknown user"}
+                </span>{" "}
+                on call now
+                {coveringLabel && (
+                  <span
+                    data-testid="layer-card-covering"
+                    className="ml-1 font-medium text-indigo-600"
+                  >
+                    ({coveringLabel.toLowerCase()})
+                  </span>
+                )}
+              </span>
+            ) : (
+              <span className="text-amber-700">
+                {userCount === 0
+                  ? "No users assigned - this layer never puts anyone on call"
+                  : "No one on call in this layer right now"}
+              </span>
+            )}
+            {currentAndNext.next && (
+              <>
+                <span className="text-gray-300">&middot;</span>
+                <span>
+                  Up next{" "}
+                  <span className="font-medium text-gray-700">
+                    {nameById[currentAndNext.next.userId] || "Unknown user"}
+                  </span>{" "}
+                  {formatRelativeStart(currentAndNext.next.start, preview.now)}
+                </span>
+              </>
+            )}
+          </div>
+        </div>
+
+        {/* Actions */}
+        <div className="flex flex-shrink-0 items-center gap-0.5">
+          {props.total > 1 && (
+            <div className="mr-0.5 flex flex-col">
+              {getReorderButton({
+                icon: IconProp.ArrowUp,
+                label: "Move layer up (higher priority)",
+                disabled: props.index === 0,
+                onClick: props.onMoveUp,
+              })}
+              {getReorderButton({
+                icon: IconProp.ArrowDown,
+                label: "Move layer down (lower priority)",
+                disabled: props.index === props.total - 1,
+                onClick: props.onMoveDown,
+              })}
+            </div>
+          )}
+          <Tooltip text="Delete layer">
+            <button
+              type="button"
+              aria-label="Delete layer"
+              disabled={props.isDeleteButtonLoading || props.actionsDisabled}
+              onClick={(e: React.MouseEvent) => {
+                e.stopPropagation();
+                props.onDeleteLayer();
+              }}
+              className="flex h-8 w-8 items-center justify-center rounded-md text-gray-400 transition-colors hover:bg-red-50 hover:text-red-600 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <Icon
+                icon={
+                  props.isDeleteButtonLoading
+                    ? IconProp.Spinner
+                    : IconProp.Trash
+                }
+                className="h-4 w-4"
+              />
+            </button>
+          </Tooltip>
+          <button
+            type="button"
+            aria-label={props.isExpanded ? "Collapse layer" : "Expand layer"}
+            onClick={props.onToggleExpand}
+            className="flex h-8 w-8 items-center justify-center rounded-md text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-700"
+          >
+            <Icon
+              icon={
+                props.isExpanded ? IconProp.ChevronUp : IconProp.ChevronDown
+              }
+              className="h-5 w-5"
+            />
+          </button>
+        </div>
+      </div>
+
+      {/* Body */}
+      {props.isExpanded && (
+        <div className="border-t border-gray-200 px-4 py-5 md:px-5">
+          {userCount > 0 ? (
+            <div className="mb-6">
+              <LayerRotationSummary
+                layer={layer}
+                users={props.users}
+                timezone={props.timezone}
+                events={preview.events}
+                now={preview.now}
+                /*
+                 * A layer only has a fallback if something sits BELOW it in
+                 * priority order. Without this the summary claimed that
+                 * lower-priority layers cover the off-hours even for the last
+                 * layer, where the off-hours are a genuine coverage hole.
+                 */
+                hasLowerPriorityLayer={props.index < props.total - 1}
+                overrideUserInfo={props.overrideUserInfo}
+              />
+            </div>
+          ) : (
+            <div className="mb-6 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs text-amber-800">
+              <Icon
+                icon={IconProp.Alert}
+                className="mt-0.5 h-3.5 w-3.5 flex-shrink-0 text-amber-500"
+              />
+              <span>
+                <span className="font-semibold">No users assigned.</span> This
+                layer produces no on-call coverage at all. Add at least one user
+                below, or this layer will never page anyone.
+              </span>
+            </div>
+          )}
+
+          <div className="mb-6">
+            <h4 className="text-sm font-semibold text-gray-900">
+              On-call users
+            </h4>
+            <p className="mb-3 mt-0.5 text-sm text-gray-500">
+              On-call duty rotates through these users top to bottom. Drag the
+              handle to reorder.
+            </p>
+            <LayerUser layer={layer} onUpdateUsers={props.onUsersChange} />
+          </div>
+
+          <div className="border-t border-gray-200 pt-5">
+            <LayerConfigForm
+              layer={layer}
+              timezone={props.timezone}
+              onLayerChange={props.onLayerChange}
+            />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default LayerCard;

@@ -1,0 +1,99 @@
+# 撰寫 Runbook
+
+在 **運行手冊 → Create Runbook** 下建立一個 runbook，然後開啟它並前往 **步驟** 分頁。
+
+## 步驟的結構
+
+每個步驟都包含：
+
+| 欄位                     | 用途                                                                   |
+| ------------------------ | ---------------------------------------------------------------------- |
+| **標題**                 | 顯示在檢查清單 UI 中的簡短標籤。必填。                                 |
+| **描述**                 | 提供給回應者的選用情境說明。支援 Markdown 的文字。                     |
+| **失敗時繼續**           | 若開啟，失敗的步驟不會停止整個執行 — 下一個步驟仍會執行。              |
+| **Require approval**     | 若開啟，runbook 會在此步驟後暫停，並等待使用者核准後才執行下一個步驟。 |
+| **Type-specific config** | Script、URL、agent 等 — 詳見下文。                                     |
+
+步驟會**依序**執行。使用 Steps 編輯器上的上/下箭頭來重新排序。
+
+## 步驟類型
+
+### Manual
+
+回應者勾選的核取方塊。當 runbook 執行到 Manual 步驟時會暫停，並停留在 `WaitingForManualStep` 狀態，直到有人將其標記為完成（或跳過）。
+
+將此用於只有人才能驗證的事項：「已確認流量已在負載平衡器儀表板中切換至次要區域。」
+
+### JavaScript
+
+在沙箱化的 `isolated-vm` 中執行的一段 JavaScript。該沙箱位於你自己基礎設施中的 [Runbook Agent](/docs/runbooks/agents) 上 — 而非 OneUptime Worker 上。
+
+在 JavaScript 步驟上設定以下內容：
+
+- **Runbook Agent** — 從下拉選單中挑選應執行此步驟的 agent。只有選定的 agent 才能認領該工作。
+- **Script** — 要執行的 JavaScript。
+- **Execution timeout** — agent 在拆除 isolate 之前，會讓這段 JavaScript 執行多久。預設為 30 秒。
+- **Claim timeout** — Worker 等待 agent 認領工作的時間。預設為 2 分鐘。
+
+```js
+const start = Date.now();
+// ... your logic ...
+return { durationMs: Date.now() - start };
+```
+
+回傳值會擷取在該步驟的執行紀錄上。`console.log` 的輸出會擷取為日誌行。預設執行逾時：30 秒。預設認領逾時（Worker 等待 agent 認領工作的時間）：2 分鐘。兩者都可以在該步驟上編輯 — 請參閱腳本下方的 **Execution timeout** 與 **Claim timeout**。
+
+### HTTP request
+
+發出對外的 HTTP 呼叫。設定方法（GET/POST/PUT/PATCH/DELETE/HEAD）、URL、選用的 JSON 標頭、選用的內文，以及 **Request timeout**（預設 30 秒）。回應的狀態、標頭與內文都會被擷取（總計上限 50KB）。
+
+適用於：觸發 PagerDuty 事件、貼文到 Slack、呼叫你自己的管理 API 等。HTTP 步驟直接在 OneUptime Worker 上執行；不需要 agent。
+
+### Bash
+
+在你自己基礎設施中的 [Runbook Agent](/docs/runbooks/agents) 上執行的 bash 腳本（`bash -c <script>`）。Bash 永遠不會在 OneUptime Worker 上執行。
+
+在 Bash 步驟上設定以下內容：
+
+- **Runbook Agent** — 從下拉選單中挑選應執行此步驟的 agent。只有選定的 agent 才能認領該工作。
+- **Script** — 要執行的 bash。輸出（stdout + stderr）最多擷取 50 KB；程序會在逾時時被終止。
+- **Execution timeout** — agent 在以 `SIGKILL` 終止腳本之前，會讓它執行多久。預設為 30 秒；對於確實需要數分鐘的步驟，請將它調高。
+- **Claim timeout** — Worker 等待 agent 認領工作的時間。預設為 2 分鐘。
+
+若 runbook 執行到此步驟時選定的 agent 處於離線狀態，該步驟最多會等待至**認領逾時**（預設 2 分鐘），然後以 `TimedOut` 失敗。在依賴 Bash 步驟之前，請先在 **設定 → Runbook 代理程式** 下新增一個 agent。
+
+### AI
+
+在執行過程中請 AI 分析、彙整或做出判斷。提示（prompt）會傳送到你專案的 LLM 供應商（**設定 → 人工智慧 → LLM 提供商**），模型的回應會成為執行時間軸上該步驟的輸出。AI 步驟在 OneUptime Worker 上執行；不需要 agent。
+
+在 AI 步驟上設定：
+
+- **Prompt** — AI 應執行的工作。例如：「檢視先前步驟的輸出，並說明是否可以安全地繼續進行修復。」
+- **Include previous step context** — 若開啟，AI 可以看到在此之前執行的所有步驟的完整資訊：標題、類型、狀態、輸出與錯誤訊息。
+- **Include trigger context** — 若開啟，AI 可以看到啟動這次執行的來源：所連結的事件、警示或排程維護事件（其描述、嚴重性、目前狀態、受影響的監控器、根本原因、狀態時間軸與公開註記），或是誰手動執行了這個 runbook。
+
+將 AI 步驟與 **Require approval** 搭配，讓人參與決策：AI 進行分析，回應者閱讀其答覆並核准，之後下一個（修復）步驟才會執行。
+
+**AI 永遠看不到的內容。** AI 步驟的答覆會作為步驟輸出儲存在執行紀錄上，而任何具有 runbook 讀取權限的人都能讀取執行紀錄——這比事件的 ACL 涵蓋更廣的對象。因此觸發情境刻意排除**私人內部註記**與 **Slack/Teams 頻道訊息**：它們會留在事件內部，由既有的事後檢討與註記產生器在那裡保存其衍生文字。先前步驟的輸出在傳送給模型之前，會先掃描機密資訊（權杖、金鑰、憑證）並加以遮蔽。
+
+AI 步驟與其他任何 AI 功能一樣會被計量並計費。若專案未設定 LLM 供應商，該步驟會以明確的錯誤失敗（若 runbook 的其餘部分仍應繼續執行，請設定 **失敗時繼續**）。
+
+## 儲存與編輯
+
+點擊 **Save Steps** 以保存。runbook 較舊版本正在進行中的執行不受影響 — 它們會繼續使用各自的快照。
+
+## 多個步驟與失敗處理
+
+預設情況下，失敗的步驟會中止整個執行，並將該執行標記為 `Failed`。若你在某個步驟上設定 **失敗時繼續**，失敗仍會被記錄，但下一個步驟會繼續執行。這對於「先嘗試這三件事，然後通知」的模式很有用。
+
+## 一個實作範例
+
+針對「DB primary unreachable」的簡單 runbook：
+
+1. **JavaScript** — 從你的設定服務取得目前的 primary 主機並記錄下來。
+2. **Manual** — 「確認次要端的複寫延遲低於 5 秒。」
+3. **HTTP request** — POST 到你的故障轉移協調器 API。
+4. **Manual** — 「驗證寫入現在已導向新的 primary。」
+5. **HTTP request** — POST 到 Slack 並附上「all clear」訊息。
+
+回應者觀看一個自動化步驟執行、勾選一個手動步驟、再觀看下一個自動化步驟執行，依此類推。每個步驟的輸出都會被擷取以供事後檢討使用。

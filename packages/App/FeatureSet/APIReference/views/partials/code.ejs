@@ -1,0 +1,35 @@
+<%#
+   A single, non-tabbed code block - responses, and the one-line cURL example on
+   the authentication page.
+
+   Locals: title, code, requestType, requestUrl.
+
+   Carries no scripting of its own: copying is handled once, by delegation,
+   in scripts.ejs. `data-copy-scope` marks what the copy button should read.
+-%>
+<div class="code-block-wrapper not-prose my-6 overflow-hidden rounded-xl code-surface shadow-lg" data-copy-scope>
+   <div class="flex min-h-[2.75rem] flex-wrap items-center gap-x-4 border-b code-divider code-surface-raised px-3 sm:px-4">
+      <h4 class="mr-auto py-2 text-xs font-semibold tracking-wide code-text"><%= title -%></h4>
+      <button type="button" class="copy-btn my-1.5" data-copy-button aria-label="<%= t('ui.copyCode') %>">
+         <svg class="copy-icon h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">
+            <path stroke-linecap="round" stroke-linejoin="round"
+               d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path>
+         </svg>
+         <svg class="check-icon hidden h-3.5 w-3.5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24" aria-hidden="true">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7"></path>
+         </svg>
+         <span class="copy-text"><%= t('ui.copy') %></span>
+      </button>
+   </div>
+
+   <% if(requestType && requestUrl){ %>
+   <div class="flex flex-wrap items-center gap-2 border-b code-divider-soft code-surface-raised px-3 py-2 sm:flex-nowrap sm:gap-3 sm:px-4">
+      <%- include('method-badge', { method: requestType, tone: 'dark' }) -%>
+      <span class="break-all font-mono text-xs code-text-muted sm:text-sm"><%= requestUrl -%></span>
+   </div>
+   <% } %>
+
+   <% if(code){ %>
+   <pre class="overflow-x-auto p-4"><code class="language-json"><%= code -%></code></pre>
+   <% } %>
+</div>

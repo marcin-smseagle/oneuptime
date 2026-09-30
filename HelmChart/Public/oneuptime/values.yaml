@@ -22,10 +22,24 @@ image:
   pullPolicy: Always
   tag: release
 
-  ## Type of OneUptime image to use.
+  ## Which edition of the OneUptime images to run.
   ## Possible values: community-edition, enterprise-edition
-  ## Enterprise edition images are hardened for more security and compliance, but you need a valid license to use them.
-  ## Please contact sales@oneuptime.com for more information.
+  ## - community-edition: the Apache-2.0 images (tags as given in image.tag).
+  ## - enterprise-edition: the Enterprise Edition images, the same tags with an
+  ##   "enterprise-" prefix. They add the enterprise features (SSO/SAML, OIDC,
+  ##   SCIM, audit logs, team compliance, instance health dashboards), licensed
+  ##   under the OneUptime Enterprise License. Production use of the Enterprise
+  ##   Edition requires a subscription under that license. An install with no
+  ##   license, or one holding a license whose expiry was never recorded, runs
+  ##   as a 14-day trial, which is for evaluation. After the trial (or 30 days
+  ##   after a license expires), until a license is activated, SSO,
+  ##   OIDC, SCIM and audit logging stop: SSO sign-in is refused and "Require
+  ##   SSO" is no longer enforced (users sign in with their password), SCIM
+  ##   requests are refused and audit logging stops recording. Enterprise
+  ##   configuration becomes read-only and the enterprise admin dashboards are
+  ##   locked too. Everything resumes, without a restart, as soon as a license
+  ##   is activated, and core monitoring is never affected.
+  ## Please contact sales@oneuptime.com for a license.
   type: community-edition
   
   restartPolicy: Always
@@ -45,7 +59,9 @@ encryptionSecret:
 ipWhitelist:
 
 # External Secrets
-# You need to leave blank oneuptimeSecret, encryptionSecret, and registerProbeKey to use this section
+# You need to leave blank oneuptimeSecret, encryptionSecret, and registerProbeKey to use this section.
+# Anything configured here is read straight from your own Secret: the chart does NOT
+# write a copy of it into the chart-managed `<release>-secrets` Secret.
 externalSecrets:
   oneuptimeSecret:
     existingSecret:
@@ -61,7 +77,7 @@ externalSecrets:
       passwordKey:
 
 deployment:
-  # When set to true, no OneUptime deployments are provisioned. Only databases (Redis, ClickHouse, Postgres) will be running.
+  # When set to true, no OneUptime deployments are provisioned. Only databases (Valkey, ClickHouse, Postgres) will be running.
   disableDeployments: false
   # Default replica count for all deployments
   replicaCount: 1
@@ -106,6 +122,14 @@ nginx:
   #   targetMemoryUtilizationPercentage: 80
   listenAddress: ""
   listenOptions: ""
+  # Per-request access logging for the high-volume ingest locations (/otlp,
+  # /telemetry, /session-replay, /kubernetes-cost, /pyroscope). "on" keeps every
+  # ingest line, which is the default because per-request status and client IP
+  # at the ingress are how a tenant's 413s and 429s get diagnosed. Set to
+  # "off" (or "false" / "0" / "no") to drop them; any other value keeps logging.
+  # Quoted deliberately: unquoted `on` and `off` are YAML booleans, and this is
+  # passed straight through to nginx as a string.
+  ingestAccessLog: "on"
   serverNamesHash:
     bucketSize: ""
     maxSize: ""
@@ -124,6 +148,52 @@ nginx:
   podSecurityContext: {}
   hostAliases: []
   containerSecurityContext: {}
+  # Extra env / volumes for this service only. A non-empty list REPLACES the
+  # chart-wide extraEnv/extraVolumes/extraVolumeMounts (they are not merged).
+  extraEnv: []
+  extraVolumes: []
+  extraVolumeMounts: []
+  # Kernel networking tuning for the ingress gateway. The ingress proxies a very
+  # high volume of short-lived upstream connections (OTLP/telemetry ingest, API,
+  # dashboard) out to a single backend Service IP. Without tuning, a pod can
+  # exhaust its ephemeral source ports with TIME_WAIT sockets and nginx then
+  # returns "connect() ... (99: Address not available)" 502s for every route.
+  #
+  # Applied via a privileged init container: tcp_tw_reuse is an "unsafe" sysctl
+  # that kubelets do not expose through pod securityContext.sysctls. Every
+  # container in a pod shares one network namespace, so tuning these net.*
+  # sysctls in the init container tunes nginx too.
+  #
+  # OPT-IN (default false): a privileged container is rejected at ADMISSION on
+  # clusters with restricted PodSecurity, GKE Autopilot, or OpenShift SCC — that
+  # would stop the ingress from ever starting. Enable this only where privileged
+  # pods are allowed (e.g. GKE Standard, most self-managed clusters) with:
+  #   --set nginx.sysctlTuning.enabled=true
+  sysctlTuning:
+    enabled: false
+    # Widen the ephemeral source-port range (~28k -> ~64k ports).
+    ipLocalPortRange: "1024 65535"
+    # Allow new outbound connections to reuse TIME_WAIT sockets (the actual fix
+    # for source-port exhaustion). Safe for the client side of a proxy.
+    tcpTwReuse: "1"
+    # Reclaim FIN_WAIT_2 sockets faster.
+    tcpFinTimeout: "15"
+  # Reuse pooled (keepalive) upstream connections to the app backend instead of
+  # opening a brand-new TCP connection per request. This is the root-cause fix
+  # for the source-port / TIME_WAIT exhaustion above: with a connection pool the
+  # ingress stops churning sockets, so it never runs out of ephemeral ports.
+  #
+  # Needs NO privilege and is safe to default on in Kubernetes because the app
+  # Service ClusterIP is stable (open-source nginx resolves the upstream once at
+  # load). Trade-off of resolving at load: on a cold install the ingress can
+  # restart until the app Service object exists, and a Service delete+recreate
+  # (new ClusterIP) needs an nginx reload. The docker-compose deployment leaves
+  # this off — its app container IP can change under nginx, which the resolver +
+  # per-request path tolerates.
+  upstreamKeepalive:
+    enabled: true
+    # Idle connections kept warm per worker process, per upstream pool.
+    connections: 64
 
 postgresql:
   enabled: true # Set this to false if you're using an external postgresql database.
@@ -163,7 +233,53 @@ postgresql:
       # supports a small/medium fleet directly, or a pgbouncer defaultPoolSize of
       # 400 in front. Raise it (and pod memory) for larger deployments.
       max_connections = 500
-      shared_buffers = 128MB
+      # A safe bump over the 128MB initdb default. Postgres wants roughly 25% of
+      # the memory it is allowed to use; raise this to ~25% of
+      # `postgresql.primary.resources.limits.memory` once that is set. It is
+      # deliberately NOT higher while `resources` is empty ({} by default), because
+      # a large shared_buffers against a pod with no memory limit is node-level
+      # memory pressure rather than a speedup.
+      shared_buffers = 256MB
+      # Planner cost of a random page fetch relative to a sequential one. The
+      # 4.0 default models a rotational disk and pushes the planner toward
+      # sequential scans instead of the ~2,246 indexes in this schema. 1.1 is the
+      # standard value for the SSD/NVMe-backed volumes every cloud provider gives
+      # you, and lets those indexes actually get used.
+      random_page_cost = 1.1
+      # How many concurrent I/O requests the storage can service. SSD-backed
+      # network volumes handle far more in flight than the default of 1.
+      effective_io_concurrency = 200
+      # Working memory per sort/hash NODE (not per query, and not per connection):
+      # a single query with several sorts or hash joins can use a multiple of this,
+      # so keep it modest while max_connections is 500. Below this, sorts and hash
+      # joins spill to temporary files on disk.
+      work_mem = 16MB
+      # Used by VACUUM, CREATE INDEX and ALTER TABLE ... ADD FOREIGN KEY. Only a
+      # few of these run at once, so it can be much larger than work_mem; it is
+      # what keeps autovacuum and boot migrations from crawling.
+      maintenance_work_mem = 256MB
+      # Let checkpoints spread out under write bursts instead of firing constantly.
+      # Costs disk on the WAL volume and lengthens crash recovery, but removes the
+      # checkpoint-storm write stalls.
+      max_wal_size = 4GB
+      # A planner HINT only — it allocates nothing. It tells the planner how much
+      # memory the OS page cache plus shared_buffers together are likely to hold,
+      # which is the other half (with random_page_cost) of getting index scans
+      # chosen over sequential scans. Set it to ~50-75% of the pod memory limit
+      # once `postgresql.primary.resources` is set.
+      effective_cache_size = 3GB
+      # Cap how long a statement WAITS for a lock. The app also sends this as a
+      # startup parameter, but pgbouncer accepts-and-discards startup
+      # parameters (see the pgbouncer block below), so behind the pooler this
+      # backend-side setting is the ONLY thing that applies. Without it,
+      # contention on a hot row becomes a strictly-ordered queue in which every
+      # waiter pins a backend for the sum of everyone ahead of it — that is the
+      # row-lock convoy shape, and it is unbounded.
+      #
+      # NOTE: lock_timeout only bounds WAITING for a lock, so ordinary queries
+      # are unaffected. Do NOT add statement_timeout here: it would apply to
+      # migrations too, which legitimately run long.
+      lock_timeout = '3s'
     # pg_hba.conf rules. These enable password auth (md5) from any host/IP.
     # Tighten these for production to your pod/service/network CIDRs.
     hbaConfiguration: |-
@@ -211,9 +327,27 @@ postgresOperator:
     # Extra postgresql.conf parameters. CloudNativePG manages everything else.
     # max_connections sized like the StatefulSet path above: 500 supports a
     # small/medium fleet (default per-pod pool 50) directly or behind pgbouncer.
+    # These mirror postgresql.primary.configuration above — see the comments
+    # there for the reasoning behind each one.
     parameters:
       max_connections: "500"
-      shared_buffers: "128MB"
+      # Safe bump over the 128MB initdb default. Raise to ~25% of
+      # postgresOperator.cnpg.resources.limits.memory once that is set; kept low
+      # while `resources` is empty so a memory-limitless pod cannot starve its node.
+      shared_buffers: "256MB"
+      # Cloud-SSD value. The 4.0 default models a rotational disk and pushes the
+      # planner to sequential-scan past this schema's ~2,246 indexes.
+      random_page_cost: "1.1"
+      effective_io_concurrency: "200"
+      work_mem: "16MB"
+      maintenance_work_mem: "256MB"
+      max_wal_size: "4GB"
+      # Planner hint only — allocates nothing. Set to ~50-75% of the pod memory
+      # limit once postgresOperator.cnpg.resources is set.
+      effective_cache_size: "3GB"
+      # See the lock_timeout note in postgresql.primary.configuration above:
+      # behind pgbouncer this backend-side value is the only one that applies.
+      lock_timeout: "3s"
     resources: {}
     nodeSelector: {}
     tolerations: []
@@ -251,7 +385,11 @@ clickhouse:
       passwordKey:
   image:
     repository: clickhouse/clickhouse-server
-    tag: latest
+    # Pin the ClickHouse version. Do NOT use `latest`: new releases can add
+    # stricter schema validation (26.7 rejects AggregatingMergeTree dimensions
+    # outside the sort key unless they are modeled as aggregate measures).
+    # Keep this aligned with docker-compose.base.yml and production.
+    tag: "26.7"
     pullPolicy: IfNotPresent
   service:
     type: ClusterIP
@@ -309,47 +447,52 @@ clickhouse:
         <interserver_http_port>9009</interserver_http_port>
         <listen_host>::</listen_host>
 
+        <!-- Maximum number of concurrently executing queries. 0 = unlimited.
+             Raised well above ClickHouse's default (100) so bursts of dashboard
+             and telemetry queries are not rejected with TOO_MANY_SIMULTANEOUS_QUERIES. -->
+        <max_concurrent_queries>10000</max_concurrent_queries>
+
         <!-- System log retention: 6 hour TTL to prevent unbounded disk growth -->
         <query_log>
             <database>system</database>
             <table>query_log</table>
             <partition_by>toYYYYMM(event_date)</partition_by>
-            <ttl>event_date + INTERVAL 6 HOUR DELETE</ttl>
+            <ttl>event_time + INTERVAL 6 HOUR DELETE</ttl>
             <flush_interval_milliseconds>7500</flush_interval_milliseconds>
         </query_log>
         <trace_log>
             <database>system</database>
             <table>trace_log</table>
             <partition_by>toYYYYMM(event_date)</partition_by>
-            <ttl>event_date + INTERVAL 6 HOUR DELETE</ttl>
+            <ttl>event_time + INTERVAL 6 HOUR DELETE</ttl>
             <flush_interval_milliseconds>7500</flush_interval_milliseconds>
         </trace_log>
         <text_log>
             <database>system</database>
             <table>text_log</table>
             <partition_by>toYYYYMM(event_date)</partition_by>
-            <ttl>event_date + INTERVAL 6 HOUR DELETE</ttl>
+            <ttl>event_time + INTERVAL 6 HOUR DELETE</ttl>
             <flush_interval_milliseconds>7500</flush_interval_milliseconds>
         </text_log>
         <part_log>
             <database>system</database>
             <table>part_log</table>
             <partition_by>toYYYYMM(event_date)</partition_by>
-            <ttl>event_date + INTERVAL 6 HOUR DELETE</ttl>
+            <ttl>event_time + INTERVAL 6 HOUR DELETE</ttl>
             <flush_interval_milliseconds>7500</flush_interval_milliseconds>
         </part_log>
         <metric_log>
             <database>system</database>
             <table>metric_log</table>
             <partition_by>toYYYYMM(event_date)</partition_by>
-            <ttl>event_date + INTERVAL 6 HOUR DELETE</ttl>
+            <ttl>event_time + INTERVAL 6 HOUR DELETE</ttl>
             <flush_interval_milliseconds>7500</flush_interval_milliseconds>
         </metric_log>
         <asynchronous_metric_log>
             <database>system</database>
             <table>asynchronous_metric_log</table>
             <partition_by>toYYYYMM(event_date)</partition_by>
-            <ttl>event_date + INTERVAL 6 HOUR DELETE</ttl>
+            <ttl>event_time + INTERVAL 6 HOUR DELETE</ttl>
             <flush_interval_milliseconds>7500</flush_interval_milliseconds>
         </asynchronous_metric_log>
         <!-- Disable processors_profile_log entirely — it was 536 GiB and is not needed -->
@@ -451,7 +594,7 @@ clickhouseOperator:
     # ClickHouse operand image. Pin a specific version for production.
     image:
       repository: clickhouse/clickhouse-server
-      tag: latest
+      tag: "26.7"
       pullPolicy: IfNotPresent
     # Cluster topology. shardsCount distributes data; replicasCount adds copies for
     # HA. replicasCount > 1 requires a coordinator — keeper.enabled (below) provides
@@ -507,6 +650,10 @@ clickhouseOperator:
       postgresql_port: "9005"
       logger/level: warning
       merge_tree/max_suspicious_broken_parts: "1000"
+      # Maximum number of concurrently executing queries (0 = unlimited). Raised
+      # well above ClickHouse's default (100) so bursts of dashboard and telemetry
+      # queries are not rejected with TOO_MANY_SIMULTANEOUS_QUERIES.
+      max_concurrent_queries: "10000"
     # User/profile-level settings rendered into users.d (under <profiles>). Slash-separated
     # keys become nested XML (default/max_threads -> <profiles><default><max_threads>).
     #
@@ -546,7 +693,8 @@ clickhouseOperator:
       replicas: 3
       image:
         repository: clickhouse/clickhouse-keeper
-        tag: latest-alpine
+        # Keep Keeper aligned with the ClickHouse server version pinned above.
+        tag: "26.7-alpine"
         pullPolicy: IfNotPresent
       persistence:
         size: 10Gi
@@ -569,20 +717,20 @@ clickhouseOperator:
 # Schema + data migrations run ONCE per release in a dedicated pre-upgrade /
 # post-install Job (App/Migrate.ts), connecting directly to the backend. The
 # runtime app/worker/nginx pods are gated off (RUN_DATABASE_MIGRATIONS_ON_BOOT=
-# false), so the data-migration session advisory lock never runs on a pooled
-# connection — which is the prerequisite for safely setting
-# pgbouncer.poolMode=transaction. See HelmChart/Docs/Postgres.md.
+# false). See HelmChart/Docs/Postgres.md.
 #
-# Set enabled: false to fall back to the legacy model where every pod runs
-# migrations on boot (serialized by the advisory lock). That fallback is NOT
-# compatible with pgbouncer.poolMode=transaction (the chart rejects that combo).
+# KEEP THIS ENABLED. The migration runners take no advisory lock, so this Job
+# is the only thing making one runner the single runner. Setting enabled: false
+# falls back to the legacy model where EVERY pod runs migrations on boot, all
+# at once and unserialized — two replicas can read the same migration as "not
+# executed" and both run it.
 #
 # Behavior: deploys gate on the migration Job (cleaner, atomic, no cross-pod
 # race). An init container waits for the database first, so a fresh install does
 # not race the bundled Postgres / CNPG bootstrap; on a very slow first-time
 # cluster bootstrap you may need a longer `helm upgrade --install --timeout`.
-# The advisory lock stays in the code — it still protects the boot path used by
-# docker-compose and enabled: false installs.
+# docker-compose and enabled: false installs run the boot path with no lock at
+# all, so data migrations must be written to tolerate concurrent runs.
 migrate:
   enabled: true
   # Whether the deploy WAITS for migrations:
@@ -605,6 +753,16 @@ migrate:
   backoffLimit: 6
   # Optional hard timeout for the whole migration run (seconds). Empty = none.
   activeDeadlineSeconds:
+  # How long each `ON CLUSTER` ClickHouse DDL statement waits for every host to
+  # confirm completion (seconds). Empty = 180, the ClickHouse server default.
+  # Hitting this timeout no longer fails the migration: the statement stays in
+  # the cluster's DDL queue and each host executes it in the background (the
+  # Job logs a warning at the end when the queue hasn't converged). Raise this
+  # when the cluster's DDL queue drains slowly (e.g. many shards/replicas under
+  # heavy merge load) and you want the Job to wait for hard confirmation — use
+  # a finite value; the app scales its client-side socket ceiling to match.
+  # 0 = enqueue and return immediately (fully async).
+  clickhouseDistributedDdlTaskTimeoutSeconds:
   resources: {}
   # Placement for the one-shot migration Job. It talks to Postgres over the
   # network, so it should NOT co-locate with the database tier — keep it on the
@@ -615,6 +773,11 @@ migrate:
   affinity: {}
   # Optional PriorityClass so the migration run isn't preempted under pressure.
   priorityClassName: ""
+  # Extra env / volumes for this service only. A non-empty list REPLACES the
+  # chart-wide extraEnv/extraVolumes/extraVolumeMounts (they are not merged).
+  extraEnv: []
+  extraVolumes: []
+  extraVolumeMounts: []
 
 # =============================================================================
 # PgBouncer connection pooler (opt-in). Orthogonal to the Postgres backend:
@@ -629,11 +792,10 @@ migrate:
 # Pool mode is TRANSACTION by default: it returns a backend connection to the
 # pool after every transaction, so many mostly-idle client connections share a
 # small set of backend connections — the real connection reduction. This is safe
-# here because migrate.enabled=true above runs migrations in a dedicated Job, so
-# the data-migration session advisory lock never runs on a pooled connection
-# (OneUptime's runtime traffic uses no other session-level Postgres features).
-# If you set migrate.enabled=false, you MUST also set poolMode=session — the
-# chart rejects transaction+no-migrate-Job at render time. See HelmChart/Docs/Postgres.md.
+# here because OneUptime's runtime traffic uses no session-level Postgres
+# features, and the migration runners no longer take a session-level advisory
+# lock either — so pool mode and migrate.enabled are now independent choices.
+# See HelmChart/Docs/Postgres.md.
 pgbouncer:
   enabled: false
   image:
@@ -679,10 +841,17 @@ pgbouncer:
   # as protocol-level startup parameters (from DATABASE_STATEMENT_TIMEOUT_MS /
   # DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS), and idle_session_timeout via "options".
   # pgbouncer ACCEPTS and IGNORES these — it does NOT forward them to the backend,
-  # so those server-side GUCs are not applied through the pooler. The app's
-  # client-side query_timeout (DATABASE_QUERY_TIMEOUT_MS) still aborts slow queries.
-  # For server-side statement_timeout enforcement, set it on the backend (e.g.
-  # CNPG parameters, or `ALTER DATABASE oneuptimedb SET statement_timeout=...`).
+  # so those server-side GUCs are not applied through the pooler.
+  #
+  # The app's client-side query_timeout (DATABASE_QUERY_TIMEOUT_MS) is NOT a
+  # substitute: it ABANDONS the query rather than cancelling it. The backend
+  # keeps executing and keeps its place in the lock queue, which is how killed
+  # and scaled-down workers left orphaned statements holding a queue through
+  # the pooler during the row-lock convoy incident.
+  # Server-side enforcement must therefore be set on the BACKEND — the chart
+  # now ships lock_timeout in both postgresql.primary.configuration and
+  # postgresOperator.cnpg.parameters. For an externalPostgres, set it yourself
+  # (e.g. `ALTER DATABASE oneuptimedb SET lock_timeout='3s'`).
   ignoreStartupParameters: "extra_float_digits,options,statement_timeout,idle_in_transaction_session_timeout,lock_timeout,idle_session_timeout"
   # TLS from pgbouncer to the Postgres backend. When fronting an externalPostgres
   # with ssl.enabled, this auto-defaults to "require" and verifies against
@@ -701,26 +870,44 @@ pgbouncer:
   # Optional: override global security contexts just for the pgbouncer pod/container
   podSecurityContext: {}
   containerSecurityContext: {}
+  # Extra env / volumes for this service only. A non-empty list REPLACES the
+  # chart-wide extraEnv/extraVolumes/extraVolumeMounts (they are not merged).
+  extraEnv: []
+  extraVolumes: []
+  extraVolumeMounts: []
 
-redis:
+# The in-cluster cache and BullMQ queue backend. The image is Valkey -- the
+# BSD-licensed fork of Redis 7.2 that most of the original Redis contributors
+# moved to after Redis 7.4 left the BSD licence -- and it speaks the Redis wire
+# protocol, so any Redis-protocol server can stand in for it (see
+# `externalValkey` below).
+#
+# This block was called `redis:` until 13.0.0. That key still works: whatever
+# you set under it is layered on top of these defaults, so an unedited
+# values.yaml from an earlier chart keeps behaving exactly as it did. Prefer
+# `valkey:` in new files -- if you set the same setting under both names, the
+# legacy one wins and `helm install` prints a warning.
+valkey:
   enabled: true
   auth:
     # Will be auto-generated if not provided
     password:
-    # Use an existing secret for the Redis password
+    # Use an existing secret for the cache password
     existingSecret:
       name:
       passwordKey:
   image:
-    repository: redis
-    # Use the alpine variant. The debian-based redis:latest image carries unfixable CVEs; alpine is a drop-in replacement.
-    tag: alpine
+    repository: valkey/valkey
+    # Use the alpine variant -- the debian-based images carry unfixable CVEs.
+    # Pinned to a minor line (patch releases still flow in) and kept aligned
+    # with docker-compose.base.yml so compose and Helm run the same engine.
+    tag: 9.1-alpine
     pullPolicy: IfNotPresent
   master:
     service:
       type: ClusterIP
       ports:
-        redis: "6379"
+        valkey: "6379"
     persistence:
       enabled: false
       size: 8Gi
@@ -728,16 +915,17 @@ redis:
     nodeSelector: {}
     tolerations: []
     affinity: {}
-    # Optional: override global security contexts just for the Redis pod/container
+    # Optional: override global security contexts just for the Valkey pod/container
     podSecurityContext: {}
     containerSecurityContext: {}
     resources: {}
-  # Liveness/readiness probes for the Redis container. Both run "redis-cli ping"
-  # inside the pod. Under transient disk fsync or CPU contention (common on
-  # slower disks such as GCP pd-standard) a single PING can take longer than a
-  # second, so the defaults below are deliberately tolerant: a few slow PINGs
-  # must not flap readiness or trigger a liveness kill and restart loop. Raise
-  # the timeouts/thresholds further if you run Redis on constrained nodes.
+  # Liveness/readiness probes for the Valkey container. Both run
+  # "valkey-cli ping" inside the pod. Under transient disk fsync or CPU
+  # contention (common on slower disks such as GCP pd-standard) a single PING
+  # can take longer than a second, so the defaults below are deliberately
+  # tolerant: a few slow PINGs must not flap readiness or trigger a liveness
+  # kill and restart loop. Raise the timeouts/thresholds further if you run it
+  # on constrained nodes.
   livenessProbe:
     enabled: true
     initialDelaySeconds: 30
@@ -754,11 +942,26 @@ redis:
     appendonly no
     save ""
     maxmemory-policy noeviction
+  # Also publish the Service under its pre-13.0.0 name,
+  # `<release>-redis-master`, pointing at the same pods.
+  #
+  # app/worker/probe/runner pods carry the old hostname in their env until they
+  # roll, and without this they resolve nothing in the meantime. It does not make
+  # the upgrade zero-downtime -- the cache pod is recreated either way, and both
+  # Services have no endpoints for the seconds that takes -- but it stops the
+  # gap lasting for the whole rollout. Safe to set to false once every workload
+  # has rolled.
+  legacyServiceAlias: true
 
+# Deprecated alias for `valkey:` above, kept so a values.yaml written against an
+# earlier chart still applies. MUST stay empty: the merge in
+# `oneuptime.valkey` layers whatever is here ON TOP of the real defaults, so a
+# value shipped here would be impossible for anyone to override.
+redis: {}
 
 
 # Global HorizontalPodAutoscaler defaults applied to every stateless service
-# (app, worker, nginx, home, ai-agent, probes, test-server) that is not managed
+# (app, worker, nginx, home, runner, probes, test-server) that is not managed
 # by KEDA. Each service can override any of these keys via its own
 # `<service>.autoscaling:` block (e.g. `nginx.autoscaling.maxReplicas`); keys not
 # set there inherit the values below. Note: a service that pins `replicaCount`
@@ -772,7 +975,7 @@ autoscaling:
   targetMemoryUtilizationPercentage: 80
 
 # Pod Disruption Budgets for the stateless OneUptime deployments (app, worker,
-# nginx, home, ai-agent, probes, pgbouncer). A PDB caps how many pods the
+# nginx, home, runner, probes, pgbouncer). A PDB caps how many pods the
 # cluster may take down at once during *voluntary* disruptions — node drains,
 # rolling node-pool upgrades, and cluster-autoscaler scale-down — so an upgrade
 # can't evict every replica of a service simultaneously. It has no effect on
@@ -789,7 +992,7 @@ autoscaling:
 # Set EITHER minAvailable OR maxUnavailable (the Kubernetes PDB spec allows only
 # one). If both resolve to a value, minAvailable wins. Both accept an integer or
 # a percentage string like "50%". The single-replica databases (postgresql,
-# redis, clickhouse) are intentionally excluded — a PDB there would imply HA
+# valkey, clickhouse) are intentionally excluded — a PDB there would imply HA
 # they don't provide; the multi-replica clickhouse-keeper ships its own PDB.
 podDisruptionBudget:
   enabled: false
@@ -829,6 +1032,21 @@ subscriptionPlan:
 analytics:
   host:
   key:
+  # Google Tag Manager. Only loaded when billing.enabled is true, so a
+  # self-hosted install never reaches googletagmanager.com either way. Set
+  # this to false to keep the container off on a billing-enabled install.
+  googleTagManager:
+    enabled: true
+
+# OneUptime's internal marketing conversion ledger (SaaS only). Conversions are
+# recorded for OneUptime's own reporting and are never sent to ad platforms.
+marketing:
+  # Outbound marketing conversion webhooks. Conversions are emitted as they
+  # happen and stored nowhere. Both values are required — a URL without a
+  # secret is refused rather than sent unsigned.
+  webhook:
+    url:
+    secret:
 
 
 # CAPTCHA Configuration
@@ -837,6 +1055,44 @@ captcha:
   enabled: false
   siteKey:
   secretKey:
+
+# Outbound webhook egress policy.
+#
+# OneUptime refuses to send workflow requests, project webhooks, on-call user
+# webhooks and sandboxed HTTP calls to targets that resolve into private,
+# loopback or link-local ranges. Both settings below relax that for self-hosted
+# installs and both are off by default. They are instance-wide and the only
+# gate: there is no per-project setting, so whatever they allow applies to
+# every project. Status page subscriber webhooks are never covered.
+webhooks:
+  # Permit RFC-1918, CGNAT, IPv6 unique-local and site-local targets. Loopback,
+  # link-local (169.254.169.254) and multicast stay blocked.
+  allowPrivateNetwork: false
+  # Comma-separated hosts and CIDRs allowed regardless of range, e.g.
+  # "mattermost.internal,*.svc.cluster.local,10.20.0.0/16". Never list
+  # 169.254.169.254 or a range containing it.
+  privateNetworkAllowlist: ""
+
+# Outbound connection egress policy, for everything that is not a webhook:
+# external data sources (security event connections, threat intel feeds), LLM
+# providers, SMTP servers (project settings and the workflow Email component),
+# SMTP and workflow OAuth token URLs, OIDC discovery, status page / dashboard
+# domain verification and Runbook HTTP steps.
+#
+# Loopback, link-local (169.254.169.254) and reserved ranges are refused for
+# these in every deployment. The private tier (RFC-1918, CGNAT, IPv6
+# unique-local) is allowed on a self-hosted install, because the servers these
+# connect to usually live there. Rendered as DATA_SOURCE_BLOCK_PRIVATE_ADDRESSES.
+outboundConnections:
+  # Refuse the private tier for these connections too — for example when
+  # projects on this instance belong to people who should not reach your
+  # internal network. Always on when billing.enabled is true, whatever this
+  # says. Does not change which targets webhooks (above) or
+  # probes.<key>.allowPrivateNetworkMonitors allow. With it on, a refused host
+  # name (webhooks and workflow requests included) is reported as "... could
+  # not be reached." without saying what it resolved to; LOG_LEVEL=DEBUG logs
+  # the reason.
+  blockPrivateNetwork: false
 
 # VAPID Configuration for Web Push Notifications
 # Generate VAPID keys using: npx web-push generate-vapid-keys
@@ -868,6 +1124,95 @@ alerts:
 telemetry:
   disableIngestion: false
 
+# Browser source maps, uploaded from CI so exception stack traces can be shown
+# with original file names and line numbers instead of minified ones.
+#
+# These were fixed constants sized for "a few dozen chunks per build". Route
+# level code splitting broke that assumption -- a Nuxt / Vite / Next app with a
+# hundred routes emits hundreds of chunk .map files per release -- so they are
+# operator settings now. The defaults are safe for every deployment; raise
+# maxMapsPerRelease if your build emits more maps than fit.
+sourceMaps:
+  # Distinct bundles one release (service + service.version) may hold. An
+  # upload past this is rejected with a clear 400 rather than being accepted
+  # and then silently failing to resolve. Cannot exceed 10000.
+  maxMapsPerRelease: 1000
+
+  # Source map files accepted in ONE upload request. CI splits a large release
+  # across several requests. This can only be LOWERED: the request is parsed
+  # before authentication, and the shared 50-file ceiling is the limit an
+  # unauthenticated caller is held to on every route that parses multipart
+  # bodies, so raising it here would not be safe and has no effect.
+  maxFilesPerRequest: 50
+
+  # Largest single .map file accepted, in bytes (50 MiB). Also cannot be
+  # raised: the multipart parser aborts larger bodies first, so a higher value
+  # would only turn a clear 400 into a confusing 413.
+  maxFileSizeBytes: 52428800
+
+  # Total map bytes ONE stack trace resolution may load into memory (512 MiB).
+  # This -- not the map count -- is what bounds the resolver, which is why
+  # maxMapsPerRelease can be raised safely. Maps that do not fit are skipped
+  # worst-match-first and reported on the response, never dropped silently.
+  maxBytesPerResolve: 536870912
+
+  # How long uploaded maps are kept. A map is only useful while exceptions
+  # from its release are still within telemetry retention.
+  retentionDays: 90
+
+# Once a day this installation asks the GitHub API which OneUptime version is
+# the latest release, so admins are told in the dashboard when an upgrade is
+# available. No usage data is sent — GitHub sees your public IP and a
+# User-Agent naming OneUptime and the version you run.
+# Set disabled to true to make no outbound call at all, or point url at an
+# internal mirror that answers with GitHub's release shape
+# (tag_name, html_url, published_at).
+updateCheck:
+  disabled: false
+  url:
+
+# How many reverse proxies that YOU run sit in front of OneUptime and append to
+# the X-Forwarded-For header. This decides which address OneUptime treats as the
+# client for IP allowlists (status pages, public dashboards) and IP rate limits.
+#
+# X-Forwarded-For is a list that each proxy appends its peer to, so a caller can
+# put anything they like at the front of it. Only the entries our own proxies
+# wrote mean anything, and those are at the END of the list. This number says how
+# far in from that end the real client sits.
+#
+# 1 is correct for a stock chart install: the chart's own nginx gateway is the
+# only thing that touches the header, and the Service in front of it is L4.
+#
+# Raise it if you put your own HTTP proxy in front. A CDN or WAF that appends to
+# X-Forwarded-For (Cloudflare, an AWS ALB, an ingress-nginx of your own) makes
+# this 2, and each further proxy adds one. Too low and every visitor looks like
+# your proxy; too high and visitors can choose the address OneUptime sees, which
+# defeats the allowlists.
+#
+# 0 ignores X-Forwarded-For entirely and uses the connecting address.
+trustedProxyHops: 1
+
+# On-call calendar feeds: people subscribe Google Calendar / Outlook / Apple
+# Calendar to their on-call shifts through a secret .ics URL
+# (https://<host>/api/on-call-calendar/user/<token>/shifts.ics).
+#
+# disabled: true switches every feed URL off. Clients get a 503 with
+# Retry-After: 3600, keep the copy they already have and try again in an hour;
+# nothing is deleted.
+#
+# rateLimit bounds those public routes. perTokenPerWindow is the budget one
+# subscribed calendar gets (keyed on token + client address); perIpPerWindow is
+# the ceiling that survives a caller rotating tokens. Calendar clients poll
+# about hourly (Apple every five minutes at most), so the defaults leave plenty
+# of room for a whole team's clients behind one office address. The limiter
+# fails open when the cache is unreachable.
+onCallCalendarFeed:
+  disabled: false
+  rateLimit:
+    windowSeconds: 60
+    perTokenPerWindow: 60
+    perIpPerWindow: 3000
+
 # If you would like to attach status page to custom domains use this setting.
 # For example, lets say you would like the status page to be hosted on status.yourcompany.com, then
 # 1. Create a A record in your DNS provider with the name "oneuptime.yourcompany.com" and value to Public IP of the server oneuptime is deployed on.
@@ -884,6 +1229,53 @@ statusPage:
 dashboard:
   cnameRecord:
 
+# Security defaults for the trusted Probe supervisor. The supervisor must start
+# as root so it can assign a different low-privilege UID/GID to each short-lived
+# synthetic worker. These defaults retain only the capabilities needed to
+# prepare/terminate/clean up cross-UID workers and to run ping/traceroute.
+# `allowPrivilegeEscalation: false` sets no_new_privs for the supervisor and all
+# descendants; changing UID/GID through the process API remains permitted by
+# the explicitly retained SETUID/SETGID capabilities.
+# An operator may still override the Probe to run non-root for compatibility;
+# in that mode workers share the Probe UID and retain the separate process and
+# browser-worker boundaries, but not the additional per-execution UID boundary.
+#
+# Kubernetes RuntimeDefault is available without provisioning files on every
+# node, so it is the operational default. RuntimeDefault blocks the
+# user-namespace syscalls both browsers' OS sandboxes use; Firefox then falls
+# back to its seccomp-only sandbox and Chromium's must stay disabled. To use
+# the full sandboxes, install a CRI/OCI-compatible profile derived from your
+# runtime default with `clone`, `setns`, `unshare` AND `chroot` allowed in the
+# kubelet seccomp directory on every Probe node (both browsers chroot inside
+# the namespace they create; without `chroot` every Firefox and Chromium
+# launch crashes), then override a probe with:
+#
+# Do not install `packages/Probe/seccomp_profile.json` verbatim in Kubernetes: that file
+# uses Moby-specific `includes`/`excludes` fields for Docker Compose.
+#
+#   containerSecurityContext:
+#     seccompProfile:
+#       type: Localhost
+#       localhostProfile: profiles/oneuptime-playwright.json
+#   syntheticMonitorChromiumSandboxEnabled: true
+#
+# The per-probe and legacy chart-wide `containerSecurityContext` maps are merged
+# over these defaults, so a seccomp override retains the other protections.
+probeContainerSecurityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+    add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - KILL
+      - NET_RAW
+      - SETGID
+      - SETUID
+  seccompProfile:
+    type: RuntimeDefault
+
 probes:
   one:
     name: "Probe"
@@ -891,10 +1283,83 @@ probes:
     enabled: true
     monitoringWorkers: 3
     monitorFetchLimit: 10
+    # Retries after the first attempt of a failed check, used when a monitor
+    # step sets no retry count of its own. 0 checks once; 3 checks up to four
+    # times. Unset uses 3.
     monitorRetryLimit: 3
+    # How many NetworkDevice SNMP walks this probe runs at once. Unset uses
+    # the probe's own default (25). Raise it together with the server's
+    # NETWORK_DEVICE_POLL_FETCH_LIMIT for fleets of many hundreds of devices
+    # — between them the two set how fast a fleet can be polled.
+    networkDevicePollConcurrency:
+    # How many SNMP OIDs this probe asks for in one GET. Unset uses the probe's
+    # own default (20). Every configured OID used to go into a single UDP
+    # datagram, so a long health-OID list answered tooBig and the DEVICE was
+    # reported offline; lower this only for an agent with an unusually small
+    # maximum message size.
+    snmpGetChunkSize:
     key:
+    # Reference a Secret you manage for this probe's PROBE_KEY, instead of the
+    # value the chart generates into `<release>-secrets`. PROBE_KEY is the probe's
+    # identity: the server registers a brand-new probe whenever it sees a key it
+    # does not recognise. `helm template` (Argo CD, Flux) always takes the chart's
+    # install-mode randAlphaNum branch, so the rendered key changes on every
+    # reconcile and orphans the previous probe — and because a monitor's probe list
+    # is fixed when the monitor is created and never back-filled, the monitor keeps
+    # pointing at the dead probe and monitoring silently stops. Ignored when `key`
+    # is set. Serving the key this way also stops the chart writing a copy of it
+    # into `<release>-secrets`, so `helm diff` no longer reports it as rotating.
+    existingSecret:
+      name:
+      passwordKey:
     replicaCount: 1
+    # Probes do not call the Kubernetes API. Keep cluster credentials out of
+    # the pod—and therefore out of synthetic browser processes—by default.
+    automountServiceAccountToken: false
+    # Let API, Website, External Status Page and Custom JavaScript Code monitors
+    # on this probe reach private network addresses (RFC-1918, CGNAT, IPv6
+    # unique-local), e.g. http://10.0.0.5/health. Honored on this chart probe.
+    # Chart probes auto-register as GLOBAL probes, so turning it on lets those
+    # monitors from EVERY project on this instance reach private addresses
+    # through this probe. Loopback, link-local and the cloud metadata endpoint
+    # stay blocked either way. Ignored, with a startup warning in the probe's
+    # log, when billing.enabled is true: global probes of a billing-enabled
+    # instance stay public-only, so deploy a private probe for internal targets.
+    allowPrivateNetworkMonitors: false
     syntheticMonitorScriptTimeoutInMs: 60000
+    # Maximum number of isolated browser worker processes started concurrently
+    # by this Probe. Additional executions wait in a bounded FIFO queue.
+    syntheticMonitorMaxConcurrency: 4
+    # Memory ceiling for each short-lived synthetic worker and all of its
+    # browser descendants together. A check is held to the memory its process
+    # tree actually holds, its proportional set size, which counts the pages
+    # the browser's processes share -- its code, and the buffers a renderer
+    # shares with the GPU process -- once rather than once per process. The
+    # probe can run up to syntheticMonitorMaxConcurrency checks at a time, so
+    # size the probe's memory for that many times this, plus the probe itself.
+    syntheticMonitorMaxProcessTreeRssBytes: 1610612736
+    # Maximum writable disk space for each short-lived synthetic execution,
+    # including browser profiles, caches, downloads, IndexedDB, and OPFS.
+    syntheticMonitorMaxDiskBytes: 268435456
+    # Pod-level backstop for Probe temporary files. The per-execution disk
+    # watchdog is the primary limit; this emptyDir ceiling contains failures
+    # across all concurrent executions and other temporary Probe data.
+    syntheticMonitorTempStorageSizeLimit: 2Gi
+    # Size of the memory-backed /dev/shm mounted into the probe (a container
+    # gets 64Mi by default). The synthetic runtime's browsers do not use it:
+    # Playwright starts Chromium with --disable-dev-shm-usage, so Chromium
+    # keeps its shared memory in the per-execution run directory under /tmp,
+    # and Firefox uses memfd. Synthetic checks write their browser state to
+    # that /tmp, so it is /tmp that needs storage which acknowledges writes
+    # promptly. This is memory-backed, so it counts against the pod's memory
+    # limit.
+    syntheticMonitorSharedMemorySizeLimit: 512Mi
+    # RuntimeDefault is available on every conforming cluster but commonly
+    # blocks the user-namespace creation Chromium's OS sandbox needs. Leave the
+    # Chromium sandbox disabled with RuntimeDefault. Set this to true together
+    # with the Localhost Playwright seccomp override documented above; startup
+    # then fails closed if Chromium cannot activate its sandbox.
+    syntheticMonitorChromiumSandboxEnabled: false
     customCodeMonitorScriptTimeoutInMs: 60000
     # DNS settings for this probe. When unset, the probe inherits the chart-wide
     # `dnsConfig`/`dnsPolicy` defaults (ndots:1 + fallback nameservers — see the
@@ -965,6 +1430,11 @@ probes:
     podSecurityContext: {}
     hostAliases: []
     containerSecurityContext: {}
+    # Extra env / volumes for this service only. A non-empty list REPLACES the
+    # chart-wide extraEnv/extraVolumes/extraVolumeMounts (they are not merged).
+    extraEnv: []
+    extraVolumes: []
+    extraVolumeMounts: []
 #   additionalContainers:
 # two:
 #   name: "Probe 2"
@@ -973,9 +1443,17 @@ probes:
 #   monitorFetchLimit: 10
 #   key:
 #   replicaCount: 1
+#   automountServiceAccountToken: false
+#   allowPrivateNetworkMonitors: false
 #   ports:
 #     http: 3874
 #   syntheticMonitorScriptTimeoutInMs: 60000
+#   syntheticMonitorMaxConcurrency: 4
+#   syntheticMonitorMaxProcessTreeRssBytes: 1610612736
+#   syntheticMonitorMaxDiskBytes: 268435456
+#   syntheticMonitorTempStorageSizeLimit: 2Gi
+#   syntheticMonitorSharedMemorySizeLimit: 512Mi
+#   syntheticMonitorChromiumSandboxEnabled: false
 #   customCodeMonitorScriptTimeoutInMs: 60000
 #   # DNS override for this probe (otherwise inherits the chart-wide dnsConfig default).
 #   dnsConfig:
@@ -1041,11 +1519,30 @@ testServer:
   nodeSelector: {}
   podSecurityContext: {}
   containerSecurityContext: {}
+  # Extra env / volumes for this service only. A non-empty list REPLACES the
+  # chart-wide extraEnv/extraVolumes/extraVolumeMounts (they are not merged).
+  extraEnv: []
+  extraVolumes: []
+  extraVolumeMounts: []
 
 openTelemetryExporter:
+  # Server-side exporter settings. headers can contain credentials and are
+  # never serialized into a frontend env.js response.
   endpoint:
   # This can be for example: x-oneuptime-token=<YOUR_ONEUPTIME_TELEMETRY_INGEST_TOKEN>
   headers:
+  # Optional. Reported as k8s.cluster.name on OneUptime's own telemetry so its
+  # pods group under this cluster in Topology. Pods always report their pod,
+  # namespace, node and deployment names; the cluster name is not visible from
+  # inside a pod, so it is only reported when set here.
+  kubernetesClusterName:
+
+# Browser RUM uses a separate, deliberately public credential. Only use a
+# OneUptime Browser ingestion key with an origin allowlist; never put a Server
+# key or arbitrary collector Authorization header here.
+browserOpenTelemetryExporter:
+  endpoint:
+  browserIngestionKey:
 
 containerSecurityContext:
 podSecurityContext:
@@ -1053,6 +1550,33 @@ affinity:
 tolerations:
 nodeSelector:
 hostAliases:
+
+# Chart-wide escape hatches, applied to every OneUptime workload the chart runs:
+# app, worker, every probe, runner, home, telemetry-writer, nginx, pgbouncer,
+# the migrate Job, test-server, the e2e cron, and vLLM. Empty by default, so an
+# install that leaves them alone renders exactly the manifests it always did.
+#
+# A service that sets its own extraEnv / extraVolumes / extraVolumeMounts
+# REPLACES the chart-wide list for that service — the two are NOT merged. That
+# is the same precedence the chart already uses for hostAliases, nodeSelector
+# and the security contexts above.
+#
+# The usual reason to reach for these: make every service trust an internal CA.
+#
+# extraVolumes:
+#   - name: internal-ca
+#     configMap:
+#       name: internal-ca-bundle   # kubectl create configmap internal-ca-bundle --from-file=ca.crt
+# extraVolumeMounts:
+#   - name: internal-ca
+#     mountPath: /etc/ssl/internal
+#     readOnly: true
+# extraEnv:
+#   - name: NODE_EXTRA_CA_CERTS
+#     value: /etc/ssl/internal/ca.crt
+extraEnv: []
+extraVolumes: []
+extraVolumeMounts: []
 
 # Chart-wide fallback DNS settings. Services that support DNS overrides (currently
 # the probes) use their per-service dnsConfig/dnsPolicy if set, otherwise these.
@@ -1086,6 +1610,17 @@ dnsConfig:
 # Please do not set this to DEBUG in production. This is only for development / debugging purposes.
 logLevel: INFO
 
+# Ack mode for telemetry ClickHouse inserts (applies to every pod that
+# inserts telemetry: app, worker, telemetry-writer). Default false =
+# fire-and-forget async inserts: ClickHouse acks once a batch is accepted
+# into its async-insert buffer and owns flushing it, so insert query slots
+# free almost immediately; flush-time errors surface only in ClickHouse
+# server logs, and a ClickHouse crash between accept and flush loses that
+# buffer. Set true to make every telemetry ack wait for the durable flush
+# (end-to-end ack-after-flush) at the cost of each in-flight insert holding
+# a ClickHouse query slot until its buffer flushes.
+telemetryWaitForAsyncInsert: false
+
 # Enable cleanup cron jobs
 # Please do not enable this in production. This is only for development purposes.
 cronJobs:
@@ -1100,6 +1635,11 @@ cronJobs:
     # This is the URL of the status page you want to test. This is used to check if the status page is up and running.
     statusPageUrl:
     failedWebhookUrl:
+    # Extra env / volumes for this service only. A non-empty list REPLACES the
+    # chart-wide extraEnv/extraVolumes/extraVolumeMounts (they are not merged).
+    extraEnv: []
+    extraVolumes: []
+    extraVolumeMounts: []
 
 # Please add this information if you want to generate SSL certificates for your status page custom domains.
 # This is only required if you're using custom domains for status pages.
@@ -1113,6 +1653,7 @@ letsEncrypt:
 
 script:
   workflowScriptTimeoutInMs: 5000
+  workflowTimeoutInMs: 120000
 
 # extraTemplates -- Array of extra objects to deploy with the release. Strings
 # are evaluated as a template and can use template expansions and functions. All
@@ -1147,10 +1688,15 @@ externalPostgres:
     cert:
     key:
 
-## External Redis Configuration
-# You need to set redis.enabled to false if you're using an external redis database.
+## External cache configuration.
+# Set valkey.enabled to false to use this instead of the in-cluster Valkey.
+# Any Redis-protocol server works here -- Valkey, real Redis, or a managed
+# service such as ElastiCache or Memorystore.
+#
+# This block was called `externalRedis:` until 13.0.0; that key still works and
+# is layered on top of whatever is set here.
 
-externalRedis:
+externalValkey:
   host:
   port:
   username:
@@ -1169,6 +1715,10 @@ externalRedis:
     # (optional)
     cert:
     key:
+
+# Deprecated alias for `externalValkey:`. Must stay empty, for the same reason
+# `redis: {}` above must.
+externalRedis: {}
 
 ## External Clickhouse Configuration
 # You need to set clickhouse.enabled to false if you're using an external clickhouse database.
@@ -1246,12 +1796,22 @@ home:
   #   targetMemoryUtilizationPercentage: 80
   ports:
     http: 1444
+  # Requests (no limits) so Home is Burstable rather than BestEffort and, crucially,
+  # so the HorizontalPodAutoscaler has a CPU request to compute utilization against
+  # — without it the HPA reports "missing request for cpu" and cannot scale Home.
   resources:
+    requests:
+      cpu: 300m
+      memory: 512Mi
   nodeSelector: {}
   podSecurityContext: {}
   hostAliases: []
   containerSecurityContext: {}
-
+  # Extra env / volumes for this service only. A non-empty list REPLACES the
+  # chart-wide extraEnv/extraVolumes/extraVolumeMounts (they are not merged).
+  extraEnv: []
+  extraVolumes: []
+  extraVolumeMounts: []
 
 app:
   enabled: true
@@ -1262,6 +1822,36 @@ app:
   workerConcurrency: 100
   # Max concurrent telemetry ingestion jobs processed by each pod
   telemetryConcurrency: 100
+  # How many NetworkDevice SNMP walks one probe is handed per fetch. A probe
+  # fetches once a minute, so this is the ceiling on how fast that probe's
+  # fleet can be polled, whatever the devices' configured intervals say.
+  # Unset uses the server default (250). Raise it together with the probe's
+  # probe.<name>.networkDevicePollConcurrency for fleets of many hundreds of
+  # devices; handing a probe more than it can walk in a cycle skips devices
+  # rather than polling them sooner.
+  networkDevicePollFetchLimit:
+  # Fan-in telemetry writer (per pod). Batches all telemetry ClickHouse inserts
+  # into a handful of large INSERTs so pods can scale horizontally without
+  # exploding ClickHouse insert concurrency. Defaults match the code
+  # (Common/Server/Utils/Telemetry/TelemetryFanInWriter.ts).
+  # Rows buffered per table before a flush is forced.
+  telemetryFanInMaxBatchRows: 100000
+  # Longest a buffered row waits (in ms) before its table is flushed anyway.
+  telemetryFanInMaxWaitMs: 5000
+  # Max simultaneous ClickHouse INSERTs per pod. Fleet-wide insert concurrency
+  # is replicas x this value — keep that product under ~60% of ClickHouse
+  # max_concurrent_queries (see docs/production-checklist.md).
+  telemetryFanInMaxConcurrentInserts: 4
+  # Backpressure cap: ingestion jobs block once this many rows are queued.
+  telemetryFanInMaxPendingRows: 200000
+  # Retry budget for failed inserts: attempts + exponential backoff bounds (ms).
+  telemetryFanInRetryMaxAttempts: 6
+  telemetryFanInRetryBaseDelayMs: 250
+  telemetryFanInRetryMaxDelayMs: 10000
+  # Per-pod ClickHouse connection pool ceilings. The ingest pool (used by the
+  # fan-in telemetry writer) inherits the query pool size when left empty.
+  clickhouseMaxOpenConnections: 100
+  clickhouseIngestMaxOpenConnections:
   disableTelemetryCollection: false
   enableProfiling: false
   disableAutoscaler: false
@@ -1276,7 +1866,7 @@ app:
   #   targetMemoryUtilizationPercentage: 80
   # Per-service Pod Disruption Budget override. Any key omitted here falls back
   # to the global podDisruptionBudget block above. Every stateless service
-  # (worker, nginx, home, aiAgent, probes.<key>, pgbouncer) accepts the same
+  # (worker, nginx, home, runner, probes.<key>, pgbouncer) accepts the same
   # block. Uncomment to customise just this service, e.g. keep at least one
   # replica available instead of the global maxUnavailable:
   # podDisruptionBudget:
@@ -1292,12 +1882,17 @@ app:
   podSecurityContext: {}
   hostAliases: []
   containerSecurityContext: {}
+  # Extra env / volumes for this service only. A non-empty list REPLACES the
+  # chart-wide extraEnv/extraVolumes/extraVolumeMounts (they are not merged).
+  extraEnv: []
+  extraVolumes: []
+  extraVolumeMounts: []
   # KEDA autoscaling configuration based on combined queue metrics (worker + workflow + telemetry + runbook)
   keda:
     enabled: false
     minReplicas: 1
     maxReplicas: 100
-    # Scale up when combined queue size (worker + workflow + telemetry + runbook) exceeds this threshold
+    # Scale up when combined queue backlog (waiting + delayed jobs across worker + workflow + telemetry + runbook) exceeds this threshold
     queueSizeThreshold: 10
     # Scale up when average CPU utilization exceeds this percentage (0 to disable).
     # If enabled, app.resources.requests.cpu must also be set.
@@ -1341,6 +1936,28 @@ worker:
   # Max concurrent telemetry ingestion jobs processed by each worker pod.
   # This is the telemetry hot path; tune it together with pod CPU/memory.
   telemetryConcurrency: 100
+  # Fan-in telemetry writer (per pod). Batches all telemetry ClickHouse inserts
+  # into a handful of large INSERTs so worker replicas can scale horizontally
+  # without exploding ClickHouse insert concurrency. Defaults match the code
+  # (Common/Server/Utils/Telemetry/TelemetryFanInWriter.ts).
+  # Rows buffered per table before a flush is forced.
+  telemetryFanInMaxBatchRows: 100000
+  # Longest a buffered row waits (in ms) before its table is flushed anyway.
+  telemetryFanInMaxWaitMs: 5000
+  # Max simultaneous ClickHouse INSERTs per pod. Fleet-wide insert concurrency
+  # is replicas x this value — keep that product under ~60% of ClickHouse
+  # max_concurrent_queries (see docs/production-checklist.md).
+  telemetryFanInMaxConcurrentInserts: 4
+  # Backpressure cap: ingestion jobs block once this many rows are queued.
+  telemetryFanInMaxPendingRows: 200000
+  # Retry budget for failed inserts: attempts + exponential backoff bounds (ms).
+  telemetryFanInRetryMaxAttempts: 6
+  telemetryFanInRetryBaseDelayMs: 250
+  telemetryFanInRetryMaxDelayMs: 10000
+  # Per-pod ClickHouse connection pool ceilings. The ingest pool (used by the
+  # fan-in telemetry writer) inherits the query pool size when left empty.
+  clickhouseMaxOpenConnections: 100
+  clickhouseIngestMaxOpenConnections:
   disableTelemetryCollection: false
   enableProfiling: false
   disableAutoscaler: false
@@ -1360,13 +1977,28 @@ worker:
   podSecurityContext: {}
   hostAliases: []
   containerSecurityContext: {}
+  # Extra env / volumes for this service only. A non-empty list REPLACES the
+  # chart-wide extraEnv/extraVolumes/extraVolumeMounts (they are not merged).
+  extraEnv: []
+  extraVolumes: []
+  extraVolumeMounts: []
   # KEDA autoscaling based on combined queue depth (worker + workflow + telemetry + runbook)
   keda:
     enabled: false
     minReplicas: 1
     maxReplicas: 100
-    # Scale up when combined queue size (worker + workflow + telemetry + runbook) exceeds this threshold
-    queueSizeThreshold: 10
+    # /metrics/queue-size reports the GLOBAL queue backlog (waiting + delayed
+    # jobs across worker + workflow + telemetry + runbook) and KEDA reads it as
+    # an AverageValue, so desired replicas = backlog / this value — it is a
+    # divisor over the fleet-wide total, not a per-pod trip point. ACTIVE jobs
+    # are deliberately not counted: they are already being served, and telemetry
+    # jobs park in the active state for the fan-in writer's flush window while
+    # awaiting their ClickHouse ack, so counting them made the scaler read
+    # busy-but-healthy capacity as demand and overscale. The backlog still
+    # counts delayed jobs, and every cron repeatable holds one, so it never
+    # falls to zero: set this high enough that the idle floor alone cannot pin
+    # the fleet at maxReplicas.
+    queueSizeThreshold: 25
     # Scale up when average CPU utilization exceeds this percentage (0 to disable).
     # If enabled, worker.resources.requests.cpu must also be set.
     targetCPUUtilizationPercentage: 0
@@ -1385,11 +2017,119 @@ worker:
       failureThreshold: 3
       replicas: 2
 
-# AI Agent Configuration
-# Deploy this to run an AI Agent within your Kubernetes cluster
-# Note: This is disabled by default. To enable, set enabled to true and provide the AI Agent credentials
-aiAgent:
+# Dedicated telemetry-writer tier (opt-in). Decouples worker/app replica count
+# from ClickHouse insert concurrency so telemetry ingest workers can scale out
+# WITHOUT limit: when enabled, every pod that processes telemetry ingest gets
+# TELEMETRY_WRITER_URL and ships its batched ClickHouse inserts to this
+# fixed-size deployment over HTTP (cluster-key authenticated) instead of
+# inserting directly. ClickHouse telemetry-insert load is then
+#   replicaCount x telemetryFanInMaxConcurrentInserts
+# — a constant — regardless of worker fleet size. Overload is shed with 429
+# and retried by workers with idempotent dedup tokens, so bursts land in the
+# BullMQ queue (the scale-out signal for workers), never on ClickHouse.
+# Size it against ClickHouse capacity, not demand: keep the product above
+# under ~60% of ClickHouse max_concurrent_queries (docs/production-checklist.md).
+# Runs the same image as `app`; no ingress, no queue consumption.
+telemetryWriter:
   enabled: false
+  # Fixed size — scale by capacity math, not autoscaling. 2 gives you rolling
+  # restarts and one-pod-failure headroom at 8 total concurrent inserts.
+  replicaCount: 2
+  # Override the per-pod Postgres pool ceiling (DATABASE_MAX_OPEN_CONNECTIONS)
+  # for this service. Empty = inherit deployment.databaseMaxOpenConnections.
+  databaseMaxOpenConnections:
+  # Concurrently-served insert requests per pod before shedding with 429.
+  # This is what bounds writer-pod memory: each admitted request holds one
+  # shipped token group (a per-signal chunk, ~500-1000 rows by default) in
+  # memory until it is buffered and inserted, on top of the fan-in buffer
+  # capped by telemetryFanInMaxPendingRows. Raise resources together with
+  # this.
+  maxInflightRequests: 100
+  # Fan-in telemetry writer (per pod) — same knobs as worker/app, but here they
+  # define CLUSTER-WIDE ClickHouse insert behavior. Defaults match the code
+  # (Common/Server/Utils/Telemetry/TelemetryFanInWriter.ts).
+  telemetryFanInMaxBatchRows: 100000
+  telemetryFanInMaxWaitMs: 5000
+  # Max simultaneous ClickHouse INSERTs per pod. Total telemetry insert
+  # concurrency = replicaCount x this value — keep it under ~60% of ClickHouse
+  # max_concurrent_queries.
+  telemetryFanInMaxConcurrentInserts: 4
+  telemetryFanInMaxPendingRows: 200000
+  telemetryFanInRetryMaxAttempts: 6
+  telemetryFanInRetryBaseDelayMs: 250
+  telemetryFanInRetryMaxDelayMs: 10000
+  # Per-pod ClickHouse connection pool ceilings. The ingest pool (used by the
+  # fan-in telemetry writer) inherits the query pool size when left empty.
+  clickhouseMaxOpenConnections: 100
+  clickhouseIngestMaxOpenConnections:
+  disableTelemetryCollection: false
+  enableProfiling: false
+  # OPT-IN CPU/memory HPA. Unlike other services, the global `autoscaling:`
+  # block never applies to this tier — only this explicit enable does.
+  # Since inserts are fire-and-forget (query slots free almost instantly),
+  # extra replicas mostly add request throughput, but STILL cap maxReplicas
+  # so maxReplicas x telemetryFanInMaxConcurrentInserts stays inside the
+  # ClickHouse max_concurrent_queries budget. CPU/memory targets need
+  # telemetryWriter.resources.requests set. Ignored when the KEDA scaler
+  # below is enabled.
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 0
+  # OPT-IN KEDA scaling on the fleet-wide shed rate — 429s rejected across
+  # all writer pods in roughly the last two minutes (Valkey-backed counter,
+  # served at /metrics/telemetry-writer-shed-rate). Sustained shedding while
+  # ClickHouse is healthy is the honest "tier too small" signal; this NEVER
+  # scales on queue depth (that is the worker fleet's signal). Optional
+  # CPU/memory triggers compose (they require resources.requests). Takes
+  # precedence over the plain HPA above when both are enabled.
+  keda:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 10
+    # Scale up when tier-wide sheds in the last ~2 minutes exceed this
+    # value per replica (KEDA targets shedCount / replicas <= threshold).
+    shedCountThreshold: 100
+    # Scale on CPU/memory utilization too (0 to disable either).
+    targetCPUUtilizationPercentage: 0
+    targetMemoryUtilizationPercentage: 0
+    pollingInterval: 30
+    cooldownPeriod: 300
+    # Fallback replicas when KEDA cannot read the shed-rate endpoint (e.g.
+    # all writer pods down). Set replicas to 0 to disable.
+    fallback:
+      failureThreshold: 3
+      replicas: 2
+  # Per-service Pod Disruption Budget override; falls back to the global
+  # podDisruptionBudget block.
+  # podDisruptionBudget:
+  #   enabled: true
+  #   minAvailable: 1
+  ports:
+    http: 3002
+  resources:
+  nodeSelector: {}
+  podSecurityContext: {}
+  hostAliases: []
+  containerSecurityContext: {}
+  # Extra env / volumes for this service only. A non-empty list REPLACES the
+  # chart-wide extraEnv/extraVolumes/extraVolumeMounts (they are not merged).
+  extraEnv: []
+  extraVolumes: []
+  extraVolumeMounts: []
+
+# AI Agent Configuration
+# Runs the OneUptime AI Agent within your Kubernetes cluster.
+# The in-cluster OneUptime Runner. It serves the AI code-fix capability for
+# every project in this deployment; it registers itself automatically (no
+# credentials needed) and idles cheaply when no LLM provider is configured.
+# Customers who want runbook steps executed inside their OWN network install
+# their own project-scoped Runner instead — see Runner/README.md.
+# Set enabled to false to not run it.
+runner:
+  enabled: true
   replicaCount: 1
   disableTelemetryCollection: false
   enableProfiling: false
@@ -1403,10 +2143,22 @@ aiAgent:
   #   maxReplicas: 10
   #   targetCPUUtilizationPercentage: 80
   #   targetMemoryUtilizationPercentage: 80
-  # AI Agent ID from OneUptime dashboard (required when enabled)
+  # Runner ID from the OneUptime dashboard (optional — by default the
+  # in-cluster Runner auto-registers itself using the key below)
   id:
-  # AI Agent Key from OneUptime dashboard (will be stored in secrets if not provided)
+  # Runner Key (optional — auto-generated and stored in the release
+  # secrets when not provided)
   key:
+  # Reference a Secret you manage for ONEUPTIME_RUNNER_KEY, instead of the value
+  # the chart generates into `<release>-secrets`. The key is the Runner's identity
+  # — the server registers a brand-new Runner whenever it sees a key it does not
+  # recognise — and `helm template` (Argo CD, Flux) regenerates it on every render.
+  # Ignored when `key` is set. Serving the key this way also stops the chart
+  # writing a copy of it into `<release>-secrets`. The per-probe equivalent is
+  # `probes.<name>.existingSecret`.
+  existingSecret:
+    name:
+    passwordKey:
   ports:
     http: 3875
   resources:
@@ -1414,6 +2166,11 @@ aiAgent:
   podSecurityContext: {}
   hostAliases: []
   containerSecurityContext: {}
+  # Extra env / volumes for this service only. A non-empty list REPLACES the
+  # chart-wide extraEnv/extraVolumes/extraVolumeMounts (they are not merged).
+  extraEnv: []
+  extraVolumes: []
+  extraVolumeMounts: []
   # KEDA autoscaling configuration based on queue metrics
   keda:
     enabled: false
@@ -1490,6 +2247,10 @@ vllm:
   extraArgs: []
   # Extra environment variables, e.g. [{name: VLLM_LOGGING_LEVEL, value: DEBUG}]
   extraEnv: []
+  # Extra volumes / mounts for the vLLM pod only. A non-empty list REPLACES the
+  # chart-wide extraVolumes/extraVolumeMounts (they are not merged).
+  extraVolumes: []
+  extraVolumeMounts: []
   ports:
     http: 8000
   service:
@@ -1615,8 +2376,21 @@ microsoftTeamsApp:
   clientId:
   clientSecret:
   tenantId:
+  # If you're using an existing secret for the configuration, please use this and update accordingly instead of the parameters above.
+  # existingSecret:
+  #   name: "app-secret"
+  #   clientIdKey: clientId
+  #   clientSecretKey: clientSecret
+  #   tenantIdKey: tenantId
 
 # GitHub Example Configuration
+#
+# `name` must match the app's real name on GitHub: its mention handle is derived
+# from it (lowercased, spaces to hyphens), so an app named "Acme AI" is
+# addressed as "@acme-ai". Answering mentions also needs the "Issues:
+# Read & write" permission and a subscription to the Issue comment, Issues,
+# Pull request, Pull request review and Pull request review comment events —
+# see https://oneuptime.com/docs/self-hosted/github-integration
 # gitHubApp:
 #   id: "123456"
 #   name: "my-github-app"
@@ -1655,8 +2429,62 @@ queueDashboard:
   enabled: false
   secret:
 
+# KEDA (Kubernetes Event-driven Autoscaling). Two flags, because who runs the
+# operator and who owns the ScaledObjects are separate questions:
+#
+#   keda.enabled  renders every ScaledObject/TriggerAuthentication in this chart
+#                 (templates/keda-scaledobjects.yaml).
+#   keda.install  installs the bundled KEDA operator subchart — it is the
+#                 `condition:` on the dependency in Chart.yaml. Deliberately NOT
+#                 set below: an unset condition path falls through to the next
+#                 one, so it tracks keda.enabled until you set it to a literal
+#                 true/false yourself. Only a real bool counts — values.schema.json
+#                 pins it to boolean so `install: ~` is rejected outright, and a
+#                 quoted "true" from --set-string would make Helm warn and fall
+#                 back to keda.enabled rather than install anything.
+#
+# keda.enabled ships false: every per-service `keda.enabled` also ships false,
+# so on default values the operator was installed (3 Deployments — manager,
+# metrics server, webhooks — plus 6 CRDs, 9 ClusterRoles, a validating webhook
+# and an aggregated APIService that takes over external.metrics.k8s.io
+# cluster-wide) purely to sit idle. Turn it on together with at least one
+# per-service `<service>.keda.enabled` to autoscale on queue depth.
+#
+# The three combinations that matter:
+#
+#   enabled: true                  bundled operator + this chart's ScaledObjects.
+#                                  The default relationship — leave install unset.
+#
+#   enabled: true, install: false  your platform team already runs KEDA. The chart
+#                                  renders only the ScaledObjects and leaves the
+#                                  operator alone. Without this the install fails
+#                                  on cluster-scoped resources the existing KEDA
+#                                  release already owns ("ClusterRole
+#                                  keda-operator ... cannot be imported").
+#
+#   enabled: false, install: true  the one-time bootstrap pass on a cluster with
+#                                  no KEDA. The bundled subchart ships its CRDs as
+#                                  templates rather than in a crds/ directory, and
+#                                  only a crds/ directory is applied ahead of the
+#                                  rest of the release — so the first install
+#                                  aborts on "no matches for kind ScaledObject"
+#                                  before anything lands at all. This pass installs
+#                                  the operator and its CRDs and renders no custom
+#                                  resources; the next one renders the
+#                                  ScaledObjects. Walkthrough:
+#                                  HelmChart/Docs/Keda.md.
+#
+# Setting a per-service `keda.enabled` while keda.enabled stays false is a hard
+# error unless install is explicitly true (the bootstrap pass above) — it would
+# render no ScaledObject at all, and on upgrade from a release that had it on it
+# would uninstall the operator out from under live ScaledObjects, so
+# templates/keda-scaledobjects.yaml fails the render instead of silently dropping
+# your autoscaling.
 keda:
-  enabled: true
+  enabled: false
+  # Uncomment (true or false) to decide the operator on its own. Leave it
+  # commented out — not null — to keep following keda.enabled.
+  # install: true
 
 # CloudNativePG operator — bundled dependency. Installed ONLY when
 # postgresOperator.cnpg.enabled is true (see the condition in Chart.yaml).

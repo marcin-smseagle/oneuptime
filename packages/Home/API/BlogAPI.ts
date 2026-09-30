@@ -1,0 +1,300 @@
+import BlogPostUtil, { BlogPost, BlogPostHeader } from "../Utils/BlogPost";
+import { BlogRootPath, ViewsPath } from "../Utils/Config";
+import NotFoundUtil from "../Utils/NotFound";
+import Text from "Common/Types/Text";
+import Express, {
+  ExpressApplication,
+  ExpressRequest,
+  ExpressResponse,
+  NextFunction,
+} from "Common/Server/Utils/Express";
+import logger from "Common/Server/Utils/Logger";
+import Response from "Common/Server/Utils/Response";
+import Route from "Common/Types/API/Route";
+import { GoogleTagManagerEnabled } from "Common/Server/EnvironmentConfig";
+
+const app: ExpressApplication = Express.getExpressApp();
+
+// create redirect for old blog post urls. This is to handle old blog post urls that are indexed by search engines.
+
+app.get(
+  "/blog/post/:file",
+  async (req: ExpressRequest, res: ExpressResponse, next: NextFunction) => {
+    try {
+      const fileName: string = req.params["file"] as string;
+
+      return Response.redirect(
+        req,
+        res,
+        new Route(`/blog/post/${fileName}/view`),
+      );
+    } catch (e) {
+      logger.error(e);
+      return next(e);
+    }
+  },
+);
+
+app.get(
+  "/blog/post/:file/view",
+  async (req: ExpressRequest, res: ExpressResponse, next: NextFunction) => {
+    try {
+      const fileName: string = req.params["file"] as string;
+
+      const blogPost: BlogPost | null =
+        await BlogPostUtil.getBlogPost(fileName);
+
+      if (!blogPost) {
+        return NotFoundUtil.renderNotFound(res);
+      }
+
+      res.render(`${ViewsPath}/Blog/Post`, {
+        support: false,
+        footerCards: true,
+        cta: true,
+        blackLogo: false,
+        requestDemoCta: false,
+        blogPost: blogPost,
+        enableGoogleTagManager: GoogleTagManagerEnabled,
+      });
+    } catch (e) {
+      logger.error(e);
+      return next(e);
+    }
+  },
+);
+
+/*
+ * Lazily serve the rendered validation-summary.md for a post (loaded on demand
+ * when the reader clicks the "Validated" badge). Registered before the static
+ * file route below so "validation-summary" is not treated as a file name.
+ */
+app.get(
+  "/blog/post/:file/validation-summary",
+  async (req: ExpressRequest, res: ExpressResponse, next: NextFunction) => {
+    try {
+      const fileName: string = req.params["file"] as string;
+
+      const summaryHtml: string | null =
+        await BlogPostUtil.getValidationSummaryHtml(fileName);
+
+      if (!summaryHtml) {
+        return NotFoundUtil.renderNotFound(res);
+      }
+
+      return Response.sendHtmlResponse(req, res, summaryHtml);
+    } catch (e) {
+      logger.error(e);
+      return next(e);
+    }
+  },
+);
+
+/*
+ * Raw markdown version of a post for LLMs / AI agents (linked from llms.txt
+ * and the post page). Registered before the static file route below so
+ * "markdown" is not treated as an asset file name.
+ */
+app.get(
+  "/blog/post/:file/markdown",
+  async (req: ExpressRequest, res: ExpressResponse, next: NextFunction) => {
+    try {
+      const fileName: string = req.params["file"] as string;
+
+      const blogPost: BlogPost | null =
+        await BlogPostUtil.getBlogPost(fileName);
+
+      if (!blogPost) {
+        res.status(404);
+        res.setHeader("Content-Type", "text/plain; charset=utf-8");
+        return res.send("Blog post not found.");
+      }
+
+      const lines: Array<string> = [
+        `# ${blogPost.title}`,
+        "",
+        blogPost.description.trim(),
+        "",
+        `- Published: ${blogPost.postDate}`,
+      ];
+
+      if (blogPost.author) {
+        lines.push(
+          `- Author: [${blogPost.author.name}](${blogPost.author.githubUrl})`,
+        );
+      }
+
+      if (blogPost.tags.length > 0) {
+        lines.push(`- Tags: ${blogPost.tags.join(", ")}`);
+      }
+
+      lines.push(`- Canonical: ${blogPost.blogUrl}`, "", "---", "");
+      lines.push(blogPost.markdownBody);
+
+      res.setHeader("Content-Type", "text/markdown; charset=utf-8");
+      res.setHeader("Cache-Control", "public, max-age=600");
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      return res.send(lines.join("\n"));
+    } catch (e) {
+      logger.error(e);
+      return next(e);
+    }
+  },
+);
+
+app.get(
+  "/blog/post/:postName/:fileName",
+  async (req: ExpressRequest, res: ExpressResponse, next: NextFunction) => {
+    /*
+     * return static files for blog post images
+     * the static files are stored in the /usr/src/blog/post/:file/:imageName
+     */
+
+    try {
+      const fileName: string = req.params["fileName"] as string;
+      const postName: string = req.params["postName"] as string;
+
+      return Response.sendFileByPath(
+        req,
+        res,
+        `${BlogRootPath}/posts/${postName}/${fileName}`,
+      );
+    } catch (e) {
+      logger.error(e);
+      return next(e);
+    }
+  },
+);
+
+// List all blog posts with tag
+
+app.get(
+  "/blog/tag/:tagName",
+  async (req: ExpressRequest, res: ExpressResponse, next: NextFunction) => {
+    try {
+      const tagName: string = req.params["tagName"] as string;
+      const tagSlug: string = tagName; // original slug
+
+      // Pagination params
+      const pageParam: string | undefined = req.query["page"] as
+        | string
+        | undefined;
+      const pageSizeParam: string | undefined = req.query["pageSize"] as
+        | string
+        | undefined;
+      let page: number = pageParam ? parseInt(pageParam, 10) : 1;
+      let pageSize: number = pageSizeParam ? parseInt(pageSizeParam, 10) : 25;
+      if (isNaN(page) || page < 1) {
+        page = 1;
+      }
+      if (isNaN(pageSize) || pageSize < 1) {
+        pageSize = 25;
+      }
+      if (pageSize > 100) {
+        pageSize = 100;
+      }
+
+      const allPosts: Array<BlogPostHeader> =
+        await BlogPostUtil.getBlogPostList(tagName, {
+          includeContributors: true,
+        });
+      const totalPosts: number = allPosts.length;
+      const totalPages: number = Math.ceil(totalPosts / pageSize) || 1;
+      if (page > totalPages) {
+        page = totalPages;
+      }
+      const start: number = (page - 1) * pageSize;
+      const paginatedPosts: Array<BlogPostHeader> = allPosts.slice(
+        start,
+        start + pageSize,
+      );
+      const allTags: Array<string> = await BlogPostUtil.getTags();
+
+      res.render(`${ViewsPath}/Blog/ListByTag`, {
+        support: false,
+        footerCards: true,
+        cta: true,
+        blackLogo: false,
+        requestDemoCta: false,
+        blogPosts: paginatedPosts,
+        tagName: Text.fromDashesToPascalCase(tagName),
+        tagSlug: tagSlug,
+        allTags: allTags,
+        page: page,
+        pageSize: pageSize,
+        totalPages: totalPages,
+        totalPosts: totalPosts,
+        basePath: `/blog/tag/${tagSlug}`,
+        enableGoogleTagManager: GoogleTagManagerEnabled,
+      });
+    } catch (e) {
+      logger.error(e);
+      return next(e);
+    }
+  },
+);
+
+// main blog page
+app.get(
+  "/blog",
+  async (_req: ExpressRequest, res: ExpressResponse, next: NextFunction) => {
+    try {
+      const req: ExpressRequest = _req; // alias for clarity
+      const pageParam: string | undefined = req.query["page"] as
+        | string
+        | undefined;
+      const pageSizeParam: string | undefined = req.query["pageSize"] as
+        | string
+        | undefined;
+      let page: number = pageParam ? parseInt(pageParam, 10) : 1;
+      let pageSize: number = pageSizeParam ? parseInt(pageSizeParam, 10) : 25;
+      if (isNaN(page) || page < 1) {
+        page = 1;
+      }
+      if (isNaN(pageSize) || pageSize < 1) {
+        pageSize = 25;
+      }
+      if (pageSize > 100) {
+        pageSize = 100;
+      }
+
+      const allPosts: Array<BlogPostHeader> =
+        await BlogPostUtil.getBlogPostList(undefined, {
+          includeContributors: true,
+        });
+      const totalPosts: number = allPosts.length;
+      const totalPages: number = Math.ceil(totalPosts / pageSize) || 1;
+      if (page > totalPages) {
+        page = totalPages;
+      }
+      const start: number = (page - 1) * pageSize;
+      const paginatedPosts: Array<BlogPostHeader> = allPosts.slice(
+        start,
+        start + pageSize,
+      );
+      const allTags: Array<string> = await BlogPostUtil.getTags();
+
+      res.render(`${ViewsPath}/Blog/List`, {
+        support: false,
+        footerCards: true,
+        cta: true,
+        blackLogo: false,
+        requestDemoCta: false,
+        blogPosts: paginatedPosts,
+        page: page,
+        pageSize: pageSize,
+        totalPages: totalPages,
+        totalPosts: totalPosts,
+        basePath: `/blog`,
+        allTags: allTags,
+        enableGoogleTagManager: GoogleTagManagerEnabled,
+        seo: {
+          fullCanonicalUrl: "https://oneuptime.com/blog",
+        },
+      });
+    } catch (e) {
+      logger.error(e);
+      return next(e);
+    }
+  },
+);

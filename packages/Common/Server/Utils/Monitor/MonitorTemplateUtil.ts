@@ -1,0 +1,719 @@
+import MonitorType from "../../../Types/Monitor/MonitorType";
+import Monitor from "../../../Models/DatabaseModels/Monitor";
+import { JSONObject } from "../../../Types/JSON";
+import ProbeMonitorResponse from "../../../Types/Probe/ProbeMonitorResponse";
+import IncomingMonitorRequest from "../../../Types/Monitor/IncomingMonitor/IncomingMonitorRequest";
+import ServerMonitorResponse, {
+  ServerProcess,
+} from "../../../Types/Monitor/ServerMonitor/ServerMonitorResponse";
+import BasicInfrastructureMetrics, {
+  BasicDiskMetrics,
+} from "../../../Types/Infrastructure/BasicMetrics";
+import SslMonitorResponse from "../../../Types/Monitor/SSLMonitor/SslMonitorResponse";
+import CustomCodeMonitorResponse from "../../../Types/Monitor/CustomCodeMonitor/CustomCodeMonitorResponse";
+import SyntheticMonitorResponse from "../../../Types/Monitor/SyntheticMonitors/SyntheticMonitorResponse";
+import SnmpMonitorResponse, {
+  SnmpOidResponse,
+} from "../../../Types/Monitor/SnmpMonitor/SnmpMonitorResponse";
+import SnmpInterface from "../../../Types/Monitor/SnmpMonitor/SnmpInterface";
+import SnmpTrap, {
+  SnmpTrapVarbind,
+} from "../../../Types/Monitor/SnmpMonitor/SnmpTrap";
+import DnsMonitorResponse, {
+  DnsRecordResponse,
+} from "../../../Types/Monitor/DnsMonitor/DnsMonitorResponse";
+import DomainMonitorResponse from "../../../Types/Monitor/DomainMonitor/DomainMonitorResponse";
+import DnssecMonitorResponse from "../../../Types/Monitor/DnssecMonitor/DnssecMonitorResponse";
+import DatabaseMonitorResponse, {
+  DatabaseMetricGroupStatus,
+} from "../../../Types/Monitor/DatabaseMonitor/DatabaseMonitorResponse";
+import ExternalStatusPageMonitorResponse, {
+  ExternalStatusPageComponentStatus,
+} from "../../../Types/Monitor/ExternalStatusPageMonitor/ExternalStatusPageMonitorResponse";
+import MetricMonitorResponse from "../../../Types/Monitor/MetricMonitor/MetricMonitorResponse";
+import Typeof from "../../../Types/Typeof";
+import SeriesDebugHints from "../../../Types/Monitor/SeriesContext/SeriesDebugHints";
+import SeriesLabelDisplay from "../../../Types/Monitor/SeriesContext/SeriesLabelDisplay";
+import VMUtil from "../VM/VMAPI";
+import DataToProcess from "./DataToProcess";
+import logger from "../Logger";
+
+/*
+ * Path segments that resolve to the object prototype when a dotted series
+ * label key is walked as a nested property path. See the fold in
+ * `getStorageMap`, and the matching write-side guard in
+ * `CapturedMetricAttributeUtil`.
+ */
+const PrototypeWalkingKeySegments: ReadonlySet<string> = new Set<string>([
+  "__proto__",
+  "constructor",
+  "prototype",
+]);
+
+/**
+ * Utility for building template variable storage map and processing dynamic placeholders
+ * shared between Incident and Alert auto-creation.
+ */
+export default class MonitorTemplateUtil {
+  /**
+   * Build a storage map of variables available for templating based on monitor type.
+   */
+  public static buildTemplateStorageMap(data: {
+    monitorType: MonitorType;
+    dataToProcess: DataToProcess;
+    /**
+     * The monitor that fired this criterion. Used to expose identity
+     * fields (`{{monitorName}}`, `{{monitorId}}`, etc.) to incident
+     * and alert title/description templates. Optional for backwards
+     * compatibility with existing callers.
+     */
+    monitor?: Monitor | undefined;
+    /**
+     * When set, the attribute values identifying the specific series
+     * this template is being rendered for. Each label is exposed to
+     * the template under its own key (so `{{host.name}}` works) and
+     * also collected under a `seriesLabels` object for iteration.
+     * Only populated when a metric monitor fires per-series.
+     */
+    seriesLabels?: JSONObject | undefined;
+  }): JSONObject {
+    let storageMap: JSONObject = {};
+
+    try {
+      if (
+        data.monitorType === MonitorType.API ||
+        data.monitorType === MonitorType.Website
+      ) {
+        let responseBody: JSONObject | null = null;
+        try {
+          responseBody = JSON.parse(
+            ((data.dataToProcess as ProbeMonitorResponse)
+              .responseBody as string) || "{}",
+          );
+        } catch (err) {
+          logger.error(err);
+          responseBody = (data.dataToProcess as ProbeMonitorResponse)
+            .responseBody as JSONObject;
+        }
+
+        if (
+          typeof responseBody === Typeof.String &&
+          responseBody?.toString() === ""
+        ) {
+          responseBody = {};
+        }
+
+        storageMap = {
+          responseBody: responseBody,
+          responseHeaders: (data.dataToProcess as ProbeMonitorResponse)
+            .responseHeaders,
+          responseStatusCode: (data.dataToProcess as ProbeMonitorResponse)
+            .responseCode,
+          responseTimeInMs: (data.dataToProcess as ProbeMonitorResponse)
+            .responseTimeInMs,
+          isOnline: (data.dataToProcess as ProbeMonitorResponse).isOnline,
+        } as JSONObject;
+      }
+
+      if (data.monitorType === MonitorType.IncomingRequest) {
+        storageMap = {
+          requestBody: (data.dataToProcess as IncomingMonitorRequest)
+            .requestBody,
+          requestHeaders: (data.dataToProcess as IncomingMonitorRequest)
+            .requestHeaders,
+          requestMethod: (data.dataToProcess as IncomingMonitorRequest)
+            .requestMethod,
+          incomingRequestReceivedAt: (
+            data.dataToProcess as IncomingMonitorRequest
+          ).incomingRequestReceivedAt,
+        } as JSONObject;
+      }
+
+      if (
+        data.monitorType === MonitorType.Ping ||
+        data.monitorType === MonitorType.IP ||
+        data.monitorType === MonitorType.Port
+      ) {
+        storageMap = {
+          isOnline: (data.dataToProcess as ProbeMonitorResponse).isOnline,
+          responseTimeInMs: (data.dataToProcess as ProbeMonitorResponse)
+            .responseTimeInMs,
+          failureCause: (data.dataToProcess as ProbeMonitorResponse)
+            .failureCause,
+          isTimeout: (data.dataToProcess as ProbeMonitorResponse).isTimeout,
+        } as JSONObject;
+      }
+
+      if (data.monitorType === MonitorType.SSLCertificate) {
+        const sslResponse: SslMonitorResponse | undefined = (
+          data.dataToProcess as ProbeMonitorResponse
+        ).sslResponse;
+        storageMap = {
+          isOnline: (data.dataToProcess as ProbeMonitorResponse).isOnline,
+          isSelfSigned: sslResponse?.isSelfSigned,
+          createdAt: sslResponse?.createdAt,
+          expiresAt: sslResponse?.expiresAt,
+          commonName: sslResponse?.commonName,
+          organizationalUnit: sslResponse?.organizationalUnit,
+          organization: sslResponse?.organization,
+          locality: sslResponse?.locality,
+          state: sslResponse?.state,
+          country: sslResponse?.country,
+          serialNumber: sslResponse?.serialNumber,
+          fingerprint: sslResponse?.fingerprint,
+          fingerprint256: sslResponse?.fingerprint256,
+          failureCause: (data.dataToProcess as ProbeMonitorResponse)
+            .failureCause,
+        } as JSONObject;
+      }
+
+      if (data.monitorType === MonitorType.Server) {
+        const serverResponse: ServerMonitorResponse =
+          data.dataToProcess as ServerMonitorResponse;
+        const infraMetrics: BasicInfrastructureMetrics | undefined =
+          serverResponse.basicInfrastructureMetrics;
+
+        storageMap = {
+          hostname: serverResponse.hostname,
+          requestReceivedAt: serverResponse.requestReceivedAt,
+          failureCause: serverResponse.failureCause,
+        } as JSONObject;
+
+        // Add CPU metrics if available
+        if (infraMetrics?.cpuMetrics) {
+          storageMap["cpuUsagePercent"] = infraMetrics.cpuMetrics.percentUsed;
+          storageMap["cpuCores"] = infraMetrics.cpuMetrics.cores;
+        }
+
+        // Add memory metrics if available
+        if (infraMetrics?.memoryMetrics) {
+          storageMap["memoryUsagePercent"] =
+            infraMetrics.memoryMetrics.percentUsed;
+          storageMap["memoryFreePercent"] =
+            infraMetrics.memoryMetrics.percentFree;
+          storageMap["memoryTotalBytes"] = infraMetrics.memoryMetrics.total;
+        }
+
+        // Add disk metrics if available
+        if (infraMetrics?.diskMetrics) {
+          storageMap["diskMetrics"] = infraMetrics.diskMetrics.map(
+            (disk: BasicDiskMetrics) => {
+              return {
+                diskPath: disk.diskPath,
+                usagePercent: disk.percentUsed,
+                freePercent: disk.percentFree,
+                totalBytes: disk.total,
+              };
+            },
+          );
+        }
+
+        // Add processes if available
+        if (serverResponse.processes) {
+          storageMap["processes"] = serverResponse.processes.map(
+            (process: ServerProcess) => {
+              return {
+                pid: process.pid,
+                name: process.name,
+                command: process.command,
+              };
+            },
+          );
+        }
+      }
+
+      if (data.monitorType === MonitorType.CustomJavaScriptCode) {
+        const customCodeResponse: CustomCodeMonitorResponse | undefined = (
+          data.dataToProcess as ProbeMonitorResponse
+        ).customCodeMonitorResponse;
+
+        storageMap = {
+          executionTimeInMs: customCodeResponse?.executionTimeInMS,
+          result: customCodeResponse?.result,
+          scriptError: customCodeResponse?.scriptError,
+          logMessages: customCodeResponse?.logMessages || [],
+          failureCause: (data.dataToProcess as ProbeMonitorResponse)
+            .failureCause,
+        } as JSONObject;
+      }
+
+      if (data.monitorType === MonitorType.SyntheticMonitor) {
+        const syntheticResponse: SyntheticMonitorResponse[] | undefined = (
+          data.dataToProcess as ProbeMonitorResponse
+        ).syntheticMonitorResponse;
+
+        /*
+         * Synthetic monitors run across multiple browser / screen-size combinations.
+         * Each run is exposed through the syntheticResponses array — use
+         * {{syntheticResponses[i].*}} or {{#each syntheticResponses}} in templates.
+         */
+        storageMap = {
+          syntheticResponses: (syntheticResponse || []).map(
+            (response: SyntheticMonitorResponse) => {
+              return {
+                executionTimeInMs: response.executionTimeInMS,
+                result: response.result,
+                scriptError: response.scriptError,
+                logMessages: response.logMessages || [],
+                screenshots: response.screenshots,
+                browserType: response.browserType,
+                screenSizeType: response.screenSizeType,
+              };
+            },
+          ),
+          failureCause: (data.dataToProcess as ProbeMonitorResponse)
+            .failureCause,
+        } as JSONObject;
+      }
+
+      if (data.monitorType === MonitorType.NetworkDevice) {
+        const snmpResponse: SnmpMonitorResponse | undefined = (
+          data.dataToProcess as ProbeMonitorResponse
+        ).snmpResponse;
+
+        storageMap = {
+          isOnline: (data.dataToProcess as ProbeMonitorResponse).isOnline,
+          responseTimeInMs: snmpResponse?.responseTimeInMs,
+          failureCause: snmpResponse?.failureCause,
+          isTimeout: snmpResponse?.isTimeout,
+        } as JSONObject;
+
+        // Add OID responses as key-value pairs
+        if (snmpResponse?.oidResponses) {
+          storageMap["oidResponses"] = snmpResponse.oidResponses.map(
+            (oidResponse: SnmpOidResponse) => {
+              return {
+                oid: oidResponse.oid,
+                name: oidResponse.name,
+                value: oidResponse.value,
+                type: oidResponse.type,
+              };
+            },
+          );
+
+          // Also add OIDs by name for easier templating
+          for (const oidResponse of snmpResponse.oidResponses) {
+            if (oidResponse.name) {
+              storageMap[oidResponse.name] = oidResponse.value;
+            }
+          }
+        }
+
+        /*
+         * Interface walk results (populated when interface monitoring is
+         * enabled on the monitor step). Counts follow the same semantics as
+         * NetworkInventoryUtil: administratively disabled interfaces are
+         * intentionally down and never count as failures, so
+         * `interfacesDown` / `downInterfaces` only cover interfaces that are
+         * admin-up but oper-down. Lets templates say
+         * "{{downInterfaces.0.name}} on {{sysName}} is down".
+         */
+        if (snmpResponse?.interfaces && snmpResponse.interfaces.length > 0) {
+          const interfaces: Array<SnmpInterface> = snmpResponse.interfaces;
+
+          const downInterfaces: Array<SnmpInterface> = interfaces.filter(
+            (snmpInterface: SnmpInterface) => {
+              return (
+                snmpInterface.isAdministrativelyUp &&
+                !snmpInterface.isOperationallyUp
+              );
+            },
+          );
+
+          storageMap["interfacesTotal"] = interfaces.length;
+          storageMap["interfacesUp"] = interfaces.filter(
+            (snmpInterface: SnmpInterface) => {
+              return (
+                snmpInterface.isAdministrativelyUp &&
+                snmpInterface.isOperationallyUp
+              );
+            },
+          ).length;
+          storageMap["interfacesDown"] = downInterfaces.length;
+          storageMap["downInterfaces"] = downInterfaces.map(
+            (snmpInterface: SnmpInterface) => {
+              return {
+                name: snmpInterface.name,
+                alias: snmpInterface.alias || "",
+                interfaceIndex: snmpInterface.interfaceIndex,
+              };
+            },
+          );
+        }
+
+        if (snmpResponse?.interfaceWalkFailure) {
+          storageMap["interfaceWalkFailure"] =
+            snmpResponse.interfaceWalkFailure;
+        }
+
+        /*
+         * Device system identity (SNMPv2 system group), when collected.
+         * Missing fields default to "" so templates render blank instead of
+         * a raw {{placeholder}} — but never clobber a value the user already
+         * exposed via a custom OID named sysName/sysDescr/etc. above.
+         */
+        if (snmpResponse?.systemInfo) {
+          const systemInfoFields: Array<[string, string | undefined]> = [
+            ["sysName", snmpResponse.systemInfo.sysName],
+            ["sysDescr", snmpResponse.systemInfo.sysDescr],
+            ["sysObjectId", snmpResponse.systemInfo.sysObjectId],
+            ["sysLocation", snmpResponse.systemInfo.sysLocation],
+          ];
+
+          for (const [fieldName, fieldValue] of systemInfoFields) {
+            if (fieldValue || storageMap[fieldName] === undefined) {
+              storageMap[fieldName] = fieldValue || "";
+            }
+          }
+        }
+
+        /*
+         * Trap payload — only present when this check was triggered by an
+         * SNMP trap received by a probe's trap receiver (rather than a
+         * scheduled poll).
+         */
+        const snmpTrapResponse: SnmpTrap | undefined = (
+          data.dataToProcess as ProbeMonitorResponse
+        ).snmpTrapResponse;
+
+        if (snmpTrapResponse) {
+          storageMap["trapOid"] = snmpTrapResponse.trapOid;
+          storageMap["trapSourceIp"] = snmpTrapResponse.sourceIpAddress;
+          storageMap["trapVarbinds"] = snmpTrapResponse.varbinds.map(
+            (varbind: SnmpTrapVarbind) => {
+              return {
+                oid: varbind.oid,
+                value: varbind.value,
+              };
+            },
+          );
+        }
+      }
+
+      if (data.monitorType === MonitorType.DNS) {
+        const dnsResponse: DnsMonitorResponse | undefined = (
+          data.dataToProcess as ProbeMonitorResponse
+        ).dnsResponse;
+
+        storageMap = {
+          isOnline: (data.dataToProcess as ProbeMonitorResponse).isOnline,
+          responseTimeInMs: dnsResponse?.responseTimeInMs,
+          failureCause: dnsResponse?.failureCause,
+          isTimeout: dnsResponse?.isTimeout,
+          isDnssecValid: dnsResponse?.isDnssecValid,
+        } as JSONObject;
+
+        // Add DNS records
+        if (dnsResponse?.records) {
+          storageMap["records"] = dnsResponse.records.map(
+            (record: DnsRecordResponse) => {
+              return {
+                type: record.type,
+                value: record.value,
+                ttl: record.ttl,
+              };
+            },
+          );
+
+          // Add record values as a flat array for easier templating
+          storageMap["recordValues"] = dnsResponse.records.map(
+            (record: DnsRecordResponse) => {
+              return record.value;
+            },
+          );
+        }
+      }
+
+      if (data.monitorType === MonitorType.Domain) {
+        const domainResponse: DomainMonitorResponse | undefined = (
+          data.dataToProcess as ProbeMonitorResponse
+        ).domainResponse;
+
+        storageMap = {
+          isOnline: (data.dataToProcess as ProbeMonitorResponse).isOnline,
+          responseTimeInMs: domainResponse?.responseTimeInMs,
+          failureCause: domainResponse?.failureCause,
+          domainName: domainResponse?.domainName,
+          registrar: domainResponse?.registrar,
+          createdDate: domainResponse?.createdDate,
+          updatedDate: domainResponse?.updatedDate,
+          expiresDate: domainResponse?.expiresDate,
+          nameServers: domainResponse?.nameServers,
+          domainStatus: domainResponse?.domainStatus,
+          dnssec: domainResponse?.dnssec,
+          lookupMethod: domainResponse?.lookupMethod,
+        } as JSONObject;
+      }
+
+      if (data.monitorType === MonitorType.DNSSEC) {
+        const dnssecResponse: DnssecMonitorResponse | undefined = (
+          data.dataToProcess as ProbeMonitorResponse
+        ).dnssecResponse;
+
+        storageMap = {
+          isOnline: (data.dataToProcess as ProbeMonitorResponse).isOnline,
+          responseTimeInMs: dnssecResponse?.responseTimeInMs,
+          failureCause: dnssecResponse?.failureCause,
+          domainName: dnssecResponse?.domainName,
+          isZoneSigned: dnssecResponse?.isZoneSigned,
+          isParentDsPresent: dnssecResponse?.isParentDsPresent,
+          isChainValid: dnssecResponse?.isChainValid,
+          resolverConsensusAd: dnssecResponse?.resolverConsensusAd,
+          isNameserverConsistent: dnssecResponse?.isNameserverConsistent,
+          earliestSignatureExpiration:
+            dnssecResponse?.earliestSignatureExpiration,
+          daysUntilSignatureExpiry: dnssecResponse?.daysUntilSignatureExpiry,
+          dnskeyCount: dnssecResponse?.dnskeys?.length,
+          dsRecordCount: dnssecResponse?.parentDsRecords?.length,
+          rrsigCount: dnssecResponse?.rrsigs?.length,
+        } as JSONObject;
+      }
+
+      if (data.monitorType === MonitorType.Database) {
+        const databaseResponse: DatabaseMonitorResponse | undefined = (
+          data.dataToProcess as ProbeMonitorResponse
+        ).databaseMonitorResponse;
+
+        const unavailableGroups: Array<DatabaseMetricGroupStatus> =
+          databaseResponse?.unavailableGroups || [];
+
+        storageMap = {
+          isOnline: (data.dataToProcess as ProbeMonitorResponse).isOnline,
+          responseTimeInMs: databaseResponse?.responseTimeInMs,
+          failureCause: databaseResponse?.failureCause,
+          connectionError: databaseResponse?.connectionError,
+          engineVersion: databaseResponse?.engineVersion,
+          collectedGroups: databaseResponse?.collectedGroups || [],
+          unavailableGroups: unavailableGroups.map(
+            (status: DatabaseMetricGroupStatus) => {
+              return {
+                group: status.group,
+                reason: status.reason,
+                message: status.message,
+                remediation: status.remediation,
+              };
+            },
+          ),
+          /*
+           * Partial collection is the normal state of this monitor, so the
+           * ready-made sentence matters more here than the array does - an
+           * incident title has room for one line, not a loop.
+           */
+          collectionIssueSummary: unavailableGroups
+            .map((status: DatabaseMetricGroupStatus) => {
+              return `${status.group}: ${status.message}`;
+            })
+            .join("; "),
+          // A metric absent from this map was not collected on this check.
+          metrics: databaseResponse?.metrics || {},
+        } as JSONObject;
+      }
+
+      if (
+        data.monitorType === MonitorType.Metrics ||
+        data.monitorType === MonitorType.Kubernetes ||
+        data.monitorType === MonitorType.Docker ||
+        data.monitorType === MonitorType.Host ||
+        data.monitorType === MonitorType.Podman ||
+        data.monitorType === MonitorType.DockerSwarm ||
+        data.monitorType === MonitorType.Proxmox ||
+        data.monitorType === MonitorType.VMware ||
+        data.monitorType === MonitorType.Ceph
+      ) {
+        const metricResponse: MetricMonitorResponse =
+          data.dataToProcess as MetricMonitorResponse;
+
+        const queryConfigs: Array<unknown> =
+          metricResponse.metricViewConfig?.queryConfigs || [];
+
+        const firstQuery: unknown = queryConfigs[0];
+        const metricName: string | undefined = (
+          firstQuery as
+            | {
+                metricQueryData?: { filterData?: { metricName?: string } };
+              }
+            | undefined
+        )?.metricQueryData?.filterData?.metricName;
+
+        storageMap = {
+          metricName: metricName || "",
+        } as JSONObject;
+      }
+
+      if (data.monitorType === MonitorType.ExternalStatusPage) {
+        const externalStatusPageResponse:
+          | ExternalStatusPageMonitorResponse
+          | undefined = (data.dataToProcess as ProbeMonitorResponse)
+          .externalStatusPageResponse;
+
+        storageMap = {
+          isOnline: (data.dataToProcess as ProbeMonitorResponse).isOnline,
+          responseTimeInMs: externalStatusPageResponse?.responseTimeInMs,
+          failureCause: externalStatusPageResponse?.failureCause,
+          overallStatus: externalStatusPageResponse?.overallStatus,
+          activeIncidentCount: externalStatusPageResponse?.activeIncidentCount,
+          provider: externalStatusPageResponse?.provider,
+          componentGroup: externalStatusPageResponse?.componentGroupName,
+          componentName: externalStatusPageResponse?.componentName,
+        } as JSONObject;
+
+        // Add component statuses
+        if (externalStatusPageResponse?.componentStatuses) {
+          storageMap["componentStatuses"] =
+            externalStatusPageResponse.componentStatuses.map(
+              (component: ExternalStatusPageComponentStatus) => {
+                return {
+                  name: component.name,
+                  status: component.status,
+                  description: component.description,
+                  groupName: component.groupName,
+                };
+              },
+            );
+        }
+      }
+    } catch (err) {
+      logger.error(err);
+    }
+
+    /*
+     * Fold series labels onto the storage map so templates like
+     * `{{host.name}}` or `{{resource.k8s.container.name}}` resolve at
+     * render time. The template engine walks dotted paths as nested
+     * property access (`host` → `.name`), so for each dotted label
+     * key we build up a nested object rather than storing the flat
+     * key. Also expose the full label map under `seriesLabels` for
+     * iteration-style templates.
+     */
+    if (data.seriesLabels && Object.keys(data.seriesLabels).length > 0) {
+      for (const key of Object.keys(data.seriesLabels)) {
+        const value: unknown = data.seriesLabels[key];
+        if (value === undefined || value === null) {
+          continue;
+        }
+        const parts: Array<string> = key.split(".");
+        /*
+         * Series label keys are attacker-adjacent: they are whatever
+         * attribute names the emitting telemetry chose, and a monitor
+         * script picks them outright via oneuptime.captureMetric(). Walking
+         * `__proto__` here would hand the loop Object.prototype — it is
+         * truthy, an object, and not an Array, so the reset below would be
+         * skipped and the final assignment would land on the prototype
+         * itself, polluting every object in the shared Workers process that
+         * renders every project's alert templates. `constructor` and
+         * `prototype` are refused with it so no spelling of the same walk
+         * survives. The whole label is skipped rather than partially
+         * folded, and it is still reachable in full under `seriesLabels`.
+         */
+        if (
+          parts.some((part: string) => {
+            return PrototypeWalkingKeySegments.has(part);
+          })
+        ) {
+          continue;
+        }
+        let cursor: JSONObject = storageMap;
+        for (let i: number = 0; i < parts.length - 1; i++) {
+          const part: string = parts[i]!;
+          const existing: unknown = cursor[part];
+          if (
+            !existing ||
+            typeof existing !== "object" ||
+            Array.isArray(existing)
+          ) {
+            cursor[part] = {};
+          }
+          cursor = cursor[part] as JSONObject;
+        }
+        cursor[parts[parts.length - 1]!] = value as JSONObject[string];
+      }
+      storageMap["seriesLabels"] = data.seriesLabels;
+    }
+
+    /*
+     * Ready-made renderings of the series identity.
+     *
+     * These are set unconditionally - to "" when the monitor is not
+     * grouped, or when its labels carry no usable value - and that is
+     * the whole point. `VMUtil.replaceValueInPlace` leaves a placeholder
+     * it cannot resolve in the output verbatim, so a title written as
+     * `"Pod CPU high{{seriesResourceSuffix}}"` would otherwise render
+     * with the braces still in it on any monitor without a group-by.
+     * Always defining them makes the variables safe to use in a shipped
+     * template that has to work for grouped and ungrouped monitors
+     * alike.
+     */
+    storageMap["seriesResourceSuffix"] = SeriesLabelDisplay.buildTitleSuffix(
+      data.seriesLabels,
+    );
+    storageMap["seriesResourceSummary"] = SeriesLabelDisplay.buildInlineSummary(
+      data.seriesLabels,
+    );
+    storageMap["seriesResourceBlock"] = SeriesLabelDisplay.buildMarkdownBlock(
+      data.seriesLabels,
+    );
+    storageMap["seriesDebugCommands"] = SeriesDebugHints.buildMarkdownBlock({
+      monitorType: data.monitorType,
+      seriesLabels: data.seriesLabels,
+    });
+
+    /*
+     * Monitor identity fields. Always exposed (when a monitor is provided),
+     * independent of monitorType, so templates like `{{monitorName}}` work
+     * uniformly across Server/VM, Probe, Synthetic, Metric monitors, etc.
+     */
+    if (data.monitor) {
+      if (data.monitor.name) {
+        storageMap["monitorName"] = data.monitor.name;
+      }
+      if (data.monitor.id) {
+        storageMap["monitorId"] = data.monitor.id.toString();
+      }
+      if (data.monitor.description) {
+        storageMap["monitorDescription"] = data.monitor.description;
+      }
+      if (data.monitor.slug) {
+        storageMap["monitorSlug"] = data.monitor.slug;
+      }
+      if (data.monitor.monitorType) {
+        storageMap["monitorType"] = data.monitor.monitorType;
+      }
+    }
+
+    logger.debug(`Storage Map: ${JSON.stringify(storageMap, null, 2)}`);
+
+    return storageMap;
+  }
+
+  /**
+   * Replace {{var}} placeholders in the given string with values from the storage map.
+   */
+  public static processTemplateString(data: {
+    value: string | undefined;
+    storageMap: JSONObject;
+  }): string {
+    try {
+      const { value, storageMap } = data;
+
+      if (!value) {
+        return "";
+      }
+
+      let replaced: string = VMUtil.replaceValueInPlace(
+        storageMap,
+        value,
+        false,
+      );
+      replaced =
+        replaced !== undefined && replaced !== null ? `${replaced}` : "";
+
+      logger.debug(`Original Value: ${data.value}`);
+      logger.debug(`Replaced Value: ${replaced}`);
+
+      return replaced;
+    } catch (err) {
+      logger.error(err);
+      return data.value || "";
+    }
+  }
+}

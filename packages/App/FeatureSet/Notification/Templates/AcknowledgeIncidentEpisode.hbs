@@ -1,0 +1,65 @@
+{{> Start this}}
+
+
+{{> Logo this}}
+{{> EmailTitle title=(concat "Incident Episode " episodeNumber ": " incidentEpisodeTitle) }}
+
+{{> InfoBlock plainInfo=(concat "A new incident episode has been created in the project - " projectName)}}
+
+{{> InfoBlock info="Here are the details: "}}
+
+{{> DetailBoxStart this }}
+{{> DetailBoxField title="Incident Episode Title:" plainText=incidentEpisodeTitle }}
+{{> DetailBoxField title="Current State: " plainText=currentState  }}
+{{> DetailBoxField title="Resources Affected: " plainText=resourcesAffected  }}
+{{> DetailBoxField title="Severity: " plainText=incidentEpisodeSeverity  }}
+{{> DetailBoxField title="Root Cause: " blockText=rootCause  }}
+{{> DetailBoxField title="Description: " blockText=incidentEpisodeDescription  }}
+{{> DetailBoxEnd this }}
+
+{{#if incidentsList}}
+{{> TitleBlock title=(concat "Incidents in this Episode (" incidentsCount ")") }}
+<!-- Incidents List Container -->
+<table role="presentation" class="st-Copy st-Width st-Width--mobile" border="0" cellpadding="0" cellspacing="0"
+  width="100%" style="width: 100%; max-width: 100%; table-layout: fixed;">
+  <tbody>
+    <tr>
+      <td class="st-Spacer st-Spacer--gutter"
+        style="border: 0; margin:0; padding: 0; font-size: 1px; line-height: 1px; mso-line-height-rule: exactly;"
+        width="40">
+        <div class="st-Spacer st-Spacer--filler"></div>
+      </td>
+      <td style="border: 0; margin: 0; padding: 0; overflow-wrap: anywhere; word-break: break-word;">
+        {{{incidentsList}}}
+      </td>
+      <td class="st-Spacer st-Spacer--gutter"
+        style="border: 0; margin:0; padding: 0; font-size: 1px; line-height: 1px; mso-line-height-rule: exactly;"
+        width="40">
+        <div class="st-Spacer st-Spacer--filler"></div>
+      </td>
+    </tr>
+    <tr>
+      <td class="st-Spacer st-Spacer--stacked" colspan="3" height="16"
+        style="border: 0; margin: 0; padding: 0; font-size: 1px; line-height: 1px; mso-line-height-rule: exactly;">
+        <div class="st-Spacer st-Spacer--filler"></div>
+      </td>
+    </tr>
+  </tbody>
+</table>
+<!-- /Incidents List Container -->
+{{/if}}
+
+{{> InfoBlock info="ACTION REQUIRED: Please acknowledge this incident episode by clicking on the button below - "}}
+
+{{> ButtonBlock buttonUrl=acknowledgeIncidentEpisodeLink buttonText="Acknowledge Incident Episode"}}
+
+{{> LinkBlock linkUrl=acknowledgeIncidentEpisodeLink linkLabel="You can also copy and paste this link:"}}
+
+{{> InfoBlock info="You will be notified when the status of this incident episode changes."}}
+
+{{> TitleBlock title="Why am I receiving this email?"}}
+{{> InfoBlock info="You are receiving this email because you are a member of the team that is responsible for this incident episode or you are currently on-call."}}
+
+{{> Footer this }}
+
+{{> End this}}

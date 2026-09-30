@@ -68,12 +68,11 @@ spec:
       {{- if $.Values.tolerations }}
       tolerations: {{- $.Values.tolerations | toYaml | nindent 8 }}
       {{- end }}
-      {{- if $.Values.worker.nodeSelector }}
       nodeSelector:
-        {{- toYaml $.Values.worker.nodeSelector | nindent 8 }}
-      {{- else if $.Values.nodeSelector }}
-      nodeSelector:
-        {{- toYaml $.Values.nodeSelector | nindent 8 }}
+        {{- include "oneuptime.nodeSelector" ($.Values.worker.nodeSelector | default $.Values.nodeSelector) | nindent 8 }}
+      {{- with (default $.Values.extraVolumes $.Values.worker.extraVolumes) }}
+      volumes:
+        {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
         - image: {{ include "oneuptime.image" (dict "Values" $.Values "ServiceName" "worker" "ImageName" "app") }}
@@ -117,6 +116,7 @@ spec:
           imagePullPolicy: {{ $.Values.image.pullPolicy }}
           env:
             {{- include "oneuptime.env.common" . | nindent 12 }}
+            {{- include "oneuptime.env.telemetryIdentity" (dict "Values" $.Values "DeploymentName" (printf "%s-%s" $.Release.Name "worker")) | nindent 12 }}
             {{- include "oneuptime.env.runtime" (dict "Values" $.Values "Release" $.Release "DatabaseMaxOpenConnections" ($.Values.worker.databaseMaxOpenConnections | default $.Values.deployment.databaseMaxOpenConnections)) | nindent 12 }}
             - name: PORT
               value: {{ $.Values.worker.ports.http | quote }}
@@ -139,7 +139,38 @@ spec:
               value: {{ $.Values.worker.enableProfiling | quote }}
             - name: TELEMETRY_CONCURRENCY
               value: {{ $.Values.worker.telemetryConcurrency | default 100 | squote }}
+            # Fan-in telemetry writer knobs (defaults match the code —
+            # Common/Server/Utils/Telemetry/TelemetryFanInWriter.ts). Fleet-wide
+            # ClickHouse insert concurrency is replicas x maxConcurrentInserts.
+            - name: TELEMETRY_FANIN_MAX_BATCH_ROWS
+              value: {{ $.Values.worker.telemetryFanInMaxBatchRows | default 100000 | squote }}
+            - name: TELEMETRY_FANIN_MAX_WAIT_MS
+              value: {{ $.Values.worker.telemetryFanInMaxWaitMs | default 5000 | squote }}
+            - name: TELEMETRY_FANIN_MAX_CONCURRENT_INSERTS
+              value: {{ $.Values.worker.telemetryFanInMaxConcurrentInserts | default 4 | squote }}
+            - name: TELEMETRY_FANIN_MAX_PENDING_ROWS
+              value: {{ $.Values.worker.telemetryFanInMaxPendingRows | default 200000 | squote }}
+            - name: TELEMETRY_FANIN_RETRY_MAX_ATTEMPTS
+              value: {{ $.Values.worker.telemetryFanInRetryMaxAttempts | default 6 | squote }}
+            - name: TELEMETRY_FANIN_RETRY_BASE_DELAY_MS
+              value: {{ $.Values.worker.telemetryFanInRetryBaseDelayMs | default 250 | squote }}
+            - name: TELEMETRY_FANIN_RETRY_MAX_DELAY_MS
+              value: {{ $.Values.worker.telemetryFanInRetryMaxDelayMs | default 10000 | squote }}
+            # Per-pod ClickHouse pool ceilings; the ingest pool inherits the
+            # query pool size when unset (same fallback the code applies).
+            - name: CLICKHOUSE_MAX_OPEN_CONNECTIONS
+              value: {{ $.Values.worker.clickhouseMaxOpenConnections | default 100 | squote }}
+            - name: CLICKHOUSE_INGEST_MAX_OPEN_CONNECTIONS
+              value: {{ $.Values.worker.clickhouseIngestMaxOpenConnections | default ($.Values.worker.clickhouseMaxOpenConnections | default 100) | squote }}
+            {{- include "oneuptime.env.telemetryWriterUrl" . | nindent 12 }}
             {{- include "oneuptime.env.registerProbeKey" (dict "Values" $.Values "Release" $.Release) | nindent 12 }}
+            {{- with (default $.Values.extraEnv $.Values.worker.extraEnv) }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with (default $.Values.extraVolumeMounts $.Values.worker.extraVolumeMounts) }}
+          volumeMounts:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           ports:
             - containerPort: {{ $.Values.worker.ports.http }}
               protocol: TCP

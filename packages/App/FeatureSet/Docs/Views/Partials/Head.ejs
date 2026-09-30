@@ -1,0 +1,263 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script>
+    /*
+     * Theme bootstrap. Runs before anything paints so a reader who chose the
+     * dark theme never sees a white flash on navigation. Stored choice wins;
+     * with no stored choice we follow the operating system.
+     */
+    (function () {
+        try {
+            var stored = window.localStorage.getItem('oneuptime-docs-theme');
+            var prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+            var isDark = stored === 'dark' || (stored !== 'light' && prefersDark);
+            document.documentElement.classList.toggle('dark', isDark);
+            document.documentElement.style.colorScheme = isDark ? 'dark' : 'light';
+        } catch (e) {
+            /* Private browsing with storage disabled — fall back to light. */
+        }
+    })();
+</script>
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0a0d14" media="(prefers-color-scheme: dark)">
+<link rel="preload" href="/docs/static/fonts/InterVariable.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/docs/static/fonts/JetBrainsMono-Regular.woff2" as="font" type="font/woff2" crossorigin>
+<style>
+  @font-face {
+    font-family: 'Inter';
+    font-style: normal;
+    font-weight: 100 900;
+    font-display: swap;
+    src: url('/docs/static/fonts/InterVariable.woff2') format('woff2') tech('variations'),
+         url('/docs/static/fonts/InterVariable.woff2') format('woff2-variations');
+  }
+  @font-face {
+    font-family: 'JetBrains Mono';
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+    src: url('/docs/static/fonts/JetBrainsMono-Regular.woff2') format('woff2');
+  }
+  @font-face {
+    font-family: 'JetBrains Mono';
+    font-style: normal;
+    font-weight: 500;
+    font-display: swap;
+    src: url('/docs/static/fonts/JetBrainsMono-Medium.woff2') format('woff2');
+  }
+</style>
+<style>
+    /*
+     * Critical CSS. Holds the page's ground colour and structural metrics so
+     * the first paint is already the right theme at the right size — the
+     * stylesheet below only refines it.
+     */
+    :root { --docs-boot-bg: #ffffff; --docs-boot-fg: #384456; }
+    html.dark { --docs-boot-bg: #0a0d14; --docs-boot-fg: #c3cbd9; }
+    html { background-color: var(--docs-boot-bg); }
+    body {
+        margin: 0;
+        min-height: 100vh;
+        background-color: var(--docs-boot-bg);
+        color: var(--docs-boot-fg);
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    }
+    /* Header: fixed height prevents shift when styles load — scoped to page header only */
+    #docs-header { position: sticky; top: 0; z-index: 50; min-height: 3.5rem; display: flex; align-items: center; justify-content: space-between; padding: 0.625rem 1rem; }
+    .docs-logo { height: 1.75rem; width: auto; display: block; }
+    .docs-logo--dark { display: none; }
+    html.dark .docs-logo--dark { display: block; }
+    html.dark .docs-logo--light { display: none; }
+    /* Reserve sidebar width on desktop so the article never reflows sideways */
+    @media (min-width: 1024px) {
+        .docs-layout-sidebar { width: 16rem; min-width: 16rem; flex-shrink: 0; }
+    }
+    .docs-content img { max-width: 100%; height: auto; }
+    nav[data-docs-nav] { width: 100%; }
+</style>
+<!-- Tailwind, served from this install - load synchronously before compiled CSS so both are ready at first paint -->
+<link rel="preload" href="/oneuptime-assets/tailwind/tailwind-3.4.5.js" as="script">
+<script src="/oneuptime-assets/tailwind/tailwind-3.4.5.js"></script>
+<script>
+    tailwind.config = {
+        /*
+         * Class-based, not media-based: the reader's explicit choice has to be
+         * able to disagree with the operating system. Matches the `.dark`
+         * selector the compiled stylesheet was built with.
+         */
+        darkMode: 'selector',
+        theme: {
+            extend: {
+                fontFamily: {
+                    sans: ['Inter', 'ui-sans-serif', 'system-ui', '-apple-system', 'BlinkMacSystemFont', '"Segoe UI"', 'Roboto', '"Helvetica Neue"', 'Arial', 'sans-serif'],
+                    display: ['Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+                    mono: ['"JetBrains Mono"', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'Monaco', 'Consolas', 'monospace'],
+                },
+                maxWidth: {
+                    '8xl': '90rem',
+                },
+            }
+        }
+    }
+</script>
+<!-- Compiled CSS: Tailwind build plus the hand-written docs design layer -->
+<link rel="stylesheet" href="/docs/static/css/style.css" crossorigin data-precedence="next">
+<title><%= typeof link !== 'undefined' && link && link.title ? link.title + ' - ' + t('ui.metaTitleSuffix') : t('ui.metaTitleDefault') %></title>
+<meta name="description" content="<%= t('ui.metaDescription') %>">
+<meta name="keywords" content="OneUptime, documentation, monitoring, observability, alerts, incidents, status page, open source">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="<%= t('ui.metaTitleSuffix') %>">
+<meta property="og:title" content="<%= typeof link !== 'undefined' && link && link.title ? link.title : t('ui.metaTitleDefault') %>">
+<meta property="og:description" content="<%= t('ui.metaDescription') %>">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="<%= typeof link !== 'undefined' && link && link.title ? link.title : t('ui.metaTitleDefault') %>">
+<meta name="twitter:description" content="<%= t('ui.metaDescription') %>">
+<link rel="icon" href="/favicon.ico" type="image/x-icon" sizes="16x16">
+<link rel="stylesheet" href="/oneuptime-assets/highlight/styles/vs2015.min.css">
+<script src="/oneuptime-assets/highlight/highlight.min.js" defer></script>
+<script>
+    /*
+     * Syntax highlighting. Only the grammars this page actually needs are
+     * fetched, and a fence that declared no language is left alone: it renders
+     * as plain text rather than being auto-detected, which is how shell
+     * snippets used to end up labelled "PHP".
+     *
+     * Every value here must have a matching file in
+     * Common/Server/Static/Vendor/highlight/languages.
+     */
+    document.addEventListener('DOMContentLoaded', function () {
+        var langMap = {
+            'apache': 'apache', 'bash': 'bash', 'shell': 'bash', 'sh': 'bash', 'zsh': 'bash',
+            'c': 'c', 'cpp': 'cpp', 'csharp': 'csharp', 'cs': 'csharp', 'css': 'css',
+            'diff': 'diff', 'dns': 'dns', 'docker': 'dockerfile', 'dockerfile': 'dockerfile',
+            'go': 'go', 'graphql': 'graphql', 'html': 'xml', 'http': 'http', 'ini': 'ini',
+            'java': 'java', 'javascript': 'javascript', 'js': 'javascript', 'json': 'json',
+            'kotlin': 'kotlin', 'lua': 'lua', 'makefile': 'makefile', 'markup': 'xml',
+            'nginx': 'nginx', 'perl': 'perl', 'php': 'php', 'powershell': 'powershell',
+            'python': 'python', 'py': 'python', 'r': 'r', 'rb': 'ruby', 'ruby': 'ruby',
+            'rust': 'rust', 'scala': 'scala', 'sql': 'sql', 'swift': 'swift',
+            'toml': 'ini', 'ts': 'typescript', 'tsx': 'typescript', 'typescript': 'typescript',
+            'xml': 'xml', 'yaml': 'yaml', 'yml': 'yaml'
+        };
+
+        var blocks = document.querySelectorAll('.docs-code pre code[class*="language-"]');
+        var needed = {};
+        blocks.forEach(function (el) {
+            var match = el.className.match(/language-([\w-]+)/);
+            if (match && langMap[match[1]]) {
+                needed[langMap[match[1]]] = true;
+            }
+        });
+
+        function highlight() {
+            if (typeof hljs === 'undefined') {
+                return;
+            }
+            hljs.configure({ ignoreUnescapedHTML: true });
+            blocks.forEach(function (el) {
+                var match = el.className.match(/language-([\w-]+)/);
+                if (match && langMap[match[1]] && hljs.getLanguage(langMap[match[1]])) {
+                    hljs.highlightElement(el);
+                }
+            });
+        }
+
+        var langs = Object.keys(needed);
+        if (langs.length === 0) {
+            return;
+        }
+        var loaded = 0;
+        langs.forEach(function (lang) {
+            var script = document.createElement('script');
+            script.src = '/oneuptime-assets/highlight/languages/' + lang + '.min.js';
+            script.async = false;
+            script.onload = script.onerror = function () {
+                loaded++;
+                if (loaded >= langs.length) {
+                    highlight();
+                }
+            };
+            document.head.appendChild(script);
+        });
+    });
+</script>
+<script type="module">
+    /*
+     * Mermaid is ~1MB across two dozen chunks. Fetch it only on the handful of
+     * pages that actually draw a diagram.
+     */
+    const diagrams = Array.prototype.slice.call(document.querySelectorAll('.mermaid'));
+    if (diagrams.length > 0) {
+        /*
+         * Keep the definitions: rendering replaces each node's contents with an
+         * SVG, so re-theming after a light/dark switch needs the source back.
+         */
+        const definitions = diagrams.map((node) => {
+            return node.textContent;
+        });
+        const mermaid = (await import('/oneuptime-assets/mermaid/mermaid.esm.min.mjs')).default;
+
+        const draw = async () => {
+            mermaid.initialize({
+                startOnLoad: false,
+                theme: document.documentElement.classList.contains('dark') ? 'dark' : 'default',
+            });
+            for (let index = 0; index < diagrams.length; index++) {
+                try {
+                    /*
+                     * render() rather than run(): run() walks the DOM itself and
+                     * quietly left an empty <svg> behind on definitions that
+                     * parse perfectly well. Rendering to a string and placing it
+                     * ourselves is the same work with a visible failure mode —
+                     * and one bad diagram cannot take the others with it.
+                     */
+                    const result = await mermaid.render(
+                        'docs-diagram-' + index,
+                        definitions[index],
+                    );
+                    diagrams[index].innerHTML = result.svg;
+
+                    /*
+                     * Fill the column, but never below the layout Mermaid
+                     * computed: its own width="100%" scales a wide flowchart
+                     * down until the labels are unreadable. The wrapper
+                     * scrolls instead.
+                     */
+                    const svg = diagrams[index].querySelector('svg');
+                    const naturalWidth = svg
+                        ? Number((svg.getAttribute('viewBox') || '').split(/\s+/)[2])
+                        : 0;
+                    if (svg && naturalWidth > 0) {
+                        svg.style.maxWidth = 'none';
+                        svg.style.width = '100%';
+                        svg.style.minWidth = Math.ceil(naturalWidth) + 'px';
+                    }
+                } catch (error) {
+                    console.error('Mermaid could not render a diagram on this page', error);
+                }
+            }
+        };
+
+        /*
+         * `startOnLoad` is no use here: the dynamic import above resolves after
+         * DOMContentLoaded has already fired, so rendering is triggered by hand.
+         */
+        await draw();
+        window.addEventListener('docs:themechange', () => {
+            draw();
+        });
+    }
+</script>
+
+<% if(typeof enableGoogleTagManager !== 'undefined' ? enableGoogleTagManager : false){ %>
+    <!-- Google Tag Manager -->
+    <script>(function (w, d, s, l, i) {
+            w[l] = w[l] || []; w[l].push({
+                'gtm.start':
+                    new Date().getTime(), event: 'gtm.js'
+            }); var f = d.getElementsByTagName(s)[0],
+                j = d.createElement(s), dl = l != 'dataLayer' ? '&l=' + l : ''; j.async = true; j.src =
+                    'https://www.googletagmanager.com/gtm.js?id=' + i + dl; f.parentNode.insertBefore(j, f);
+        })(window, document, 'script', 'dataLayer', 'GTM-PKQD5WH');</script>
+    <!-- End Google Tag Manager -->
+    <% } %>

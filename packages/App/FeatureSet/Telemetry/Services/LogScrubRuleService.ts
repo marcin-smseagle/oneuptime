@@ -1,0 +1,326 @@
+import LogScrubRule from "Common/Models/DatabaseModels/LogScrubRule";
+import DatabaseService from "Common/Server/Services/DatabaseService";
+import SortOrder from "Common/Types/BaseDatabase/SortOrder";
+import LIMIT_MAX from "Common/Types/Database/LimitMax";
+import ObjectID from "Common/Types/ObjectID";
+import { JSONObject } from "Common/Types/JSON";
+import LogScrubAction from "Common/Types/Log/LogScrubAction";
+import LogScrubPatternType from "Common/Types/Log/LogScrubPatternType";
+import crypto from "crypto";
+import InMemoryTTLCache from "Common/Server/Infrastructure/InMemoryTTLCache";
+
+interface CompiledRule {
+  rule: LogScrubRule;
+  regex: RegExp;
+}
+
+const CACHE_TTL_MS: number = 60 * 1000; // 60 seconds
+const MAX_CACHED_PROJECTS: number = 10_000;
+
+const scrubRuleCache: InMemoryTTLCache<Array<CompiledRule>> =
+  new InMemoryTTLCache<Array<CompiledRule>>(MAX_CACHED_PROJECTS);
+
+// Built-in PII detection patterns
+const BUILT_IN_PATTERNS: Record<string, RegExp> = {
+  [LogScrubPatternType.Email]:
+    /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g,
+  [LogScrubPatternType.CreditCard]: /\b(?:\d{4}[-\s]?){3}\d{4}\b/g,
+  [LogScrubPatternType.SSN]: /\b\d{3}-\d{2}-\d{4}\b/g,
+  [LogScrubPatternType.PhoneNumber]:
+    /\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/g,
+  [LogScrubPatternType.IPAddress]: /\b(?:\d{1,3}\.){3}\d{1,3}\b/g,
+};
+
+/*
+ * Attribute-KEY denylist for the SensitiveKeys pattern. Value-regex rules
+ * miss secrets that don't look like anything (a random password, an opaque
+ * token) — but the attribute key names them. Matched case-insensitively
+ * against the attribute key; on a hit the WHOLE value gets the rule's
+ * scrub action, whatever the value looks like. Same list as the trace
+ * engine — keep them in sync.
+ */
+const SENSITIVE_KEY_REGEX: RegExp =
+  /(password|passwd|pwd|secret|token|api[._-]?key|access[._-]?key|private[._-]?key|client[._-]?secret|authorization|auth[._-]?header|cookie|session[._-]?id|credit[._-]?card|card[._-]?number|ssn|csrf|xsrf)/i;
+
+export class LogScrubRuleService {
+  public static async loadScrubRules(
+    projectId: ObjectID,
+  ): Promise<Array<CompiledRule>> {
+    const cacheKey: string = projectId.toString();
+    const cached: Array<CompiledRule> | undefined =
+      scrubRuleCache.get(cacheKey);
+
+    // Empty arrays are truthy — zero-rule projects stay negatively cached.
+    if (cached) {
+      return cached;
+    }
+
+    const service: DatabaseService<LogScrubRule> =
+      new DatabaseService<LogScrubRule>(LogScrubRule);
+
+    const rules: Array<LogScrubRule> = await service.findBy({
+      query: {
+        projectId: projectId,
+        isEnabled: true,
+      },
+      skip: 0,
+      limit: LIMIT_MAX,
+      sort: {
+        sortOrder: SortOrder.Ascending,
+      },
+      select: {
+        _id: true,
+        name: true,
+        patternType: true,
+        customRegex: true,
+        scrubAction: true,
+        fieldsToScrub: true,
+        sortOrder: true,
+      },
+      props: {
+        isRoot: true,
+      },
+    });
+
+    // Pre-compile regex patterns for performance
+    const compiledPatterns: Array<CompiledRule> = [];
+
+    for (const rule of rules) {
+      const regex: RegExp | null = this.getRegexForPattern(
+        rule.patternType as string,
+        rule.customRegex as string | undefined,
+      );
+
+      if (regex) {
+        compiledPatterns.push({ rule, regex });
+      }
+    }
+
+    scrubRuleCache.set(cacheKey, compiledPatterns, CACHE_TTL_MS);
+
+    return compiledPatterns;
+  }
+
+  private static getRegexForPattern(
+    patternType: string,
+    customRegex?: string,
+  ): RegExp | null {
+    if (patternType === LogScrubPatternType.Custom) {
+      if (!customRegex) {
+        return null;
+      }
+      try {
+        return new RegExp(customRegex, "g");
+      } catch {
+        return null;
+      }
+    }
+
+    /*
+     * SensitiveKeys compiles to the KEY regex — it is matched against
+     * attribute keys (not values) by the attribute scrub loop, and
+     * skipped entirely by scrubString.
+     */
+    if (patternType === LogScrubPatternType.SensitiveKeys) {
+      return new RegExp(SENSITIVE_KEY_REGEX.source, SENSITIVE_KEY_REGEX.flags);
+    }
+
+    const builtIn: RegExp | undefined = BUILT_IN_PATTERNS[patternType];
+    if (builtIn) {
+      // Return a new instance so lastIndex is independent per use
+      return new RegExp(builtIn.source, builtIn.flags);
+    }
+
+    return null;
+  }
+
+  private static applyScrubAction(
+    match: string,
+    action: string,
+    patternType: string,
+  ): string {
+    switch (action) {
+      case LogScrubAction.Redact:
+        return "[REDACTED]";
+
+      case LogScrubAction.Hash: {
+        const hash: string = crypto
+          .createHash("sha256")
+          .update(match)
+          .digest("hex")
+          .substring(0, 8);
+        return `[HASHED:${hash}]`;
+      }
+
+      case LogScrubAction.Mask:
+        return this.maskValue(match, patternType);
+
+      default:
+        return "[REDACTED]";
+    }
+  }
+
+  private static maskValue(value: string, patternType: string): string {
+    switch (patternType) {
+      case LogScrubPatternType.Email: {
+        const atIndex: number = value.indexOf("@");
+        if (atIndex > 0) {
+          const dotIndex: number = value.lastIndexOf(".");
+          if (dotIndex > atIndex) {
+            return value[0] + "***@***" + value.substring(dotIndex);
+          }
+        }
+        return "***@***.***";
+      }
+
+      case LogScrubPatternType.CreditCard: {
+        // Show last 4 digits only
+        const digits: string = value.replace(/[-\s]/g, "");
+        if (digits.length >= 4) {
+          return "****-****-****-" + digits.substring(digits.length - 4);
+        }
+        return "****-****-****-****";
+      }
+
+      case LogScrubPatternType.SSN:
+        return "***-**-" + value.substring(value.length - 4);
+
+      case LogScrubPatternType.PhoneNumber: {
+        // Show last 4 digits only
+        const phoneDigits: string = value.replace(/[^0-9]/g, "");
+        if (phoneDigits.length >= 4) {
+          return "***-***-" + phoneDigits.substring(phoneDigits.length - 4);
+        }
+        return "***-***-****";
+      }
+
+      case LogScrubPatternType.IPAddress:
+        return "***.***.***.***";
+
+      default: {
+        // Generic masking: keep first and last char, mask middle
+        if (value.length <= 2) {
+          return "***";
+        }
+        return (
+          value[0] +
+          "*".repeat(Math.max(value.length - 2, 3)) +
+          value[value.length - 1]!
+        );
+      }
+    }
+  }
+
+  private static scrubString(
+    value: string,
+    compiledRules: Array<CompiledRule>,
+  ): string {
+    let result: string = value;
+
+    for (const { rule, regex } of compiledRules) {
+      const patternType: string = (rule.patternType as string) || "";
+
+      // Key-targeted rules never scan free text.
+      if (patternType === LogScrubPatternType.SensitiveKeys) {
+        continue;
+      }
+
+      // Reset lastIndex for global regex
+      regex.lastIndex = 0;
+
+      const action: string =
+        (rule.scrubAction as string) || LogScrubAction.Redact;
+
+      result = result.replace(regex, (match: string) => {
+        return this.applyScrubAction(match, action, patternType);
+      });
+    }
+
+    return result;
+  }
+
+  public static scrubLog(
+    logRow: JSONObject,
+    compiledRules: Array<CompiledRule>,
+  ): JSONObject {
+    if (compiledRules.length === 0) {
+      return logRow;
+    }
+
+    /*
+     * Each rule's `fieldsToScrub` can be "body", "attributes", or
+     * "both" — so we cannot just call scrubString once across the
+     * full ruleset, we have to honour each rule's scope. The old
+     * implementation did `compiledRules.filter(cr => cr.rule === rule)`
+     * inside this loop, which made the loop O(N^2) over the rule
+     * count. We now keep a one-element scratch array per rule and
+     * reuse it across the body / attributes scrubs.
+     */
+    const singleRule: Array<CompiledRule> = new Array<CompiledRule>(1);
+
+    for (const compiled of compiledRules) {
+      singleRule[0] = compiled;
+
+      /*
+       * SensitiveKeys is key-targeted, so it can only ever act on
+       * attributes — a rule saved with a body-only scope would otherwise
+       * be a silent no-op while looking active in the rules table. Force
+       * the attributes scope for it regardless of the stored value.
+       */
+      const isSensitiveKeysRule: boolean =
+        (compiled.rule.patternType as string) ===
+        LogScrubPatternType.SensitiveKeys;
+
+      const fieldsToScrub: string = isSensitiveKeysRule
+        ? "attributes"
+        : (compiled.rule.fieldsToScrub as string) || "both";
+
+      // Scrub body
+      if (
+        (fieldsToScrub === "body" || fieldsToScrub === "both") &&
+        typeof logRow["body"] === "string"
+      ) {
+        logRow["body"] = this.scrubString(logRow["body"] as string, singleRule);
+      }
+
+      // Scrub attributes
+      if (
+        (fieldsToScrub === "attributes" || fieldsToScrub === "both") &&
+        logRow["attributes"] &&
+        typeof logRow["attributes"] === "object"
+      ) {
+        const attributes: JSONObject = logRow["attributes"] as JSONObject;
+        const isKeyTargeted: boolean =
+          (compiled.rule.patternType as string) ===
+          LogScrubPatternType.SensitiveKeys;
+
+        for (const key of Object.keys(attributes)) {
+          if (typeof attributes[key] !== "string") {
+            continue;
+          }
+
+          if (isKeyTargeted) {
+            // Key match → the whole value gets the action.
+            if (compiled.regex.test(key)) {
+              attributes[key] = this.applyScrubAction(
+                attributes[key] as string,
+                (compiled.rule.scrubAction as string) || LogScrubAction.Redact,
+                LogScrubPatternType.SensitiveKeys,
+              );
+            }
+            continue;
+          }
+
+          attributes[key] = this.scrubString(
+            attributes[key] as string,
+            singleRule,
+          );
+        }
+      }
+    }
+
+    return logRow;
+  }
+}
+
+export default LogScrubRuleService;
