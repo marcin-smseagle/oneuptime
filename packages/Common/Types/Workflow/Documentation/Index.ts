@@ -28,6 +28,8 @@ import {
   getMicrosoftTeamsDocumentation,
   getSendEmailDocumentation,
   getSlackDocumentation,
+  getSMSEagleMakeCallDocumentation,
+  getSMSEagleSendSmsDocumentation,
   getTelegramDocumentation,
 } from "./MessagingDocumentation";
 import {
@@ -61,6 +63,8 @@ export const BUILT_IN_COMPONENT_DOCUMENTATION: Record<
     getMicrosoftTeamsDocumentation,
   [ComponentID.DiscordSendMessageToChannel]: getDiscordDocumentation,
   [ComponentID.TelegramSendMessageToChat]: getTelegramDocumentation,
+  [ComponentID.SMSEagleSendSms]: getSMSEagleSendSmsDocumentation,
+  [ComponentID.SMSEagleMakeCall]: getSMSEagleMakeCallDocumentation,
   [ComponentID.JavaScriptCode]: getJavaScriptDocumentation,
   [ComponentID.JsonToText]: getJsonToTextDocumentation,
   [ComponentID.TextToJson]: getTextToJsonDocumentation,

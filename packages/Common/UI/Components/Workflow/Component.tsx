@@ -146,6 +146,7 @@ const getCategoryColors: (
     lowerCategory.includes("discord") ||
     lowerCategory.includes("teams") ||
     lowerCategory.includes("telegram") ||
+    lowerCategory.includes("smseagle") ||
     lowerCategory.includes("email") ||
     lowerCategory.includes("notification")
   ) {
