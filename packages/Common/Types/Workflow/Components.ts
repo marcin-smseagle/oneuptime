@@ -14,6 +14,7 @@ import MicrosoftTeamsComponents from "./Components/MicrosoftTeams";
 import ScheduleComponents from "./Components/Schedule";
 import SlackComponents from "./Components/Slack";
 import SleepComponents from "./Components/Sleep";
+import SMSEagleComponents from "./Components/SMSEagle";
 import TelegramComponents from "./Components/Telegram";
 import WebhookComponents from "./Components/Webhook";
 import WorkflowComponents from "./Components/Workflow";
@@ -26,6 +27,7 @@ const components: Array<ComponentMetadata> = [
   ...SlackComponents,
   ...DiscordComponents,
   ...TelegramComponents,
+  ...SMSEagleComponents,
   ...ConditionComponents,
   ...JsonComponents,
   ...JavaScriptComponents,
@@ -76,6 +78,11 @@ export const Categories: Array<ComponentCategory> = [
     name: "Telegram",
     description: "Integrate OneUptime with your Telegram chats and channels.",
     icon: IconProp.SendMessage,
+  },
+  {
+    name: "SMSEagle",
+    description: "Integrate OneUptime with your SMSEagle SMS gateway.",
+    icon: IconProp.SMS,
   },
   {
     name: "Conditions",

@@ -31,6 +31,8 @@ import MicrosoftTeamsSendMessageToChannel from "./MicrosoftTeams/SendMessageToCh
 import Schedule from "./Schedule";
 import SlackSendMessageToChannel from "./Slack/SendMessageToChannel";
 import Sleep from "./Sleep";
+import SMSEagleMakeCall from "./SMSEagle/MakeCall";
+import SMSEagleSendSms from "./SMSEagle/SendSms";
 import TelegramSendMessageToChat from "./Telegram/SendMessageToChat";
 import WebhookTrigger from "./Webhook";
 import ExecuteWorkflow from "./Workflow";
@@ -49,6 +51,8 @@ const Components: Dictionary<ComponentCode> = {
   [ComponentID.MicrosoftTeamsSendMessageToChannel]:
     new MicrosoftTeamsSendMessageToChannel(),
   [ComponentID.TelegramSendMessageToChat]: new TelegramSendMessageToChat(),
+  [ComponentID.SMSEagleSendSms]: new SMSEagleSendSms(),
+  [ComponentID.SMSEagleMakeCall]: new SMSEagleMakeCall(),
   [ComponentID.Log]: new Log(),
   [ComponentID.Schedule]: new Schedule(),
   [ComponentID.JavaScriptCode]: new JavaScriptCode(),
