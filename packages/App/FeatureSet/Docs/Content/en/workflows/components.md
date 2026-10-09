@@ -79,6 +79,10 @@ Post a message to a Discord channel through an incoming webhook URL.
 
 Send a message to a Telegram chat using a bot token and chat ID.
 
+## SMSEagle
+
+Send an SMS or make a text-to-speech call through an SMSEagle device using its URL and an API v2 key.
+
 ## Email
 
 Send an email through an SMTP server that you enter on the block.

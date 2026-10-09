@@ -751,6 +751,10 @@ const DocsNav: NavGroup[] = [
         title: "Telegram",
         url: "/docs/integrations/telegram",
       },
+      {
+        title: "SMSEagle",
+        url: "/docs/integrations/smseagle",
+      },
     ],
   },
   {

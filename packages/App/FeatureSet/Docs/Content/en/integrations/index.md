@@ -51,6 +51,7 @@ OneUptime Incident → On Create  ──►  API component  ──►  Jira / Pa
 | [GitLab](/docs/integrations/gitlab)                                   | Outbound             | Open a GitLab issue for an incident.                                          |
 | [Discord](/docs/integrations/discord)                                 | Outbound             | Post incident updates to a Discord channel.                                   |
 | [Telegram](/docs/integrations/telegram)                               | Outbound             | Send incident updates to a Telegram chat.                                     |
+| [SMSEagle](/docs/integrations/smseagle)                               | Outbound             | Send SMS messages and calls through your own SMSEagle SMS gateway.            |
 | [Slack](/docs/workspace-connections/slack)                            | Both                 | Native workspace connection — channels, alerts, and on-call.                  |
 | [Microsoft Teams](/docs/workspace-connections/microsoft-teams)        | Both                 | Native workspace connection.                                                  |
 
